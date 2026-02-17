@@ -37,9 +37,17 @@ app.get("/test", async (req, res) => {
 
     const data = await response.json();
 
-    const imageUrl = Array.isArray(data.output)
-      ? data.output[0]
-      : data.output;
+let imageUrl = null;
+
+if (Array.isArray(data.output)) {
+  imageUrl = data.output[0];
+} else if (typeof data.output === "string") {
+  imageUrl = data.output;
+} else if (data.output?.url) {
+  imageUrl = data.output.url;
+}
+
+console.log("Replicate output:", data);
 
     res.send(`
       <h2>✅ 이미지 생성 성공</h2>
