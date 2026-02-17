@@ -1,162 +1,160 @@
 import express from "express";
 import cors from "cors";
+import Replicate from "replicate";
 
 const app = express();
 
 app.use(cors());
 app.use(express.json());
 
+// Render/health check
 app.get("/", (req, res) => {
   res.send("DRESSD server running");
 });
 
-/**
- * ✅ 테스트 페이지
- * - 브라우저에서: https://dressd-bridge.onrender.com/test?prompt=fashion%20model
- * - 화면에서 이미지 나오면 성공
- */
-app.get("/test", async (req, res) => {
-  const prompt = (req.query.prompt || "").toString();
-
-  res.setHeader("Content-Type", "text/html; charset=utf-8");
-  res.end(`
-<!doctype html>
-<html>
-<head>
-  <meta charset="utf-8" />
-  <title>DRESSD S1 Test</title>
-  <style>
-    body { font-family: Arial, sans-serif; padding: 24px; }
-    .ok { color: #0a7d00; font-weight: 700; }
-    .bad { color: #b00020; font-weight: 700; }
-    img { max-width: 512px; display:block; margin-top: 16px; border: 1px solid #eee; }
-    pre { background:#f6f6f6; padding:12px; overflow:auto; }
-  </style>
-</head>
-<body>
-  <div id="status">로딩중...</div>
-  <div><b>Prompt:</b> ${escapeHtml(prompt)}</div>
-  <img id="img" />
-  <pre id="json"></pre>
-
-  <script>
-    async function run() {
-      const prompt = ${JSON.stringify(prompt)};
-      if (!prompt) {
-        document.getElementById("status").innerHTML = '<span class="bad">prompt가 비어있어</span>';
-        return;
-      }
-
-      const r = await fetch("/api/s1", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ prompt })
-      });
-
-      const data = await r.json().catch(() => ({}));
-      document.getElementById("json").textContent = JSON.stringify({ httpStatus: r.status, ...data }, null, 2);
-
-      if (!r.ok) {
-        document.getElementById("status").innerHTML = '<span class="bad">실패</span>';
-        return;
-      }
-
-      if (!data.imageUrl) {
-        document.getElementById("status").innerHTML = '<span class="bad">성공 응답인데 imageUrl이 없어</span>';
-        return;
-      }
-
-      document.getElementById("status").innerHTML = '<span class="ok">이미지 생성 성공</span>';
-      document.getElementById("img").src = data.imageUrl;
-    }
-
-    run();
-  </script>
-</body>
-</html>
-  `);
+// Replicate client (token은 Render Env: REPLICATE_API_TOKEN)
+const replicate = new Replicate({
+  auth: process.env.REPLICATE_API_TOKEN,
 });
 
-// HTML escape helper
-function escapeHtml(str) {
-  return String(str)
-    .replaceAll("&", "&amp;")
-    .replaceAll("<", "&lt;")
-    .replaceAll(">", "&gt;")
-    .replaceAll('"', "&quot;")
-    .replaceAll("'", "&#039;");
-}
-
-/**
- * ✅ S1 생성 API
- * - 올바른 Replicate 엔드포인트 사용
- * - 오류/레이트리밋/출력 null 케이스까지 프론트가 확인 가능하게 응답을 정리
- */
+// ---------- 핵심: S1 API ----------
 app.post("/api/s1", async (req, res) => {
-  const { prompt } = req.body || {};
-  const token = process.env.REPLICATE_API_TOKEN;
+  const { prompt } = req.body;
 
-  if (!token) {
-    return res.status(500).json({ error: "REPLICATE_API_TOKEN is missing on server" });
+  if (!process.env.REPLICATE_API_TOKEN) {
+    return res.status(500).json({ error: "Missing REPLICATE_API_TOKEN in env" });
   }
-  if (!prompt) {
+
+  if (!prompt || typeof prompt !== "string") {
     return res.status(400).json({ error: "Prompt missing" });
   }
 
   try {
-    // ✅ 핵심: /v1/models/{owner}/{name}/predictions
-    const response = await fetch(
-      "https://api.replicate.com/v1/models/google/imagen-4/predictions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`,
-          "Content-Type": "application/json",
-          Prefer: "wait"
-        },
-        body: JSON.stringify({
-          input: { prompt }
-        })
-      }
-    );
+    // ✅ Replicate 공식 방식: replicate.run(model, { input })
+    const input = {
+      prompt,
+      // 필요하면 여기 옵션 추가 (모델 스키마에 맞춰야 함)
+      // aspect_ratio: "16:9",
+      // safety_filter_level: "block_medium_and_above",
+    };
 
-    const data = await response.json().catch(() => ({}));
+    const output = await replicate.run("google/imagen-4", { input });
 
-    // 레이트리밋/에러면 그대로 내려서 테스트 화면에서 확인 가능하게
-    if (!response.ok) {
-      return res.status(response.status).json({
-        error: "Replicate request failed",
-        replicate: data
-      });
+    // 출력 형태는 모델마다 다를 수 있어서 안전하게 처리
+    let imageUrl = null;
+
+    // output이 배열이면 첫 번째가 URL인 경우가 많음
+    if (Array.isArray(output)) {
+      imageUrl = output[0] ?? null;
+    } else if (typeof output === "string") {
+      imageUrl = output;
+    } else if (output && typeof output === "object") {
+      // 일부 모델은 { url(): ... } 형태 or { output: ... } 형태가 있을 수 있음
+      if (typeof output.url === "function") imageUrl = output.url();
+      else if (typeof output.url === "string") imageUrl = output.url;
+      else if (Array.isArray(output.output)) imageUrl = output.output[0] ?? null;
+      else if (typeof output.output === "string") imageUrl = output.output;
     }
 
-    // output 파싱
-    const out = data?.output;
-    const imageUrl = Array.isArray(out) ? out[0] : out;
-
-    // ✅ output이 null일 수도 있음 (차단/실패/예외)
-    // 이 경우 raw 데이터 같이 내려서 원인 파악 가능하게
+    // ✅ safety block / 실패 케이스: imageUrl이 없으면 원인도 같이 내려주기
     if (!imageUrl) {
       return res.status(200).json({
         ok: true,
         imageUrl: null,
-        note: "No imageUrl in output (maybe blocked/failed). Check replicate payload.",
-        replicate: data
+        note: "No imageUrl in output (maybe blocked/failed). Check server logs.",
+        replicateOutput: output,
       });
     }
 
     return res.json({ ok: true, imageUrl });
+  } catch (err) {
+    // Replicate 에러는 status / retry_after 같은 값이 붙는 경우가 있음
+    const status = err?.status || err?.response?.status;
 
-  } catch (error) {
+    // 429 Rate limit이면 retry_after 힌트 전달
+    if (status === 429) {
+      const retryAfter = err?.retry_after || err?.response?.headers?.get?.("retry-after") || null;
+      if (retryAfter) res.setHeader("Retry-After", String(retryAfter));
+
+      return res.status(429).json({
+        error: "Rate limited by Replicate",
+        retryAfter,
+        detail: err?.detail || err?.message || String(err),
+      });
+    }
+
     return res.status(500).json({
-      error: "Generation failed (server exception)",
-      detail: String(error?.message || error)
+      error: "Generation failed",
+      detail: err?.detail || err?.message || String(err),
     });
   }
 });
 
-const PORT = process.env.PORT || 3000;
+// ---------- 브라우저 테스트 페이지 ----------
+app.get("/test", async (req, res) => {
+  const prompt = (req.query.prompt || "").toString();
 
-app.listen(PORT, () => {
-  console.log("Server running");
+  if (!prompt) {
+    return res.status(200).send(`
+      <h2>Test</h2>
+      <p>Use: <code>/test?prompt=adult%20female%20fashion%20model%20age%2025</code></p>
+    `);
+  }
+
+  try {
+    // 서버 내부에서 /api/s1 로직 재사용 (직접 호출)
+    const input = {
+      prompt,
+      // safety_filter_level: "block_medium_and_above",
+    };
+
+    const output = await replicate.run("google/imagen-4", { input });
+
+    let imageUrl = null;
+    if (Array.isArray(output)) imageUrl = output[0] ?? null;
+    else if (typeof output === "string") imageUrl = output;
+    else if (output && typeof output === "object") {
+      if (typeof output.url === "function") imageUrl = output.url();
+      else if (typeof output.url === "string") imageUrl = output.url;
+      else if (Array.isArray(output.output)) imageUrl = output.output[0] ?? null;
+      else if (typeof output.output === "string") imageUrl = output.output;
+    }
+
+    const escapedPrompt = prompt.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+
+    if (!imageUrl) {
+      return res.status(200).send(`
+        <div style="font-family:Arial; padding:16px;">
+          <h2 style="color:#d33;">성공 응답인데 imageUrl이 없어</h2>
+          <b>Prompt:</b> ${escapedPrompt}<br/><br/>
+          <pre style="background:#f6f6f6; padding:12px; overflow:auto;">${JSON.stringify(output, null, 2)}</pre>
+        </div>
+      `);
+    }
+
+    return res.status(200).send(`
+      <div style="font-family:Arial; padding:16px;">
+        <h2 style="color:green;">✅ 이미지 생성 성공</h2>
+        <b>Prompt:</b> ${escapedPrompt}<br/><br/>
+        <img src="${imageUrl}" style="max-width:512px; border:1px solid #ddd;" />
+        <p><a href="${imageUrl}" target="_blank">Open image</a></p>
+      </div>
+    `);
+  } catch (err) {
+    const escapedPrompt = prompt.replaceAll("&", "&amp;").replaceAll("<", "&lt;").replaceAll(">", "&gt;");
+    return res.status(200).send(`
+      <div style="font-family:Arial; padding:16px;">
+        <h2 style="color:#d33;">❌ 생성 실패</h2>
+        <b>Prompt:</b> ${escapedPrompt}<br/><br/>
+        <pre style="background:#f6f6f6; padding:12px; overflow:auto;">${JSON.stringify({
+          status: err?.status,
+          detail: err?.detail,
+          message: err?.message,
+        }, null, 2)}</pre>
+      </div>
+    `);
+  }
 });
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => console.log("Server running"));
