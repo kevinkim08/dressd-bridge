@@ -10,6 +10,49 @@ app.get("/", (req, res) => {
   res.send("DRESSD server running");
 });
 
+/**
+ * ✅ 브라우저 테스트용 주소
+ * 주소 뒤에 prompt 넣어서 테스트 가능
+ * 예:
+ * https://dressd-bridge.onrender.com/test?prompt=fashion%20model
+ */
+app.get("/test", async (req, res) => {
+  const prompt = req.query.prompt || "fashion model studio photo";
+
+  const token = process.env.REPLICATE_API_TOKEN;
+
+  try {
+    const response = await fetch("https://api.replicate.com/v1/predictions", {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${token}`,
+        "Content-Type": "application/json",
+        Prefer: "wait"
+      },
+      body: JSON.stringify({
+        model: "google/imagen-4",
+        input: { prompt }
+      })
+    });
+
+    const data = await response.json();
+
+    const imageUrl = Array.isArray(data.output)
+      ? data.output[0]
+      : data.output;
+
+    res.send(`
+      <h2>✅ 이미지 생성 성공</h2>
+      <p><b>Prompt:</b> ${prompt}</p>
+      <img src="${imageUrl}" style="max-width:400px;border-radius:10px"/>
+      <p>${imageUrl}</p>
+    `);
+
+  } catch (error) {
+    res.status(500).send("❌ Generation failed");
+  }
+});
+
 app.post("/api/s1", async (req, res) => {
   const { prompt } = req.body;
 
@@ -39,9 +82,7 @@ app.post("/api/s1", async (req, res) => {
       ? data.output[0]
       : data.output;
 
-    res.json({
-      imageUrl
-    });
+    res.json({ imageUrl });
 
   } catch (error) {
     res.status(500).json({ error: "Generation failed" });
