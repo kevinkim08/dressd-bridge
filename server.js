@@ -22,18 +22,21 @@ app.get("/test", async (req, res) => {
   const token = process.env.REPLICATE_API_TOKEN;
 
   try {
-    const response = await fetch("https://api.replicate.com/v1/predictions", {
-      method: "POST",
-      headers: {
-        Authorization: `Bearer ${token}`,
-        "Content-Type": "application/json",
-        Prefer: "wait"
-      },
-      body: JSON.stringify({
-        model: "google/imagen-4",
-        input: { prompt }
-      })
-    });
+    const response = await fetch(
+  "https://api.replicate.com/v1/models/google/imagen-4/predictions",
+  {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json",
+      Prefer: "wait"
+    },
+    body: JSON.stringify({
+      input: { prompt }
+    })
+  }
+);
+
 
     const data = await response.json();
 
