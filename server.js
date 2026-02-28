@@ -6,30 +6,22 @@ import Replicate from "replicate"
 const app = express()
 
 /**
- * ✅ CORS (Framer + 로컬 허용)
+ * ✅ CORS: 일단 전체 허용(테스트용)
+ * - 배포 후 정상 동작 확인되면, 다시 allowlist 방식으로 좁히자.
  */
-const corsOptions = {
-  origin: (origin, cb) => {
-    // origin이 없을 때(서버-서버 호출/헬스체크)는 허용
-    if (!origin) return cb(null, true)
+app.use(
+  cors({
+    origin: true, // 요청 Origin을 그대로 허용
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+)
 
-    const ok =
-      origin.includes("framer.app") ||
-      origin.includes("framer.com") ||
-      origin.includes("localhost") ||
-      origin.includes("127.0.0.1")
-
-    if (ok) return cb(null, true)
-    return cb(new Error("Not allowed by CORS: " + origin))
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}
-
-app.use(cors(corsOptions))
+// ✅ preflight 안정화
+app.options("*", cors())
 
 /**
- * ✅ JSON 바디 사이즈 크게 (이미지 dataUrl이 커서 기본값이면 터질 수 있음)
+ * ✅ JSON 바디 사이즈 크게 (dataUrl 커서 기본값이면 터질 수 있음)
  */
 app.use(express.json({ limit: "25mb" }))
 
@@ -51,7 +43,6 @@ const replicate = new Replicate({
 })
 
 function withAdultGuard(prompt) {
-  // ✅ 정책/안전: 성인 명시 + 나이 고정
   return `adult, age 25, ${prompt}`
 }
 
@@ -105,16 +96,7 @@ app.post("/api/s1", async (req, res) => {
 
 /**
  * =========================================================
- * ✅ S3 Dress endpoint (디버그/연결 확인용)
- *
- * - GET: 힌트만 반환
- * - POST: 들어온 payload에서 model을 "관대하게" 찾고
- *         우선 model dataUrl을 그대로 돌려줌 (echo)
- *
- * 목적:
- * - Runner가 실제로 어떤 구조로 body를 보내는지 확인
- * - files 키가 무엇인지 / model 키가 무엇인지 확인
- * - 네트워크 / CORS / JSON limit 문제 분리
+ * ✅ S3 Dress endpoint (연결/디버그용: model echo)
  * =========================================================
  */
 app.get("/api/dress", (req, res) => {
@@ -127,7 +109,6 @@ app.post("/api/dress", async (req, res) => {
     const view = body.view || "front"
     const storeId = body.storeId || "no-storeId"
 
-    // ✅ 여러 가능성에서 files 후보를 다 모음
     const files =
       body.files ||
       body.dressFiles ||
@@ -142,12 +123,10 @@ app.post("/api/dress", async (req, res) => {
       Object.keys(files || {}).slice(0, 80)
     )
 
-    // ✅ model 후보 키들도 여러개로 탐색
     const model =
       files["model_single"] ||
       files["model"] ||
       files["model_front"] ||
-      files["MODEL"] ||
       body.model_single ||
       body.model ||
       body.payload?.model_single ||
@@ -163,8 +142,7 @@ app.post("/api/dress", async (req, res) => {
       })
     }
 
-    // ✅ 1단계: 일단 모델을 그대로 echo해서
-    // 프론트에서 output이 보이면 "연결 + 렌더링"이 확정됨
+    // ✅ 일단 model을 그대로 echo (연결/뷰어 반응 확인용)
     return res.json({
       ok: true,
       mode: "TEST_ECHO_MODEL",
@@ -182,20 +160,6 @@ app.post("/api/dress", async (req, res) => {
       detail: String(e?.message ?? e),
     })
   }
-})
-
-/**
- * ✅ 에러 핸들러 (CORS 등)
- */
-app.use((err, req, res, next) => {
-  if (err) {
-    console.error("[server error]", err)
-    return res.status(500).json({
-      ok: false,
-      error: String(err?.message ?? err),
-    })
-  }
-  next()
 })
 
 const PORT = process.env.PORT || 3000
