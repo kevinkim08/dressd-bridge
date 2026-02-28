@@ -24,10 +24,10 @@ const corsOptions = {
 
 app.use(cors(corsOptions))
 app.options("*", cors(corsOptions)) // ✅ 프리플라이트 강제 허용
-app.use(express.json({ limit: "80mb" }))
+app.use(express.json({ limit: "120mb" }))
 
 // ✅ dataUrl(base64) 크니까 limit 올려둠
-app.use(express.json({ limit: "80mb" }))
+app.use(express.json({ limit: "120mb" }))
 
 app.get("/", (req, res) => {
   res.send("DRESSD server running")
