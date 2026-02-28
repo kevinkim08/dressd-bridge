@@ -5,9 +5,6 @@ import Replicate from "replicate"
 
 const app = express()
 
-/**
- * ✅ CORS: 테스트 단계 전체 허용
- */
 app.use(
   cors({
     origin: true,
@@ -17,10 +14,7 @@ app.use(
 )
 app.options("*", cors())
 
-/**
- * ✅ dataUrl 큼 → limit 늘림
- */
-app.use(express.json({ limit: "25mb" }))
+app.use(express.json({ limit: "35mb" }))
 
 app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) => res.json({ ok: true }))
@@ -87,69 +81,127 @@ app.post("/api/s1", async (req, res) => {
 /**
  * =========================================================
  * ✅ S3 Dress endpoint (연결/디버그: model echo)
- * - Runner가 보내는 형태:
- *   { view, model, garments, clientTime, storeId }
  * =========================================================
  */
 app.get("/api/dress", (req, res) => {
   res.json({ ok: true, hint: "Use POST /api/dress" })
 })
 
-function pickDataUrl(x) {
+/**
+ * ✅ 어떤 형태로 와도 dataUrl을 최대한 찾아냄
+ * - string: 그대로
+ * - array: 첫 원소부터 재귀적으로 탐색
+ * - object: 흔한 키들(dataUrl/previewUrl/imageDataUrl/src/url/...)
+ *          + model_single 같은 키로 직접 박혀있는 경우
+ *          + 숫자키("0","1") array-like 도 대응
+ *          + 한 단계 더 들어간 nested 도 대응 (image: {...}, model: {...} 등)
+ */
+function pickDataUrl(x, depth = 0) {
   if (!x) return ""
+  if (depth > 4) return "" // 무한 루프 방지
+
   if (typeof x === "string") return x
-  if (typeof x === "object") {
-    // 흔한 형태들 대응
-    if (typeof x.dataUrl === "string") return x.dataUrl
-    if (typeof x.url === "string") return x.url
-    if (typeof x.image === "string") return x.image
+
+  // Array
+  if (Array.isArray(x)) {
+    for (const item of x) {
+      const got = pickDataUrl(item, depth + 1)
+      if (got) return got
+    }
+    return ""
   }
+
+  // Object
+  if (typeof x === "object") {
+    // 1) 흔한 키들 우선
+    const directKeys = [
+      "dataUrl",
+      "imageDataUrl",
+      "previewUrl",
+      "src",
+      "url",
+      "image",
+      "base64",
+      "b64",
+      "content",
+    ]
+    for (const k of directKeys) {
+      if (typeof x[k] === "string" && x[k].startsWith("data:image")) return x[k]
+    }
+
+    // 2) model_single 처럼 키로 바로 들어오는 경우
+    if (typeof x["model_single"] === "string" && x["model_single"].startsWith("data:image")) {
+      return x["model_single"]
+    }
+
+    // 3) 숫자키 array-like ({"0": "...", "1": "..."})
+    if (typeof x["0"] === "string" && x["0"].startsWith("data:image")) return x["0"]
+
+    // 4) 위 키들이 객체라면 한 단계 더 들어가 보기
+    for (const k of directKeys) {
+      if (x[k] && typeof x[k] === "object") {
+        const got = pickDataUrl(x[k], depth + 1)
+        if (got) return got
+      }
+    }
+
+    // 5) 마지막: 모든 값 훑어서 dataUrl 찾기 (너무 무겁지 않게 depth 제한 있음)
+    for (const k of Object.keys(x)) {
+      const v = x[k]
+      const got = pickDataUrl(v, depth + 1)
+      if (got) return got
+    }
+  }
+
   return ""
+}
+
+function keysOf(x) {
+  if (!x) return []
+  if (Array.isArray(x)) return x.map((_, i) => String(i))
+  if (typeof x === "object") return Object.keys(x)
+  return []
 }
 
 app.post("/api/dress", async (req, res) => {
   try {
     const body = req.body || {}
-
     const view = body.view || "front"
     const storeId = body.storeId || "no-storeId"
 
-    // ✅ Runner가 보내는 방식 우선 수용
     const modelDataUrl = pickDataUrl(body.model)
 
-    // ✅ garments는 객체일 확률이 큼 (slotKey -> dataUrl)
-    const garments = body.garments && typeof body.garments === "object"
-      ? body.garments
-      : {}
+    // garments: object일 수도, array일 수도 있음
+    const garmentsRaw = body.garments
+    const garmentsKeys = keysOf(garmentsRaw)
 
     console.log("[/api/dress] storeId:", storeId, "view:", view)
     console.log("[/api/dress] body keys:", Object.keys(body))
-    console.log(
-      "[/api/dress] garments keys:",
-      Object.keys(garments).slice(0, 80)
-    )
-    console.log("[/api/dress] model type:", typeof body.model)
+    console.log("[/api/dress] model keys:", keysOf(body.model))
+    console.log("[/api/dress] garments keys:", garmentsKeys.slice(0, 60))
     console.log("[/api/dress] modelDataUrl length:", modelDataUrl?.length || 0)
 
     if (!modelDataUrl) {
       return res.status(400).json({
         ok: false,
         error: "model missing",
-        hint: "Expected body.model as dataUrl string OR {dataUrl}.",
+        hint: "Expected body.model as dataUrl string OR object containing dataUrl-like fields.",
         gotBodyKeys: Object.keys(body),
         gotModelType: typeof body.model,
-        gotGarmentsKeys: Object.keys(garments || {}),
+        gotModelKeys: keysOf(body.model),
+        gotGarmentsKeys: garmentsKeys,
       })
     }
 
-    // ✅ 1차 목표: 서버-프론트 연결 확인용으로 model을 그대로 반환
+    // ✅ 1차 목표: 연결 검증 → model을 그대로 반환
     return res.json({
       ok: true,
       mode: "TEST_ECHO_MODEL",
       view,
       storeId,
       gotBodyKeys: Object.keys(body),
-      gotGarmentsKeys: Object.keys(garments || {}),
+      gotModelKeys: keysOf(body.model),
+      gotGarmentsKeys: garmentsKeys,
       imageDataUrl: modelDataUrl,
     })
   } catch (e) {
