@@ -5,7 +5,8 @@ import Replicate from "replicate"
 const app = express()
 
 // ✅ body가 dataUrl이면 커서 터질 수 있음
-app.use(express.json({ limit: "25mb" }))
+app.use(cors())
+app.options("*", cors())
 
 /**
  * ✅ CORS: 프레이머 미리보기/배포 도메인이 여러개라 넓게 허용
