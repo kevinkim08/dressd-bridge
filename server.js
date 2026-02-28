@@ -1,90 +1,85 @@
 import express from "express"
 import cors from "cors"
-import Replicate from "replicate"
 
 const app = express()
 
-// ✅ body가 dataUrl이면 커서 터질 수 있음
+// ✅ 개발 단계: CORS 전면 허용
 app.use(cors())
 app.options("*", cors())
 
-/**
- * ✅ CORS: 프레이머 미리보기/배포 도메인이 여러개라 넓게 허용
- * - 나중에 안정화되면 좁혀도 됨
- */
-const corsOptions = {
-  origin: (origin, cb) => {
-    // 서버-서버/헬스체크(Origin 없음) 허용
-    if (!origin) return cb(null, true)
+// ✅ 핵심: base64 이미지 받으려면 limit 크게
+app.use(express.json({ limit: "50mb" }))
+app.use(express.urlencoded({ extended: true, limit: "50mb" }))
 
-    const ok =
-      origin.includes("framer.app") ||
-      origin.includes("framer.com") ||
-      origin.includes("framer.website") ||
-      origin.includes("framer.ai") ||
-      origin.includes("framerusercontent.com") ||
-      origin.includes("localhost") ||
-      origin.includes("127.0.0.1")
-
-    if (ok) return cb(null, true)
-    return cb(new Error("Not allowed by CORS: " + origin))
-  },
-  methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
-}
-
-// ✅ 프리플라이트 포함
-app.use(cors(corsOptions))
-app.options("*", cors(corsOptions))
-
-// ✅ 요청 들어오면 origin/method 찍어서 디버깅
-app.use((req, res, next) => {
-  console.log("[REQ]", req.method, req.path, "origin=", req.headers.origin)
-  next()
+app.get("/", (req, res) => {
+  res.send("DRESSD server running")
 })
 
-app.get("/", (req, res) => res.send("DRESSD server running"))
-app.get("/health", (req, res) => res.json({ ok: true }))
+app.get("/health", (req, res) => {
+  res.json({ ok: true })
+})
 
-// ✅ GET도 만들어서 배포됐는지 확인 쉽게
+// ✅ dress endpoint 확인용 GET
 app.get("/api/dress", (req, res) => {
   res.json({ ok: true, hint: "Use POST /api/dress" })
 })
 
-const replicate = new Replicate({
-  auth: process.env.REPLICATE_API_TOKEN,
-})
-
 /**
- * ✅ 연결 테스트용: POST /api/dress
- * - 지금은 합성 없이 model_single을 그대로 output으로 돌려줌
+ * ✅ TEST MODE: 합성 대신 "model_single" 그대로 반환
+ * 요청 payload가 정상으로 들어오는지만 확인하는 목적
  */
 app.post("/api/dress", async (req, res) => {
   try {
-    const { view, files } = req.body || {}
-    if (!files || typeof files !== "object") {
-      return res.status(400).json({ error: "files missing" })
-    }
+    const body = req.body || {}
+    const view = body.view || "front"
+    const storeId = body.storeId || "no-storeId"
+    const files = body.files || body.dressFiles || {}
 
+    // files 안에 model_single이 있어야 함
     const model = files["model_single"]
-    if (!model) {
-      return res.status(400).json({ error: "model_single missing" })
+
+    // ✅ 서버에서 로그로 확인( Render Logs 에 찍힘 )
+    console.log("[/api/dress] storeId:", storeId, "view:", view)
+    console.log("[/api/dress] keys:", Object.keys(files || {}).slice(0, 30))
+    console.log(
+      "[/api/dress] model_single bytes:",
+      typeof model === "string" ? model.length : 0
+    )
+
+    if (!model || typeof model !== "string") {
+      return res.status(400).json({
+        ok: false,
+        error: "model_single missing in files",
+        gotKeys: Object.keys(files || {}),
+      })
     }
 
+    // ✅ 일단 결과를 model 그대로 반환 (Viewer가 즉시 뜨는지 확인)
     return res.json({
       ok: true,
-      view: view || "front",
-      output: model,
-      debug: {
-        keys: Object.keys(files),
-      },
+      mode: "TEST_ECHO_MODEL",
+      view,
+      storeId,
+      imageDataUrl: model, // 프론트가 이 키를 읽어서 Viewer에 넣게 만들면 됨
     })
   } catch (e) {
+    console.error("[/api/dress] ERROR:", e)
     return res.status(500).json({
-      error: "dress api failed",
+      ok: false,
+      error: "Internal Server Error",
       detail: String(e?.message ?? e),
     })
   }
+})
+
+// ✅ 예외가 HTML로 떨어지는 것 방지(항상 JSON)
+app.use((err, req, res, next) => {
+  console.error("[global error]", err)
+  res.status(500).json({
+    ok: false,
+    error: "Unhandled error",
+    detail: String(err?.message ?? err),
+  })
 })
 
 const PORT = process.env.PORT || 3000
