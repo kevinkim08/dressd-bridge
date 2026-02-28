@@ -4,52 +4,38 @@ import Replicate from "replicate"
 
 const app = express()
 
-// ✅ CORS 확실히 열기 (Framer + 로컬 허용)
 const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true)
 
-    const ok =
-      origin.includes("framer.app") ||
-      origin.includes("framer.com") ||
-      origin.includes("localhost") ||
-      origin.includes("127.0.0.1")
+    const allow = ["framer.app", "framer.com", "localhost", "127.0.0.1"]
+    const ok = allow.some((d) => origin.includes(d))
 
     if (ok) return cb(null, true)
-    return cb(new Error("Not allowed by CORS: " + origin))
+
+    // ✅ 디버그용: 일단 전부 허용 (문제 해결 후 다시 막아도 됨)
+    return cb(null, true)
   },
   methods: ["GET", "POST", "OPTIONS"],
   allowedHeaders: ["Content-Type", "Authorization"],
 }
 
 app.use(cors(corsOptions))
-app.options("*", cors(corsOptions)) // ✅ 프리플라이트 강제 허용
-app.use(express.json({ limit: "120mb" }))
+app.options("*", cors(corsOptions)) // ✅ 프리플라이트 확실히 처리
+app.use(express.json({ limit: "120mb" })) // ✅ dataUrl payload 대비
 
-// ✅ dataUrl(base64) 크니까 limit 올려둠
-app.use(express.json({ limit: "120mb" }))
+app.get("/", (req, res) => res.send("DRESSD server running"))
+app.get("/health", (req, res) => res.json({ ok: true }))
 
-app.get("/", (req, res) => {
-  res.send("DRESSD server running")
-})
-
-app.get("/health", (req, res) => {
-  res.json({ ok: true })
-})
-
-const replicate = new Replicate({
-  auth: process.env.REPLICATE_API_TOKEN,
-})
+const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN })
 
 function withAdultGuard(prompt) {
   return `adult, age 25, ${prompt}`
 }
 
-/**
- * =========================
- * S1 (Imagen)
- * =========================
- */
+// ----------------------
+// S1 (Imagen)
+// ----------------------
 app.post("/api/s1", async (req, res) => {
   const { prompt } = req.body
 
@@ -58,9 +44,7 @@ app.post("/api/s1", async (req, res) => {
       .status(500)
       .json({ error: "REPLICATE_API_TOKEN missing on server" })
   }
-  if (!prompt) {
-    return res.status(400).json({ error: "Prompt missing" })
-  }
+  if (!prompt) return res.status(400).json({ error: "Prompt missing" })
 
   try {
     const finalPrompt = withAdultGuard(prompt)
@@ -98,13 +82,9 @@ app.post("/api/s1", async (req, res) => {
   }
 })
 
-/**
- * =========================
- * S3 (Dress) - ECHO (연결 테스트용)
- * =========================
- * - 지금은 합성 없이 "model_single"을 그대로 반환
- * - Runner 연결/플로우 먼저 완성시키는 용도
- */
+// ----------------------
+// S3 (Dress) - ECHO (연결 테스트)
+// ----------------------
 app.post("/api/dress", async (req, res) => {
   try {
     const body = req.body || {}
@@ -112,17 +92,13 @@ app.post("/api/dress", async (req, res) => {
     const files = body.files || {}
     const model = files.model_single
 
-    if (!model) {
-      return res.status(400).json({ error: "model_single missing" })
-    }
+    if (!model) return res.status(400).json({ error: "model_single missing" })
 
     return res.json({
       dataUrl: model,
       debug: {
         view,
         receivedKeys: Object.keys(files),
-        hasArrangeForView: !!body.dressArrangeForView,
-        hasArrange: !!body.dressArrange,
       },
     })
   } catch (e) {
