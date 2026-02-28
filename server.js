@@ -4,17 +4,24 @@ import Replicate from "replicate"
 
 const app = express()
 
+// ✅ body가 dataUrl이면 커서 터질 수 있음
+app.use(express.json({ limit: "25mb" }))
+
 /**
- * ✅ CORS (Framer + Local)
- * - OPTIONS 프리플라이트도 자동 처리되게 함
+ * ✅ CORS: 프레이머 미리보기/배포 도메인이 여러개라 넓게 허용
+ * - 나중에 안정화되면 좁혀도 됨
  */
 const corsOptions = {
   origin: (origin, cb) => {
+    // 서버-서버/헬스체크(Origin 없음) 허용
     if (!origin) return cb(null, true)
 
     const ok =
       origin.includes("framer.app") ||
       origin.includes("framer.com") ||
+      origin.includes("framer.website") ||
+      origin.includes("framer.ai") ||
+      origin.includes("framerusercontent.com") ||
       origin.includes("localhost") ||
       origin.includes("127.0.0.1")
 
@@ -25,44 +32,35 @@ const corsOptions = {
   allowedHeaders: ["Content-Type", "Authorization"],
 }
 
+// ✅ 프리플라이트 포함
 app.use(cors(corsOptions))
 app.options("*", cors(corsOptions))
-app.use(express.json({ limit: "25mb" })) // ✅ dataUrl이 커질 수 있어서 넉넉히
+
+// ✅ 요청 들어오면 origin/method 찍어서 디버깅
+app.use((req, res, next) => {
+  console.log("[REQ]", req.method, req.path, "origin=", req.headers.origin)
+  next()
+})
 
 app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) => res.json({ ok: true }))
 
-/**
- * ✅ (중요) 브라우저에서 /api/dress 눌렀을 때 "Cannot GET"이 보기 싫으면
- * GET도 하나 만들어두면 확인이 편해짐
- */
+// ✅ GET도 만들어서 배포됐는지 확인 쉽게
 app.get("/api/dress", (req, res) => {
   res.json({ ok: true, hint: "Use POST /api/dress" })
 })
 
-/**
- * ✅ Replicate (지금은 아직 S3 합성 모델을 안붙였으니 '연결 테스트'만)
- * - 나중에 여기서 실제 try-on 모델로 교체하면 됨
- */
 const replicate = new Replicate({
   auth: process.env.REPLICATE_API_TOKEN,
 })
 
 /**
- * ✅ POST /api/dress
- * - 지금 단계 목표: 프론트가 서버를 잘 때리고, 응답을 받아서 Viewer에 표시되는지 확인
- *
- * 기대 입력(프론트에서):
- * {
- *   view: "front" | "back",
- *   files: { "model_single": "data:image/..", "top_front": "...", ... },
- *   meta?: { ... }
- * }
+ * ✅ 연결 테스트용: POST /api/dress
+ * - 지금은 합성 없이 model_single을 그대로 output으로 돌려줌
  */
 app.post("/api/dress", async (req, res) => {
   try {
     const { view, files } = req.body || {}
-
     if (!files || typeof files !== "object") {
       return res.status(400).json({ error: "files missing" })
     }
@@ -72,15 +70,11 @@ app.post("/api/dress", async (req, res) => {
       return res.status(400).json({ error: "model_single missing" })
     }
 
-    // ✅ 1단계: 합성 없이 "연결 테스트"로 모델 이미지를 그대로 반환
-    // - 프론트가 이 값을 받아서 Viewer에 띄우면 파이프가 살아있는 거
-    // - 나중에 여기서 실제 try-on 결과 imageUrl/dataUrl로 교체하면 됨
     return res.json({
       ok: true,
       view: view || "front",
-      output: model, // dataUrl 그대로 돌려줌
+      output: model,
       debug: {
-        hasModel: true,
         keys: Object.keys(files),
       },
     })
