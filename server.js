@@ -4,8 +4,10 @@ import Replicate from "replicate"
 
 const app = express()
 
-// ✅ CORS (Framer + 로컬)
-// 커스텀 도메인/preview 도메인일 수도 있어서 "framer"만 포함해도 통과시키게 완화
+/**
+ * ✅ CORS (Framer + Local)
+ * - OPTIONS 프리플라이트도 자동 처리되게 함
+ */
 const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true)
@@ -13,7 +15,6 @@ const corsOptions = {
     const ok =
       origin.includes("framer.app") ||
       origin.includes("framer.com") ||
-      origin.includes("framer") || // ✅ 프리뷰/커스텀 케이스 완화
       origin.includes("localhost") ||
       origin.includes("127.0.0.1")
 
@@ -25,98 +26,67 @@ const corsOptions = {
 }
 
 app.use(cors(corsOptions))
-app.use(express.json({ limit: "25mb" })) // ✅ base64 이미지 받으니까 넉넉히
+app.options("*", cors(corsOptions))
+app.use(express.json({ limit: "25mb" })) // ✅ dataUrl이 커질 수 있어서 넉넉히
 
 app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) => res.json({ ok: true }))
 
+/**
+ * ✅ (중요) 브라우저에서 /api/dress 눌렀을 때 "Cannot GET"이 보기 싫으면
+ * GET도 하나 만들어두면 확인이 편해짐
+ */
+app.get("/api/dress", (req, res) => {
+  res.json({ ok: true, hint: "Use POST /api/dress" })
+})
+
+/**
+ * ✅ Replicate (지금은 아직 S3 합성 모델을 안붙였으니 '연결 테스트'만)
+ * - 나중에 여기서 실제 try-on 모델로 교체하면 됨
+ */
 const replicate = new Replicate({
   auth: process.env.REPLICATE_API_TOKEN,
 })
 
-function withAdultGuard(prompt) {
-  return `adult, age 25, ${prompt}`
-}
-
-// --------------------
-// ✅ Step1 (이미 쓰고 있는 것)
-// --------------------
-app.post("/api/s1", async (req, res) => {
-  const { prompt } = req.body
-
-  if (!process.env.REPLICATE_API_TOKEN) {
-    return res.status(500).json({ error: "REPLICATE_API_TOKEN missing on server" })
-  }
-  if (!prompt) {
-    return res.status(400).json({ error: "Prompt missing" })
-  }
-
-  try {
-    const finalPrompt = withAdultGuard(prompt)
-
-    const output = await replicate.run("google/imagen-4", {
-      input: {
-        prompt: finalPrompt,
-        image_size: "2K",
-        aspect_ratio: "9:16",
-        output_format: "png",
-      },
-    })
-
-    const imageUrl = Array.isArray(output)
-      ? output[0]?.url ? output[0].url() : output[0]
-      : output?.url ? output.url() : output
-
-    if (!imageUrl) {
-      return res.status(502).json({
-        error: "No imageUrl in output (possibly blocked/failed).",
-        output,
-      })
-    }
-
-    return res.json({ imageUrl, usedPrompt: finalPrompt })
-  } catch (e) {
-    return res.status(500).json({
-      error: "Generation failed",
-      detail: String(e?.message ?? e),
-    })
-  }
-})
-
-// --------------------
-// ✅ Step3 Dress (지금은 “연결 확인용 더미”)
-// --------------------
-// 프론트가 보내는 payload:
-// { view, model:{mime,b64}, garments:[{key,mime,b64}...], storeId, clientTime }
+/**
+ * ✅ POST /api/dress
+ * - 지금 단계 목표: 프론트가 서버를 잘 때리고, 응답을 받아서 Viewer에 표시되는지 확인
+ *
+ * 기대 입력(프론트에서):
+ * {
+ *   view: "front" | "back",
+ *   files: { "model_single": "data:image/..", "top_front": "...", ... },
+ *   meta?: { ... }
+ * }
+ */
 app.post("/api/dress", async (req, res) => {
   try {
-    const { view, model, garments, storeId } = req.body ?? {}
+    const { view, files } = req.body || {}
 
-    // ✅ 최소 검증
-    if (!view) return res.status(400).json({ error: "view missing" })
-    if (!model?.b64) return res.status(400).json({ error: "model.b64 missing" })
+    if (!files || typeof files !== "object") {
+      return res.status(400).json({ error: "files missing" })
+    }
 
-    // ✅ 지금은 AI 합성 전이라, “모델 이미지를 그대로 반환”해서
-    // 프론트 Viewer가 뜨는지부터 확인한다.
-    // (이 단계 통과되면 다음에 진짜 dressing 모델 붙이면 됨)
-    const mime = model?.mime || "image/png"
-    const dataUrl = `data:${mime};base64,${model.b64}`
+    const model = files["model_single"]
+    if (!model) {
+      return res.status(400).json({ error: "model_single missing" })
+    }
 
-    console.log("[/api/dress] ok", {
-      view,
-      storeId,
-      garmentsCount: Array.isArray(garments) ? garments.length : 0,
-    })
-
+    // ✅ 1단계: 합성 없이 "연결 테스트"로 모델 이미지를 그대로 반환
+    // - 프론트가 이 값을 받아서 Viewer에 띄우면 파이프가 살아있는 거
+    // - 나중에 여기서 실제 try-on 결과 imageUrl/dataUrl로 교체하면 됨
     return res.json({
       ok: true,
-      view,
-      dataUrl,
-      note: "DUMMY: returning model image as output. Next step: replace with real dressing.",
+      view: view || "front",
+      output: model, // dataUrl 그대로 돌려줌
+      debug: {
+        hasModel: true,
+        keys: Object.keys(files),
+      },
     })
   } catch (e) {
     return res.status(500).json({
-      error: "Dress failed",
+      error: "dress api failed",
       detail: String(e?.message ?? e),
     })
   }
