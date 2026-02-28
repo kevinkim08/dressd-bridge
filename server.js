@@ -24,7 +24,9 @@ const corsOptions = {
 }
 
 app.use(cors(corsOptions))
-app.use(express.json())
+
+// ✅ 중요: S3는 dataUrl(base64)이 커서 기본 json 제한(100kb)으로는 터짐
+app.use(express.json({ limit: "80mb" }))
 
 app.get("/", (req, res) => {
   res.send("DRESSD server running")
@@ -43,6 +45,11 @@ function withAdultGuard(prompt) {
   return `adult, age 25, ${prompt}`
 }
 
+/**
+ * =========================
+ * S1 (Imagen)
+ * =========================
+ */
 app.post("/api/s1", async (req, res) => {
   const { prompt } = req.body
 
@@ -58,10 +65,6 @@ app.post("/api/s1", async (req, res) => {
   try {
     const finalPrompt = withAdultGuard(prompt)
 
-    // ✅ 품질 개선 핵심:
-    // - image_size: "2K" (2048) → 확대해도 덜 흐림
-    // - aspect_ratio: "9:16" → 전신/모바일 최적
-    // - output_format: "png" → JPEG 압축 노이즈 줄임
     const output = await replicate.run("google/imagen-4", {
       input: {
         prompt: finalPrompt,
@@ -95,5 +98,58 @@ app.post("/api/s1", async (req, res) => {
   }
 })
 
+/**
+ * =========================
+ * S3 (Dress) - 1단계 ECHO 서버
+ * =========================
+ * Runner가 보내는 payload 예:
+ * {
+ *   view: "front"|"back",
+ *   positive: "...",
+ *   negative: "...",
+ *   files: { model_single: "data:image/..", top_front:"...", ... },
+ *   dressArrange: {...},
+ *   dressArrangeForView: {...}
+ * }
+ *
+ * ✅ 1단계 목표:
+ * - 통신/연결 검증
+ * - model_single 그대로 돌려주기
+ * - arrange/keys 로그 확인
+ */
+app.post("/api/dress", async (req, res) => {
+  try {
+    const body = req.body || {}
+    const view = body.view || "front"
+    const files = body.files || {}
+    const model = files.model_single
+
+    if (!model) {
+      return res.status(400).json({ error: "model_single missing" })
+    }
+
+    // (선택) 디버그용: 들어온 키/arrange 확인
+    const receivedKeys = Object.keys(files)
+    const arrangeForView = body.dressArrangeForView || {}
+    const arrangeKeys = Object.keys(arrangeForView)
+
+    return res.json({
+      dataUrl: model, // ✅ 지금은 합성/AI 없이 모델 그대로 반환 (연결 테스트)
+      debug: {
+        view,
+        receivedKeysCount: receivedKeys.length,
+        receivedKeys,
+        arrangeKeysCount: arrangeKeys.length,
+        arrangeKeys,
+      },
+    })
+  } catch (e) {
+    return res.status(500).json({
+      error: "Dress endpoint failed",
+      detail: String(e?.message ?? e),
+    })
+  }
+})
+
 const PORT = process.env.PORT || 3000
-app.listen(PORT, () => console.log("Server running"))
+app.listen(PORT, () => console.log("Server running on", PORT))
