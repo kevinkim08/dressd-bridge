@@ -6,36 +6,28 @@ import Replicate from "replicate"
 const app = express()
 
 /**
- * ✅ CORS: 일단 전체 허용(테스트용)
- * - 배포 후 정상 동작 확인되면, 다시 allowlist 방식으로 좁히자.
+ * ✅ CORS: 테스트 단계 전체 허용
  */
 app.use(
   cors({
-    origin: true, // 요청 Origin을 그대로 허용
+    origin: true,
     methods: ["GET", "POST", "OPTIONS"],
     allowedHeaders: ["Content-Type", "Authorization"],
   })
 )
-
-// ✅ preflight 안정화
 app.options("*", cors())
 
 /**
- * ✅ JSON 바디 사이즈 크게 (dataUrl 커서 기본값이면 터질 수 있음)
+ * ✅ dataUrl 큼 → limit 늘림
  */
 app.use(express.json({ limit: "25mb" }))
 
-app.get("/", (req, res) => {
-  res.send("DRESSD server running")
-})
-
-app.get("/health", (req, res) => {
-  res.json({ ok: true })
-})
+app.get("/", (req, res) => res.send("DRESSD server running"))
+app.get("/health", (req, res) => res.json({ ok: true }))
 
 /**
  * =========================================================
- * ✅ Replicate (S1 전용)
+ * ✅ Replicate (S1)
  * =========================================================
  */
 const replicate = new Replicate({
@@ -54,9 +46,7 @@ app.post("/api/s1", async (req, res) => {
       .status(500)
       .json({ error: "REPLICATE_API_TOKEN missing on server" })
   }
-  if (!prompt) {
-    return res.status(400).json({ error: "Prompt missing" })
-  }
+  if (!prompt) return res.status(400).json({ error: "Prompt missing" })
 
   try {
     const finalPrompt = withAdultGuard(prompt)
@@ -96,61 +86,71 @@ app.post("/api/s1", async (req, res) => {
 
 /**
  * =========================================================
- * ✅ S3 Dress endpoint (연결/디버그용: model echo)
+ * ✅ S3 Dress endpoint (연결/디버그: model echo)
+ * - Runner가 보내는 형태:
+ *   { view, model, garments, clientTime, storeId }
  * =========================================================
  */
 app.get("/api/dress", (req, res) => {
   res.json({ ok: true, hint: "Use POST /api/dress" })
 })
 
+function pickDataUrl(x) {
+  if (!x) return ""
+  if (typeof x === "string") return x
+  if (typeof x === "object") {
+    // 흔한 형태들 대응
+    if (typeof x.dataUrl === "string") return x.dataUrl
+    if (typeof x.url === "string") return x.url
+    if (typeof x.image === "string") return x.image
+  }
+  return ""
+}
+
 app.post("/api/dress", async (req, res) => {
   try {
     const body = req.body || {}
+
     const view = body.view || "front"
     const storeId = body.storeId || "no-storeId"
 
-    const files =
-      body.files ||
-      body.dressFiles ||
-      body.payload?.files ||
-      body.payload?.dressFiles ||
-      {}
+    // ✅ Runner가 보내는 방식 우선 수용
+    const modelDataUrl = pickDataUrl(body.model)
+
+    // ✅ garments는 객체일 확률이 큼 (slotKey -> dataUrl)
+    const garments = body.garments && typeof body.garments === "object"
+      ? body.garments
+      : {}
 
     console.log("[/api/dress] storeId:", storeId, "view:", view)
     console.log("[/api/dress] body keys:", Object.keys(body))
     console.log(
-      "[/api/dress] files keys:",
-      Object.keys(files || {}).slice(0, 80)
+      "[/api/dress] garments keys:",
+      Object.keys(garments).slice(0, 80)
     )
+    console.log("[/api/dress] model type:", typeof body.model)
+    console.log("[/api/dress] modelDataUrl length:", modelDataUrl?.length || 0)
 
-    const model =
-      files["model_single"] ||
-      files["model"] ||
-      files["model_front"] ||
-      body.model_single ||
-      body.model ||
-      body.payload?.model_single ||
-      body.payload?.model
-
-    if (!model || typeof model !== "string") {
+    if (!modelDataUrl) {
       return res.status(400).json({
         ok: false,
         error: "model missing",
-        hint: "Expected model_single in files (or compatible key).",
+        hint: "Expected body.model as dataUrl string OR {dataUrl}.",
         gotBodyKeys: Object.keys(body),
-        gotFilesKeys: Object.keys(files || {}),
+        gotModelType: typeof body.model,
+        gotGarmentsKeys: Object.keys(garments || {}),
       })
     }
 
-    // ✅ 일단 model을 그대로 echo (연결/뷰어 반응 확인용)
+    // ✅ 1차 목표: 서버-프론트 연결 확인용으로 model을 그대로 반환
     return res.json({
       ok: true,
       mode: "TEST_ECHO_MODEL",
       view,
       storeId,
       gotBodyKeys: Object.keys(body),
-      gotFilesKeys: Object.keys(files || {}),
-      imageDataUrl: model,
+      gotGarmentsKeys: Object.keys(garments || {}),
+      imageDataUrl: modelDataUrl,
     })
   } catch (e) {
     console.error("[/api/dress] error:", e)
