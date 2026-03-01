@@ -107,3 +107,30 @@ app.get("/api/dress", (req, res) => {
 
 const PORT = process.env.PORT || 3000
 app.listen(PORT, () => console.log("Server running on", PORT))
+app.post("/api/dress", async (req, res) => {
+  try {
+    const { view, model, garments } = req.body
+
+    if (!model) {
+      return res.status(400).json({
+        ok: false,
+        error: "model missing",
+      })
+    }
+
+    // ✅ 테스트용: 모델 이미지를 그대로 반환
+    return res.json({
+      ok: true,
+      imageDataUrl: model,
+      debug: {
+        view,
+        garmentsCount: garments ? Object.keys(garments).length : 0,
+      },
+    })
+  } catch (e) {
+    return res.status(500).json({
+      ok: false,
+      error: String(e?.message ?? e),
+    })
+  }
+})
