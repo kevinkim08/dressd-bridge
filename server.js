@@ -13,7 +13,7 @@ const corsOptions = {
     const ok =
       origin.includes("framer.app") ||
       origin.includes("framer.com") ||
-      origin.includes("framercanvas.com") || // ✅ 이거 추가!!
+      origin.includes("framercanvas.com") ||
       origin.includes("localhost") ||
       origin.includes("127.0.0.1")
 
@@ -25,10 +25,9 @@ const corsOptions = {
 }
 
 app.use(cors(corsOptions))
-// ✅ preflight(OPTIONS) 확실히 처리
 app.options("*", cors(corsOptions))
 
-app.use(express.json({ limit: "15mb" }))
+app.use(express.json({ limit: "25mb" })) // dress dataUrl 고려해 좀 더 넉넉히
 
 app.get("/", (req, res) => {
   res.send("DRESSD server running")
@@ -43,18 +42,34 @@ const replicate = new Replicate({
 })
 
 function withAdultGuard(prompt) {
-  // ✅ 정책/안전: 성인 명시 + 나이 고정
   return `adult, age 25, ${prompt}`
 }
 
-// (기존 S1 endpoint 유지)
+function isDataUrl(v) {
+  return typeof v === "string" && v.startsWith("data:image/")
+}
+
+/**
+ * ✅ dress payload에서 "현재 view"에 해당하는 garment를 하나 선택
+ * - 지금은 가장 단순하게 top_front / top_back만 사용
+ * - 추후 outer/bottom 등 확장 가능
+ */
+function pickGarment(view, garments) {
+  const primary = view === "back" ? "top_back" : "top_front"
+  const fallback = view === "back" ? "top_front" : "top_back"
+  return garments?.[primary] || garments?.[fallback] || ""
+}
+
+/**
+ * ----------------------------
+ * ✅ (기존) S1 endpoint 유지
+ * ----------------------------
+ */
 app.post("/api/s1", async (req, res) => {
   const { prompt } = req.body
 
   if (!process.env.REPLICATE_API_TOKEN) {
-    return res
-      .status(500)
-      .json({ error: "REPLICATE_API_TOKEN missing on server" })
+    return res.status(500).json({ error: "REPLICATE_API_TOKEN missing on server" })
   }
   if (!prompt) {
     return res.status(400).json({ error: "Prompt missing" })
@@ -96,41 +111,121 @@ app.post("/api/s1", async (req, res) => {
   }
 })
 
-// ✅ /api/dress GET은 안내만
+/**
+ * ----------------------------
+ * ✅ (신규) S3 Dress endpoints
+ * ----------------------------
+ */
+
+// 안내용
 app.get("/api/dress", (req, res) => {
-  res.json({ ok: true, hint: "Use POST /api/dress" })
+  res.json({ ok: true, hint: "Use POST /api/dress or GET /api/dress/:id" })
 })
 
-// ✅ /api/dress POST는 (너가 이미 붙인 try-on 로직이 있다면 여기 유지/추가하면 됨)
-// 지금은 CORS 해결이 목적이라, 네 기존 /api/dress 구현이 이미 있으면 그대로 두고
-// 위 CORS만 반영해도 됨.
-
-const PORT = process.env.PORT || 3000
-app.listen(PORT, () => console.log("Server running on", PORT))
+/**
+ * ✅ 1) 합성 시작
+ * POST /api/dress
+ * - 네 Runner payload 그대로 받음: { view, model, garments, ... }
+ * - 응답: { predictionId, status }
+ */
 app.post("/api/dress", async (req, res) => {
   try {
-    const { view, model, garments } = req.body
+    if (!process.env.REPLICATE_API_TOKEN) {
+      return res.status(500).json({ error: "REPLICATE_API_TOKEN missing on server" })
+    }
 
-    if (!model) {
+    const VERSION_ID = process.env.REPLICATE_DRESS_VERSION_ID
+    if (!VERSION_ID) {
+      return res.status(500).json({ error: "REPLICATE_DRESS_VERSION_ID missing on server" })
+    }
+
+    const { view = "front", model, garments = {} } = req.body || {}
+
+    if (!isDataUrl(model)) {
+      return res.status(400).json({ error: "model must be a dataUrl (data:image/...)" })
+    }
+
+    const garment = pickGarment(view, garments)
+    if (!isDataUrl(garment)) {
       return res.status(400).json({
-        ok: false,
-        error: "model missing",
+        error: "garment missing. Need top_front/top_back (dataUrl)",
       })
     }
 
-    // ✅ 테스트용: 모델 이미지를 그대로 반환
-    return res.json({
-      ok: true,
-      imageDataUrl: model,
-      debug: {
-        view,
-        garmentsCount: garments ? Object.keys(garments).length : 0,
+    /**
+     * ⚠️ 중요:
+     * 아래 input 키(model_image, garment_image)는 "네가 선택한 Replicate 모델" 스키마에 맞춰야 함.
+     * 오늘은 일단 OOTDiffusion류처럼 model_image/garment_image로 가정.
+     * 만약 네 모델이 다른 키를 쓰면, 여기 키 2개만 바꾸면 끝.
+     */
+    const prediction = await replicate.predictions.create({
+      version: VERSION_ID,
+      input: {
+        model_image: model,
+        garment_image: garment,
+        steps: 20,
+        guidance_scale: 2,
+        seed: 0,
       },
+    })
+
+    return res.status(202).json({
+      predictionId: prediction.id,
+      status: prediction.status,
     })
   } catch (e) {
     return res.status(500).json({
-      ok: false,
       error: String(e?.message ?? e),
     })
   }
 })
+
+/**
+ * ✅ 2) 결과 확인 (폴링)
+ * GET /api/dress/:id
+ * - 응답:
+ *   processing이면 202
+ *   succeeded면 imageUrl 반환
+ */
+app.get("/api/dress/:id", async (req, res) => {
+  try {
+    if (!process.env.REPLICATE_API_TOKEN) {
+      return res.status(500).json({ error: "REPLICATE_API_TOKEN missing on server" })
+    }
+
+    const pred = await replicate.predictions.get(req.params.id)
+
+    if (pred.status === "succeeded") {
+      const output = pred.output
+      const imageUrl = Array.isArray(output) ? output[0] : output
+
+      return res.json({
+        predictionId: pred.id,
+        status: pred.status,
+        imageUrl,
+      })
+    }
+
+    if (pred.status === "failed" || pred.status === "canceled") {
+      return res.status(500).json({
+        predictionId: pred.id,
+        status: pred.status,
+        error: pred.error || "prediction failed",
+      })
+    }
+
+    // starting / processing
+    return res.status(202).json({
+      predictionId: pred.id,
+      status: pred.status,
+    })
+  } catch (e) {
+    return res.status(500).json({
+      error: String(e?.message ?? e),
+    })
+  }
+})
+
+// ✅ 마지막에 listen
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => console.log("Server running on", PORT))
