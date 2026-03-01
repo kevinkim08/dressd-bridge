@@ -5,29 +5,38 @@ import Replicate from "replicate"
 
 const app = express()
 
-app.use(
-  cors({
-    origin: true,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-)
-app.options("*", cors())
+// ✅ CORS: Framer + 로컬
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true)
+    const ok =
+      origin.includes("framer.app") ||
+      origin.includes("framer.com") ||
+      origin.includes("localhost") ||
+      origin.includes("127.0.0.1")
+    if (ok) return cb(null, true)
+    return cb(new Error("Not allowed by CORS: " + origin))
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}
 
-app.use(express.json({ limit: "35mb" }))
+app.use(cors(corsOptions))
+app.use(express.json({ limit: "25mb" })) // ✅ dataUrl이 커질 수 있어서 넉넉히
 
-app.get("/", (req, res) => res.send("DRESSD server running"))
-app.get("/health", (req, res) => res.json({ ok: true }))
+app.get("/", (req, res) => {
+  res.send("DRESSD server running")
+})
 
-/**
- * =========================================================
- * ✅ Replicate (S1)
- * =========================================================
- */
+app.get("/health", (req, res) => {
+  res.json({ ok: true })
+})
+
 const replicate = new Replicate({
   auth: process.env.REPLICATE_API_TOKEN,
 })
 
+// ✅ S1 (이미 쓰던 것 유지)
 function withAdultGuard(prompt) {
   return `adult, age 25, ${prompt}`
 }
@@ -36,11 +45,11 @@ app.post("/api/s1", async (req, res) => {
   const { prompt } = req.body
 
   if (!process.env.REPLICATE_API_TOKEN) {
-    return res
-      .status(500)
-      .json({ error: "REPLICATE_API_TOKEN missing on server" })
+    return res.status(500).json({ error: "REPLICATE_API_TOKEN missing on server" })
   }
-  if (!prompt) return res.status(400).json({ error: "Prompt missing" })
+  if (!prompt) {
+    return res.status(400).json({ error: "Prompt missing" })
+  }
 
   try {
     const finalPrompt = withAdultGuard(prompt)
@@ -79,136 +88,140 @@ app.post("/api/s1", async (req, res) => {
 })
 
 /**
- * =========================================================
- * ✅ S3 Dress endpoint (연결/디버그: model echo)
- * =========================================================
+ * ==========================================================
+ * ✅ S3: Dress (Virtual Try-on)
+ * - Replicate IDM-VTON 사용
+ * - 입력 스키마: human_img, garm_img, category, crop, steps, seed... :contentReference[oaicite:1]{index=1}
+ * ==========================================================
  */
+
+// ✅ 특정 버전 고정 (테스트 안정성)
+const IDM_VTON_VERSION =
+  "cuuupid/idm-vton:3b032a70c29aef7b9c3222f2e40b71660201d8c288336475ba326f3ca278a3e1"
+
+// ✅ category 자동 결정: 일단 S3는 "상의/아우터" 중심으로 upper_body가 기본
+function normalizeCategory(v) {
+  const x = String(v ?? "").trim()
+  if (x === "upper_body" || x === "lower_body" || x === "dresses") return x
+  return "upper_body"
+}
+
+// GET으로 때리면 힌트 주기 (너가 브라우저로 확인하던 그 용도)
 app.get("/api/dress", (req, res) => {
   res.json({ ok: true, hint: "Use POST /api/dress" })
 })
 
-/**
- * ✅ 어떤 형태로 와도 dataUrl을 최대한 찾아냄
- * - string: 그대로
- * - array: 첫 원소부터 재귀적으로 탐색
- * - object: 흔한 키들(dataUrl/previewUrl/imageDataUrl/src/url/...)
- *          + model_single 같은 키로 직접 박혀있는 경우
- *          + 숫자키("0","1") array-like 도 대응
- *          + 한 단계 더 들어간 nested 도 대응 (image: {...}, model: {...} 등)
- */
-function pickDataUrl(x, depth = 0) {
-  if (!x) return ""
-  if (depth > 4) return "" // 무한 루프 방지
-
-  if (typeof x === "string") return x
-
-  // Array
-  if (Array.isArray(x)) {
-    for (const item of x) {
-      const got = pickDataUrl(item, depth + 1)
-      if (got) return got
-    }
-    return ""
-  }
-
-  // Object
-  if (typeof x === "object") {
-    // 1) 흔한 키들 우선
-    const directKeys = [
-      "dataUrl",
-      "imageDataUrl",
-      "previewUrl",
-      "src",
-      "url",
-      "image",
-      "base64",
-      "b64",
-      "content",
-    ]
-    for (const k of directKeys) {
-      if (typeof x[k] === "string" && x[k].startsWith("data:image")) return x[k]
-    }
-
-    // 2) model_single 처럼 키로 바로 들어오는 경우
-    if (typeof x["model_single"] === "string" && x["model_single"].startsWith("data:image")) {
-      return x["model_single"]
-    }
-
-    // 3) 숫자키 array-like ({"0": "...", "1": "..."})
-    if (typeof x["0"] === "string" && x["0"].startsWith("data:image")) return x["0"]
-
-    // 4) 위 키들이 객체라면 한 단계 더 들어가 보기
-    for (const k of directKeys) {
-      if (x[k] && typeof x[k] === "object") {
-        const got = pickDataUrl(x[k], depth + 1)
-        if (got) return got
-      }
-    }
-
-    // 5) 마지막: 모든 값 훑어서 dataUrl 찾기 (너무 무겁지 않게 depth 제한 있음)
-    for (const k of Object.keys(x)) {
-      const v = x[k]
-      const got = pickDataUrl(v, depth + 1)
-      if (got) return got
-    }
-  }
-
-  return ""
-}
-
-function keysOf(x) {
-  if (!x) return []
-  if (Array.isArray(x)) return x.map((_, i) => String(i))
-  if (typeof x === "object") return Object.keys(x)
-  return []
-}
-
 app.post("/api/dress", async (req, res) => {
+  if (!process.env.REPLICATE_API_TOKEN) {
+    return res.status(500).json({ ok: false, error: "REPLICATE_API_TOKEN missing on server" })
+  }
+
+  const body = req.body ?? {}
+  const view = (body.view === "back" ? "back" : "front")
+
+  /**
+   * ✅ 우리가 받는 payload 규격(클라에서 맞춰줄 것)
+   * {
+   *   view: "front" | "back",
+   *   model: "<dataUrl or url string>",
+   *   garments: [{ key: "top_front", dataUrl: "<dataUrl or url>" , category?: "upper_body" }],
+   *   category?: "upper_body" | "lower_body" | "dresses",
+   *   crop?: boolean,
+   *   steps?: number,
+   *   seed?: number,
+   *   storeId?: string,
+   *   clientTime?: number
+   * }
+   */
+
+  const model = body.model
+  const garments = Array.isArray(body.garments) ? body.garments : []
+
+  // ✅ model validation
+  if (!model || typeof model !== "string") {
+    return res.status(400).json({
+      ok: false,
+      error: "model missing",
+      hint: "Expected body.model as dataUrl string OR URL string",
+      gotBodyKeys: Object.keys(body),
+      gotModelType: typeof model,
+    })
+  }
+
+  // ✅ garment validation (지금은 1개만 먼저 제대로 만들자)
+  if (!garments.length) {
+    return res.status(400).json({
+      ok: false,
+      error: "garments missing",
+      hint: "Expected body.garments as array with at least one item {dataUrl}",
+      gotGarmentsType: typeof body.garments,
+    })
+  }
+
+  const g0 = garments[0] ?? {}
+  const garm_img = g0.dataUrl
+  if (!garm_img || typeof garm_img !== "string") {
+    return res.status(400).json({
+      ok: false,
+      error: "garment[0].dataUrl missing",
+      hint: "Expected garments[0].dataUrl as dataUrl string OR URL string",
+      gotGarment0Keys: Object.keys(g0),
+      gotGarmType: typeof garm_img,
+    })
+  }
+
+  // ✅ category: body 우선, 없으면 garment item, 최종 upper_body
+  const category = normalizeCategory(body.category ?? g0.category)
+
+  // ✅ crop: 모델이 3:4가 아닐 수 있으니 기본 true 권장(테스트 안정)
+  const crop = typeof body.crop === "boolean" ? body.crop : true
+
+  // ✅ steps: 기본 30 (Replicate schema default 30, 20~40) :contentReference[oaicite:2]{index=2}
+  let steps = Number.isFinite(body.steps) ? Number(body.steps) : 30
+  steps = Math.max(20, Math.min(40, steps))
+
+  // ✅ seed: 고정하면 재현성이 좋아짐
+  const seed = Number.isFinite(body.seed) ? Number(body.seed) : 42
+
   try {
-    const body = req.body || {}
-    const view = body.view || "front"
-    const storeId = body.storeId || "no-storeId"
+    // ✅ Replicate run
+    const outputUrl = await replicate.run(IDM_VTON_VERSION, {
+      input: {
+        human_img: model,     // :contentReference[oaicite:3]{index=3}
+        garm_img: garm_img,   // :contentReference[oaicite:4]{index=4}
+        category,             // :contentReference[oaicite:5]{index=5}
+        crop,                 // :contentReference[oaicite:6]{index=6}
+        steps,                // :contentReference[oaicite:7]{index=7}
+        seed,                 // :contentReference[oaicite:8]{index=8}
+      },
+    })
 
-    const modelDataUrl = pickDataUrl(body.model)
-
-    // garments: object일 수도, array일 수도 있음
-    const garmentsRaw = body.garments
-    const garmentsKeys = keysOf(garmentsRaw)
-
-    console.log("[/api/dress] storeId:", storeId, "view:", view)
-    console.log("[/api/dress] body keys:", Object.keys(body))
-    console.log("[/api/dress] model keys:", keysOf(body.model))
-    console.log("[/api/dress] garments keys:", garmentsKeys.slice(0, 60))
-    console.log("[/api/dress] modelDataUrl length:", modelDataUrl?.length || 0)
-
-    if (!modelDataUrl) {
-      return res.status(400).json({
+    // outputUrl은 string(URI) 형태 :contentReference[oaicite:9]{index=9}
+    if (!outputUrl || typeof outputUrl !== "string") {
+      return res.status(502).json({
         ok: false,
-        error: "model missing",
-        hint: "Expected body.model as dataUrl string OR object containing dataUrl-like fields.",
-        gotBodyKeys: Object.keys(body),
-        gotModelType: typeof body.model,
-        gotModelKeys: keysOf(body.model),
-        gotGarmentsKeys: garmentsKeys,
+        error: "No outputUrl returned",
+        output: outputUrl,
       })
     }
 
-    // ✅ 1차 목표: 연결 검증 → model을 그대로 반환
     return res.json({
       ok: true,
-      mode: "TEST_ECHO_MODEL",
       view,
-      storeId,
-      gotBodyKeys: Object.keys(body),
-      gotModelKeys: keysOf(body.model),
-      gotGarmentsKeys: garmentsKeys,
-      imageDataUrl: modelDataUrl,
+      category,
+      outputUrl,
+      debug: {
+        crop,
+        steps,
+        seed,
+        storeId: body.storeId ?? null,
+        clientTime: body.clientTime ?? null,
+      },
     })
   } catch (e) {
-    console.error("[/api/dress] error:", e)
     return res.status(500).json({
       ok: false,
-      error: "Internal error in /api/dress",
+      error: "Dress generation failed",
       detail: String(e?.message ?? e),
     })
   }
