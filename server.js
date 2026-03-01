@@ -1,4 +1,4 @@
-// server.js
+// server.js (ESM)
 import express from "express"
 import cors from "cors"
 import Replicate from "replicate"
@@ -6,128 +6,128 @@ import Replicate from "replicate"
 const app = express()
 
 /**
- * ✅ DEV에서는 전체 허용 (지금 단계에선 이게 맞음)
- * 운영 전환 시 아래 "ALLOWLIST 모드"로 바꾸면 됨.
+ * ✅ CORS
+ * - framer preview/production 도메인, 로컬 허용
+ * - Render health check 같은 origin 없는 요청도 허용
  */
-app.use(
-  cors({
-    origin: true,
-    methods: ["GET", "POST", "OPTIONS"],
-    allowedHeaders: ["Content-Type", "Authorization"],
-  })
-)
-app.options("*", cors())
+const corsOptions = {
+  origin: (origin, cb) => {
+    if (!origin) return cb(null, true)
 
-// ✅ dataUrl payload 크기 대비 (모델+의류 여러 장이면 커짐)
-app.use(express.json({ limit: "80mb" }))
+    const ok =
+      origin.includes("framer.app") ||
+      origin.includes("framer.com") ||
+      origin.includes("localhost") ||
+      origin.includes("127.0.0.1")
+
+    if (ok) return cb(null, true)
+    return cb(new Error("Not allowed by CORS: " + origin))
+  },
+  methods: ["GET", "POST", "OPTIONS"],
+  allowedHeaders: ["Content-Type", "Authorization"],
+}
+
+app.use(cors(corsOptions))
+app.options("*", cors(corsOptions)) // ✅ preflight 안정화
+app.use(express.json({ limit: "25mb" })) // ✅ dataUrl 길어서 넉넉히
 
 app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) => res.json({ ok: true }))
-
-app.get("/api/dress", (req, res) => {
-  res.json({ ok: true, hint: "Use POST /api/dress" })
-})
 
 const replicate = new Replicate({
   auth: process.env.REPLICATE_API_TOKEN,
 })
 
-function isDataUrl(v) {
-  return typeof v === "string" && v.startsWith("data:image/")
-}
-
-function normalizeModel(model) {
-  if (typeof model === "string") return model
-  if (model && typeof model === "object") {
-    if (typeof model.dataUrl === "string") return model.dataUrl
-    if (typeof model.url === "string") return model.url
+/**
+ * ✅ helper: garments object에서 첫번째 이미지 뽑기
+ * - { "top_front": "data:image/...", "outer_front": "data:image/..." } 형태
+ */
+function pickFirstGarment(garments) {
+  if (!garments || typeof garments !== "object") return null
+  const keys = Object.keys(garments)
+  for (const k of keys) {
+    const v = garments[k]
+    if (typeof v === "string" && (v.startsWith("data:image/") || v.startsWith("http"))) {
+      return { key: k, value: v }
+    }
   }
   return null
 }
 
-function pickFirstGarment(garmentsObj) {
-  if (!garmentsObj || typeof garmentsObj !== "object") return null
-  const keys = Object.keys(garmentsObj)
-  if (!keys.length) return null
-  // 현재는 1개만 먼저 붙여서 성공 루프를 만들자
-  const k = keys[0]
-  const v = garmentsObj[k]
-  if (typeof v === "string") return { key: k, value: v }
-  return null
-}
+app.get("/api/dress", (req, res) => {
+  res.json({ ok: true, hint: "Use POST /api/dress" })
+})
 
 /**
- * POST /api/dress
+ * ✅ POST /api/dress
  * body:
  * {
  *   view: "front" | "back",
- *   model: "data:image/..."  // or {dataUrl}
- *   garments: { "top_front": "data:image/..." ... }
- *   clientTime, storeId
+ *   model: "data:image/..." | "https://...",
+ *   garments: { [key:string]: "data:image/..." | "https://..." },
+ *   clientTime?: number,
+ *   storeId?: string
  * }
  */
 app.post("/api/dress", async (req, res) => {
   try {
-    const { view, model, garments, clientTime, storeId } = req.body || {}
+    if (!process.env.REPLICATE_API_TOKEN) {
+      return res.status(500).json({ ok: false, error: "REPLICATE_API_TOKEN missing on server" })
+    }
 
-    const v = view === "front" || view === "back" ? view : "front"
-    const modelNorm = normalizeModel(model)
+    const { view, model, garments } = req.body || {}
 
-    if (!modelNorm) {
+    // ✅ 모델 필수
+    if (!model || typeof model !== "string") {
       return res.status(400).json({
         ok: false,
         error: "model missing",
-        hint: "Expected body.model as dataUrl string OR {dataUrl} OR {url}",
+        hint: "Expected body.model as dataUrl string OR {dataUrl} string",
         gotBodyKeys: Object.keys(req.body || {}),
-        gotModelType: typeof model,
-        gotGarmentsKeys:
-          garments && typeof garments === "object" ? Object.keys(garments) : [],
       })
     }
 
-    // ✅ garment 1개만 먼저 성공시키는 전략 (확장 쉬움)
-    const firstGarment = pickFirstGarment(garments)
+    // ✅ 의류 1개라도 있어야 진짜 try-on 의미가 있음
+    const picked = pickFirstGarment(garments)
+    if (!picked) {
+      return res.status(400).json({
+        ok: false,
+        error: "garment missing",
+        hint: "Expected body.garments as object with at least 1 image (dataUrl or http url)",
+        gotGarmentsKeys: garments ? Object.keys(garments) : [],
+      })
+    }
 
-    // ✅ 아직 DRESS 모델을 안 붙였으면: 테스트 에코 (절대 안깨짐)
-    const DRESS_MODEL = process.env.REPLICATE_DRESS_MODEL || ""
-    if (!DRESS_MODEL || !process.env.REPLICATE_API_TOKEN) {
-      return res.json({
-        ok: true,
-        mode: "echo",
-        imageDataUrl: modelNorm,
-        debug: {
-          view: v,
-          storeId: storeId || "no-store-id",
-          clientTime: clientTime || null,
-          modelIsDataUrl: isDataUrl(modelNorm),
-          firstGarmentKey: firstGarment?.key || null,
-          garmentsCount:
-            garments && typeof garments === "object"
-              ? Object.keys(garments).length
-              : 0,
-          note:
-            "Set REPLICATE_API_TOKEN + REPLICATE_DRESS_MODEL to enable real try-on.",
+    // ✅ idm-vton 입력 구성
+    // - Replicate 모델 페이지의 input schema: human_img, garm_img, garment_des ... :contentReference[oaicite:2]{index=2}
+    const human_img = model
+    const garm_img = picked.value
+
+    // 아주 단순한 설명(나중에 너희 S3DressPrompt에서 정교화 가능)
+    const garment_des =
+      picked.key.includes("top") ? "top" :
+      picked.key.includes("bottom") ? "bottom" :
+      picked.key.includes("outer") ? "outerwear" :
+      "garment"
+
+    const output = await replicate.run(
+      // ✅ idm-vton (cuuupid)
+      "cuuupid/idm-vton:3b032a70c29aef7b9c3222f2e40b71660201d8c288336475ba326f3ca278a3e1",
+      {
+        input: {
+          human_img,
+          garm_img,
+          garment_des,
+          // mask_img: optional
         },
-      })
-    }
+      }
+    )
 
-    // ✅ 여기부터 “진짜” try-on 호출
-    // ⚠️ Replicate 모델마다 input 키가 다르다.
-    // 그래서 일단 범용 구조로 만들고, 네가 정한 모델 스펙에 맞게 input만 맞추면 됨.
-    const input = {
-      // 흔한 패턴 예시 (모델에 맞게 교체)
-      model_image: modelNorm,
-      garment_image: firstGarment?.value || null,
-      view: v,
-    }
-
-    const output = await replicate.run(DRESS_MODEL, { input })
-
-    // output이 URL이거나 배열일 수 있어서 정규화
-    let imageUrl = null
-    if (Array.isArray(output)) imageUrl = output[0]
-    else if (output?.url) imageUrl = output.url()
-    else imageUrl = output
+    // Replicate output 형태가 모델마다 달라서 유연하게 처리
+    const imageUrl =
+      Array.isArray(output)
+        ? (output[0]?.url ? output[0].url() : output[0])
+        : (output?.url ? output.url() : output)
 
     if (!imageUrl) {
       return res.status(502).json({
@@ -139,19 +139,14 @@ app.post("/api/dress", async (req, res) => {
 
     return res.json({
       ok: true,
-      mode: "replicate",
+      view: view ?? null,
+      usedGarmentKey: picked.key,
       imageUrl,
-      debug: {
-        view: v,
-        storeId: storeId || "no-store-id",
-        usedModel: DRESS_MODEL,
-        usedGarmentKey: firstGarment?.key || null,
-      },
     })
   } catch (e) {
     return res.status(500).json({
       ok: false,
-      error: "Internal Server Error",
+      error: "Dress generation failed",
       detail: String(e?.message ?? e),
     })
   }
