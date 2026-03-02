@@ -49,7 +49,7 @@ app.post("/api/s1", async (req, res) => {
       input: {
         prompt: finalPrompt,
         image_size: "2K",
-        aspect_ratio: "9:16",
+        aspect_ratio: "3"4",
         output_format: "png",
       },
     })
