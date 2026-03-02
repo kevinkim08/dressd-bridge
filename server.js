@@ -7,7 +7,9 @@ const app = express()
 // ✅ Node 18+ 는 fetch 기본 제공.
 // Render/로컬에서 Node 버전이 낮아 fetch가 없으면 에러나니까 안전장치.
 if (typeof globalThis.fetch !== "function") {
-  console.warn("[WARN] fetch is not available. Use Node 18+ or add a fetch polyfill (undici/node-fetch).")
+  console.warn(
+    "[WARN] fetch is not available. Use Node 18+ or add a fetch polyfill (undici/node-fetch)."
+  )
 }
 
 const corsOptions = {
@@ -23,7 +25,8 @@ const corsOptions = {
     return cb(new Error("Not allowed by CORS: " + origin))
   },
   methods: ["GET", "POST", "OPTIONS"],
-  allowedHeaders: ["Content-Type", "Authorization"],
+  // ✅ 중요: 프론트에서 X-Client-Id 헤더를 보내므로 허용해야 함
+  allowedHeaders: ["Content-Type", "Authorization", "X-Client-Id"],
 }
 
 app.use(cors(corsOptions))
@@ -32,6 +35,151 @@ app.use(express.json({ limit: "25mb" }))
 
 app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) => res.json({ ok: true }))
+
+/** -------------------------
+ *  Credits (MVP B안: reserve/commit/release)
+ *  - 로그인 없음: clientId(브라우저 localStorage)로 관리
+ *  - 메모리 저장: 서버 재시작 시 초기화(현재 단계에 OK)
+ *  ------------------------- */
+const DEFAULT_BALANCE = 1000 // 테스트 기본 지급 (원하면 0으로)
+const RESERVE_TTL_MS = 5 * 60 * 1000 // 5분
+
+const balances = new Map() // clientId -> number
+const reservations = new Map()
+// reservationId -> { clientId, amount, status, createdAt, expiresAt, reason, committedAt?, releasedAt?, releaseReason? }
+
+function now() {
+  return Date.now()
+}
+
+function getClientId(req) {
+  const id = req.header("X-Client-Id")
+  if (!id) throw new Error("Missing X-Client-Id")
+  return id
+}
+
+function getBalance(clientId) {
+  if (!balances.has(clientId)) balances.set(clientId, DEFAULT_BALANCE)
+  return balances.get(clientId)
+}
+
+function setBalance(clientId, v) {
+  balances.set(clientId, v)
+}
+
+function cleanupExpiredReservations() {
+  const t = now()
+  for (const [rid, r] of reservations.entries()) {
+    if (r.status === "reserved" && r.expiresAt <= t) {
+      // 만료면 자동 환불(=release)
+      const bal = getBalance(r.clientId)
+      setBalance(r.clientId, bal + r.amount)
+      reservations.set(rid, { ...r, status: "released", releasedAt: t, releaseReason: "expired" })
+    }
+  }
+}
+setInterval(cleanupExpiredReservations, 15000)
+
+app.post("/api/credits/balance", (req, res) => {
+  try {
+    const clientId = getClientId(req)
+    return res.json({ clientId, balance: getBalance(clientId) })
+  } catch (e) {
+    return res.status(400).json({ error: String(e?.message ?? e) })
+  }
+})
+
+app.post("/api/credits/reserve", (req, res) => {
+  try {
+    const clientId = getClientId(req)
+    const amount = Number(req.body?.amount || 0)
+    const reason = String(req.body?.reason || "")
+
+    if (!Number.isFinite(amount) || amount <= 0) {
+      return res.status(400).json({ error: "amount must be > 0" })
+    }
+
+    const balance = getBalance(clientId)
+    if (balance < amount) {
+      return res.status(402).json({ error: "insufficient_credits", balance })
+    }
+
+    // reserve 시점에 hold 차감
+    setBalance(clientId, balance - amount)
+
+    const reservationId = `r_${now()}_${Math.random().toString(16).slice(2)}`
+    const createdAt = now()
+    const expiresAt = createdAt + RESERVE_TTL_MS
+
+    reservations.set(reservationId, {
+      reservationId,
+      clientId,
+      amount,
+      status: "reserved",
+      createdAt,
+      expiresAt,
+      reason,
+    })
+
+    return res.json({ reservationId, expiresAt, balance: getBalance(clientId) })
+  } catch (e) {
+    return res.status(400).json({ error: String(e?.message ?? e) })
+  }
+})
+
+app.post("/api/credits/commit", (req, res) => {
+  try {
+    const clientId = getClientId(req)
+    const reservationId = String(req.body?.reservationId || "")
+    const r = reservations.get(reservationId)
+    if (!r) return res.status(404).json({ error: "reservation_not_found" })
+    if (r.clientId !== clientId) return res.status(403).json({ error: "forbidden" })
+
+    if (r.status === "committed") {
+      return res.json({ ok: true, idempotent: true, balance: getBalance(clientId) })
+    }
+    if (r.status !== "reserved") {
+      return res.status(400).json({ error: `cannot_commit_status_${r.status}` })
+    }
+
+    reservations.set(reservationId, { ...r, status: "committed", committedAt: now() })
+    return res.json({ ok: true, balance: getBalance(clientId) })
+  } catch (e) {
+    return res.status(400).json({ error: String(e?.message ?? e) })
+  }
+})
+
+app.post("/api/credits/release", (req, res) => {
+  try {
+    const clientId = getClientId(req)
+    const reservationId = String(req.body?.reservationId || "")
+    const reason = String(req.body?.reason || "release")
+    const r = reservations.get(reservationId)
+    if (!r) return res.status(404).json({ error: "reservation_not_found" })
+    if (r.clientId !== clientId) return res.status(403).json({ error: "forbidden" })
+
+    if (r.status === "released") {
+      return res.json({ ok: true, idempotent: true, balance: getBalance(clientId) })
+    }
+    if (r.status !== "reserved") {
+      return res.status(400).json({ error: `cannot_release_status_${r.status}` })
+    }
+
+    // 환불(hold 되돌리기)
+    setBalance(clientId, getBalance(clientId) + r.amount)
+
+    reservations.set(reservationId, {
+      ...r,
+      status: "released",
+      releasedAt: now(),
+      releaseReason: reason,
+    })
+
+    return res.json({ ok: true, balance: getBalance(clientId) })
+  } catch (e) {
+    return res.status(400).json({ error: String(e?.message ?? e) })
+  }
+})
 
 /** -------------------------
  *  S1 (Replicate / Imagen)
@@ -79,9 +227,7 @@ function pickImageUrl(output) {
   if (Array.isArray(output)) {
     const first = output[0]
     if (!first) return null
-    // string url
     if (typeof first === "string") return first
-    // object with url() or url
     if (typeof first?.url === "function") return first.url()
     if (typeof first?.url === "string") return first.url
     return null
@@ -94,7 +240,6 @@ function pickImageUrl(output) {
   if (output && typeof output?.url === "function") return output.url()
   if (output && typeof output?.url === "string") return output.url
 
-  // 4) 기타 케이스
   return null
 }
 
@@ -103,7 +248,7 @@ async function runImagen(prompt) {
     input: {
       prompt,
       image_size: "2K",
-      aspect_ratio: "3:4", // ✅ 3:4 고정
+      aspect_ratio: "3:4",
       output_format: "png",
     },
   })
@@ -140,11 +285,25 @@ app.post("/api/s1", async (req, res) => {
   }
 })
 
-// ✅ 신규 엔드포인트: /api/s1/pair (FRONT+BACK 2장 생성)
+// ✅ 신규 엔드포인트: /api/s1/pair (FRONT+BACK 2장 생성 + reservationId 필수)
 app.post("/api/s1/pair", async (req, res) => {
-  const { prompt } = req.body || {}
+  const { prompt, reservationId } = req.body || {}
   if (!mustHaveToken(res)) return
   if (!prompt) return res.status(400).json({ error: "Prompt missing" })
+
+  // ✅ credit reservation 검증
+  let clientId = null
+  let r = null
+  try {
+    clientId = getClientId(req)
+    if (!reservationId) return res.status(400).json({ error: "Missing reservationId" })
+    r = reservations.get(String(reservationId))
+    if (!r) return res.status(404).json({ error: "reservation_not_found" })
+    if (r.clientId !== clientId) return res.status(403).json({ error: "forbidden" })
+    if (r.status !== "reserved") return res.status(400).json({ error: `bad_reservation_status_${r.status}` })
+  } catch (e) {
+    return res.status(400).json({ error: String(e?.message ?? e) })
+  }
 
   try {
     const base = withAdultGuard(prompt)
@@ -156,6 +315,19 @@ app.post("/api/s1/pair", async (req, res) => {
     const backUrl = await runImagen(promptBack)
 
     if (!frontUrl || !backUrl) {
+      // 실패 → release(환불)
+      try {
+        if (r && r.status === "reserved") {
+          setBalance(clientId, getBalance(clientId) + r.amount)
+          reservations.set(String(reservationId), {
+            ...r,
+            status: "released",
+            releasedAt: now(),
+            releaseReason: "no_image_url",
+          })
+        }
+      } catch {}
+
       return res.status(502).json({
         error: "No imageUrl in output",
         frontUrl: frontUrl || null,
@@ -163,17 +335,36 @@ app.post("/api/s1/pair", async (req, res) => {
       })
     }
 
+    // ✅ 성공 → commit
+    reservations.set(String(reservationId), { ...r, status: "committed", committedAt: now() })
+
     return res.json({
       frontUrl,
       backUrl,
       usedPromptFront: promptFront,
       usedPromptBack: promptBack,
       aspect_ratio: "3:4",
+      credit: { committed: true, balance: getBalance(clientId) },
+      reservationId,
     })
   } catch (e) {
+    // 예외 → release(환불)
+    try {
+      if (r && r.status === "reserved") {
+        setBalance(clientId, getBalance(clientId) + r.amount)
+        reservations.set(String(reservationId), {
+          ...r,
+          status: "released",
+          releasedAt: now(),
+          releaseReason: "generation_failed",
+        })
+      }
+    } catch {}
+
     return res.status(500).json({
       error: "Generation failed",
       detail: String(e?.message ?? e),
+      reservationId,
     })
   }
 })
@@ -199,7 +390,7 @@ function fashnHeaders() {
   if (!key) throw new Error("FASHN_API_KEY missing on server")
   return {
     "Content-Type": "application/json",
-    "Authorization": `Bearer ${key}`,
+    Authorization: `Bearer ${key}`,
   }
 }
 
@@ -235,7 +426,9 @@ app.post("/api/dress", async (req, res) => {
 
     const text = await r.text()
     let json = null
-    try { json = JSON.parse(text) } catch {}
+    try {
+      json = JSON.parse(text)
+    } catch {}
 
     if (!r.ok) {
       return res.status(r.status).json({
@@ -261,7 +454,9 @@ app.get("/api/dress/:id", async (req, res) => {
     const r = await fetch(`${FASHN_BASE}/status/${id}`, { headers: fashnHeaders() })
     const text = await r.text()
     let json = null
-    try { json = JSON.parse(text) } catch {}
+    try {
+      json = JSON.parse(text)
+    } catch {}
 
     if (!r.ok) {
       return res.status(r.status).json({
@@ -273,9 +468,10 @@ app.get("/api/dress/:id", async (req, res) => {
 
     if (status === "completed") {
       const output = json?.output
-      const imageUrl =
-        Array.isArray(output) ? output[0]
-        : typeof output === "string" ? output
+      const imageUrl = Array.isArray(output)
+        ? output[0]
+        : typeof output === "string"
+        ? output
         : output?.image || output?.image_url || output?.url
 
       if (!imageUrl) {
