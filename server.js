@@ -28,7 +28,7 @@ app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) => res.json({ ok: true }))
 
 /** -------------------------
- *  S1 (Replicate) 그대로 유지
+ *  S1 (Replicate / Imagen)
  *  ------------------------- */
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN })
 
@@ -36,6 +36,56 @@ function withAdultGuard(prompt) {
   return `adult, age 25, ${prompt}`
 }
 
+// ✅ FRONT/BACK 뷰를 강하게 고정 (모델 일관성 ↑)
+function withViewLock(prompt, view) {
+  if (view === "back") {
+    return [
+      prompt,
+      "back view only",
+      "rear view",
+      "standing straight",
+      "full body",
+      "head to toe",
+      "feet visible",
+      "not front view",
+      "single person",
+      "centered",
+    ].join(", ")
+  }
+  // default front
+  return [
+    prompt,
+    "front view only",
+    "front-facing",
+    "standing straight",
+    "full body",
+    "head to toe",
+    "feet visible",
+    "not back view",
+    "single person",
+    "centered",
+  ].join(", ")
+}
+
+function pickImageUrl(output) {
+  return Array.isArray(output)
+    ? (output[0]?.url ? output[0].url() : output[0])
+    : (output?.url ? output.url() : output)
+}
+
+async function runImagen(prompt) {
+  const output = await replicate.run("google/imagen-4", {
+    input: {
+      prompt,
+      image_size: "2K",
+      aspect_ratio: "3:4", // ✅ 3:4 고정
+      output_format: "png",
+    },
+  })
+  return pickImageUrl(output)
+}
+
+// ✅ 기존 엔드포인트 유지: /api/s1 (FRONT 1장만)
 app.post("/api/s1", async (req, res) => {
   const { prompt } = req.body
   if (!process.env.REPLICATE_API_TOKEN) {
@@ -45,23 +95,51 @@ app.post("/api/s1", async (req, res) => {
 
   try {
     const finalPrompt = withAdultGuard(prompt)
-    const output = await replicate.run("google/imagen-4", {
-      input: {
-        prompt: finalPrompt,
-        image_size: "2K",
-        aspect_ratio: "3:4",
-        output_format: "png",
-      },
-    })
-
-    const imageUrl = Array.isArray(output)
-      ? output[0]?.url ? output[0].url() : output[0]
-      : output?.url ? output.url() : output
+    const lockedPrompt = withViewLock(finalPrompt, "front")
+    const imageUrl = await runImagen(lockedPrompt)
 
     if (!imageUrl) {
-      return res.status(502).json({ error: "No imageUrl in output", output })
+      return res.status(502).json({ error: "No imageUrl in output" })
     }
-    return res.json({ imageUrl, usedPrompt: finalPrompt })
+    return res.json({ imageUrl, usedPrompt: lockedPrompt })
+  } catch (e) {
+    return res.status(500).json({ error: "Generation failed", detail: String(e?.message ?? e) })
+  }
+})
+
+// ✅ 신규 엔드포인트: /api/s1/pair (FRONT+BACK 2장 생성)
+app.post("/api/s1/pair", async (req, res) => {
+  const { prompt } = req.body
+  if (!process.env.REPLICATE_API_TOKEN) {
+    return res.status(500).json({ error: "REPLICATE_API_TOKEN missing on server" })
+  }
+  if (!prompt) return res.status(400).json({ error: "Prompt missing" })
+
+  try {
+    const base = withAdultGuard(prompt)
+
+    const promptFront = withViewLock(base, "front")
+    const promptBack = withViewLock(base, "back")
+
+    // ✅ 순차 실행(안정)
+    const frontUrl = await runImagen(promptFront)
+    const backUrl = await runImagen(promptBack)
+
+    if (!frontUrl || !backUrl) {
+      return res.status(502).json({
+        error: "No imageUrl in output",
+        frontUrl: frontUrl || null,
+        backUrl: backUrl || null,
+      })
+    }
+
+    return res.json({
+      frontUrl,
+      backUrl,
+      usedPromptFront: promptFront,
+      usedPromptBack: promptBack,
+      aspect_ratio: "3:4",
+    })
   } catch (e) {
     return res.status(500).json({ error: "Generation failed", detail: String(e?.message ?? e) })
   }
@@ -72,7 +150,7 @@ app.post("/api/s1", async (req, res) => {
  *  ------------------------- */
 
 const FASHN_BASE = "https://api.fashn.ai/v1"
-const FASHN_MODEL_NAME = "tryon-v1.6" // 문서 예시 모델명 :contentReference[oaicite:5]{index=5}
+const FASHN_MODEL_NAME = "tryon-v1.6"
 
 function isDataUrl(v) {
   return typeof v === "string" && v.startsWith("data:image/")
@@ -89,7 +167,7 @@ function fashnHeaders() {
   if (!key) throw new Error("FASHN_API_KEY missing on server")
   return {
     "Content-Type": "application/json",
-    "Authorization": `Bearer ${key}`, // 문서 방식 :contentReference[oaicite:6]{index=6}
+    "Authorization": `Bearer ${key}`,
   }
 }
 
@@ -111,13 +189,11 @@ app.post("/api/dress", async (req, res) => {
       return res.status(400).json({ error: "garment missing. Need top_front/top_back (dataUrl)" })
     }
 
-    // FASHN: POST /v1/run, model_name + inputs :contentReference[oaicite:7]{index=7}
     const body = {
       model_name: FASHN_MODEL_NAME,
       inputs: {
         model_image: model,
         garment_image: garment,
-        // (추가 옵션은 나중에. 일단 파이프라인 성공부터)
       },
     }
 
@@ -137,7 +213,6 @@ app.post("/api/dress", async (req, res) => {
       })
     }
 
-    // 문서 예시: runData.id가 predictionId :contentReference[oaicite:8]{index=8}
     const predictionId = json?.id
     if (!predictionId) {
       return res.status(502).json({ error: "FASHN /run returned no id", raw: json })
@@ -154,7 +229,6 @@ app.get("/api/dress/:id", async (req, res) => {
   try {
     const id = req.params.id
 
-    // FASHN: GET /v1/status/<ID> :contentReference[oaicite:9]{index=9}
     const r = await fetch(`${FASHN_BASE}/status/${id}`, { headers: fashnHeaders() })
     const text = await r.text()
     let json = null
@@ -168,10 +242,8 @@ app.get("/api/dress/:id", async (req, res) => {
 
     const status = json?.status
 
-    // 문서 예시: completed면 output 확인 :contentReference[oaicite:10]{index=10}
     if (status === "completed") {
       const output = json?.output
-      // output 형태는 케이스별로 다를 수 있어서 "첫 이미지 URL"만 뽑아주자
       const imageUrl =
         Array.isArray(output) ? output[0]
         : typeof output === "string" ? output
@@ -188,7 +260,6 @@ app.get("/api/dress/:id", async (req, res) => {
       return res.status(202).json({ predictionId: id, status })
     }
 
-    // 실패/기타
     return res.status(500).json({
       predictionId: id,
       status,
