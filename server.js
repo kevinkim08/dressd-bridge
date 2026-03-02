@@ -74,7 +74,12 @@ function cleanupExpiredReservations() {
       // 만료면 자동 환불(=release)
       const bal = getBalance(r.clientId)
       setBalance(r.clientId, bal + r.amount)
-      reservations.set(rid, { ...r, status: "released", releasedAt: t, releaseReason: "expired" })
+      reservations.set(rid, {
+        ...r,
+        status: "released",
+        releasedAt: t,
+        releaseReason: "expired",
+      })
     }
   }
 }
@@ -186,11 +191,50 @@ app.post("/api/credits/release", (req, res) => {
  *  ------------------------- */
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN })
 
+function mustHaveToken(res) {
+  if (!process.env.REPLICATE_API_TOKEN) {
+    res.status(500).json({ error: "REPLICATE_API_TOKEN missing on server" })
+    return false
+  }
+  return true
+}
+
 function withAdultGuard(prompt) {
   return `adult, age 25, ${prompt}`
 }
 
-// ✅ FRONT/BACK 뷰를 강하게 고정 (모델 일관성 ↑)
+/**
+ * ✅ 핵심: 프롬프트 안에 front/back 지시가 섞여 들어오는 경우가 많아서
+ *    back 생성 시 front 지시어를 제거하고, front 생성 시 back 지시어를 제거함.
+ *    (특히 buildFinalPrompt(s) 가 기본적으로 front 성향 문구를 넣는 경우에 매우 중요)
+ */
+function sanitizeViewConflicts(prompt, view) {
+  let p = String(prompt || "")
+
+  // 공통: 공백 정리
+  const clean = () => p.replace(/\s+/g, " ").trim()
+
+  if (view === "back") {
+    // back 생성 시 front 지시 제거
+    p = p.replace(/front view only/gi, "")
+    p = p.replace(/front-facing/gi, "")
+    p = p.replace(/not back view/gi, "")
+    p = p.replace(/facing camera/gi, "")
+    p = p.replace(/looking at camera/gi, "")
+    p = p.replace(/camera-facing/gi, "")
+    return clean()
+  }
+
+  // front 생성 시 back 지시 제거
+  p = p.replace(/back view only/gi, "")
+  p = p.replace(/rear view/gi, "")
+  p = p.replace(/not front view/gi, "")
+  p = p.replace(/facing away/gi, "")
+  p = p.replace(/back-facing/gi, "")
+  return clean()
+}
+
+// ✅ FRONT/BACK 뷰를 강하게 고정
 function withViewLock(prompt, view) {
   if (view === "back") {
     return [
@@ -206,7 +250,6 @@ function withViewLock(prompt, view) {
       "centered",
     ].join(", ")
   }
-  // default front
   return [
     prompt,
     "front view only",
@@ -223,7 +266,6 @@ function withViewLock(prompt, view) {
 
 // ✅ Replicate output 형태가 케이스별로 달라서 최대한 안전하게 뽑기
 function pickImageUrl(output) {
-  // 1) 배열 형태
   if (Array.isArray(output)) {
     const first = output[0]
     if (!first) return null
@@ -233,10 +275,8 @@ function pickImageUrl(output) {
     return null
   }
 
-  // 2) 단일 string url
   if (typeof output === "string") return output
 
-  // 3) object with url() or url
   if (output && typeof output?.url === "function") return output.url()
   if (output && typeof output?.url === "string") return output.url
 
@@ -255,14 +295,6 @@ async function runImagen(prompt) {
   return pickImageUrl(output)
 }
 
-function mustHaveToken(res) {
-  if (!process.env.REPLICATE_API_TOKEN) {
-    res.status(500).json({ error: "REPLICATE_API_TOKEN missing on server" })
-    return false
-  }
-  return true
-}
-
 // ✅ 기존 엔드포인트 유지: /api/s1 (FRONT 1장만)
 app.post("/api/s1", async (req, res) => {
   const { prompt } = req.body || {}
@@ -271,7 +303,8 @@ app.post("/api/s1", async (req, res) => {
 
   try {
     const base = withAdultGuard(prompt)
-    const lockedPrompt = withViewLock(base, "front")
+    const baseFront = sanitizeViewConflicts(base, "front")
+    const lockedPrompt = withViewLock(baseFront, "front")
 
     const imageUrl = await runImagen(lockedPrompt)
     if (!imageUrl) return res.status(502).json({ error: "No imageUrl in output" })
@@ -285,7 +318,12 @@ app.post("/api/s1", async (req, res) => {
   }
 })
 
-// ✅ 신규 엔드포인트: /api/s1/pair (FRONT+BACK 2장 생성 + reservationId 필수)
+/**
+ * ✅ 신규 엔드포인트: /api/s1/pair
+ * - reservationId 필수
+ * - front/back sanitize 후 viewLock
+ * - frontUrl===backUrl 이면 실패로 처리(환불 + 502) → 프론트가 재시도 가능
+ */
 app.post("/api/s1/pair", async (req, res) => {
   const { prompt, reservationId } = req.body || {}
   if (!mustHaveToken(res)) return
@@ -305,33 +343,52 @@ app.post("/api/s1/pair", async (req, res) => {
     return res.status(400).json({ error: String(e?.message ?? e) })
   }
 
+  // helper: 실패시 환불+release (중복 방지)
+  const releaseOnce = (reason) => {
+    try {
+      const cur = reservations.get(String(reservationId))
+      if (cur && cur.status === "reserved") {
+        setBalance(clientId, getBalance(clientId) + cur.amount)
+        reservations.set(String(reservationId), {
+          ...cur,
+          status: "released",
+          releasedAt: now(),
+          releaseReason: reason,
+        })
+      }
+    } catch {}
+  }
+
   try {
     const base = withAdultGuard(prompt)
-    const promptFront = withViewLock(base, "front")
-    const promptBack = withViewLock(base, "back")
+
+    // ✅ 중요: view별로 충돌 문구 제거
+    const baseFront = sanitizeViewConflicts(base, "front")
+    const baseBack = sanitizeViewConflicts(base, "back")
+
+    const promptFront = withViewLock(baseFront, "front")
+    const promptBack = withViewLock(baseBack, "back")
 
     // ✅ 순차 실행(안정)
     const frontUrl = await runImagen(promptFront)
     const backUrl = await runImagen(promptBack)
 
     if (!frontUrl || !backUrl) {
-      // 실패 → release(환불)
-      try {
-        if (r && r.status === "reserved") {
-          setBalance(clientId, getBalance(clientId) + r.amount)
-          reservations.set(String(reservationId), {
-            ...r,
-            status: "released",
-            releasedAt: now(),
-            releaseReason: "no_image_url",
-          })
-        }
-      } catch {}
-
+      releaseOnce("no_image_url")
       return res.status(502).json({
         error: "No imageUrl in output",
         frontUrl: frontUrl || null,
         backUrl: backUrl || null,
+      })
+    }
+
+    // ✅ “앞면 2장” 방지 1차 안전장치: URL이 같으면 실패 처리
+    if (frontUrl === backUrl) {
+      releaseOnce("same_url_front_back")
+      return res.status(502).json({
+        error: "front/back identical (retry)",
+        frontUrl,
+        backUrl,
       })
     }
 
@@ -348,19 +405,7 @@ app.post("/api/s1/pair", async (req, res) => {
       reservationId,
     })
   } catch (e) {
-    // 예외 → release(환불)
-    try {
-      if (r && r.status === "reserved") {
-        setBalance(clientId, getBalance(clientId) + r.amount)
-        reservations.set(String(reservationId), {
-          ...r,
-          status: "released",
-          releasedAt: now(),
-          releaseReason: "generation_failed",
-        })
-      }
-    } catch {}
-
+    releaseOnce("generation_failed")
     return res.status(500).json({
       error: "Generation failed",
       detail: String(e?.message ?? e),
@@ -426,9 +471,7 @@ app.post("/api/dress", async (req, res) => {
 
     const text = await r.text()
     let json = null
-    try {
-      json = JSON.parse(text)
-    } catch {}
+    try { json = JSON.parse(text) } catch {}
 
     if (!r.ok) {
       return res.status(r.status).json({
@@ -454,9 +497,7 @@ app.get("/api/dress/:id", async (req, res) => {
     const r = await fetch(`${FASHN_BASE}/status/${id}`, { headers: fashnHeaders() })
     const text = await r.text()
     let json = null
-    try {
-      json = JSON.parse(text)
-    } catch {}
+    try { json = JSON.parse(text) } catch {}
 
     if (!r.ok) {
       return res.status(r.status).json({
@@ -468,10 +509,9 @@ app.get("/api/dress/:id", async (req, res) => {
 
     if (status === "completed") {
       const output = json?.output
-      const imageUrl = Array.isArray(output)
-        ? output[0]
-        : typeof output === "string"
-        ? output
+      const imageUrl =
+        Array.isArray(output) ? output[0]
+        : typeof output === "string" ? output
         : output?.image || output?.image_url || output?.url
 
       if (!imageUrl) {
