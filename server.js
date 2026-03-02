@@ -46,7 +46,7 @@ const RESERVE_TTL_MS = 5 * 60 * 1000 // 5분
 
 const balances = new Map() // clientId -> number
 const reservations = new Map()
-// reservationId -> { clientId, amount, status, createdAt, expiresAt, reason, committedAt?, releasedAt?, releaseReason? }
+// reservationId -> { reservationId, clientId, amount, status, createdAt, expiresAt, reason, committedAt?, releasedAt?, releaseReason? }
 
 function now() {
   return Date.now()
@@ -204,18 +204,37 @@ function withAdultGuard(prompt) {
 }
 
 /**
- * ✅ 핵심: 프롬프트 안에 front/back 지시가 섞여 들어오는 경우가 많아서
- *    back 생성 시 front 지시어를 제거하고, front 생성 시 back 지시어를 제거함.
- *    (특히 buildFinalPrompt(s) 가 기본적으로 front 성향 문구를 넣는 경우에 매우 중요)
+ * ✅ 텍스트/숫자/치수/인포그래픽 오버레이 방지
+ * - 키/몸무게 같은 숫자가 프롬프트에 들어가면 이미지에 글씨로 박히는 현상이 생길 수 있어
+ * - 그래서 서버에서 강제로 금지 문구를 주입
+ */
+function banTextOverlays(p) {
+  return [
+    p,
+    "no text",
+    "no typography",
+    "no labels",
+    "no captions",
+    "no numbers",
+    "no measurements",
+    "no watermark",
+    "no UI",
+    "no infographic",
+    "no chart",
+    "no diagram",
+  ].join(", ")
+}
+
+/**
+ * ✅ view 충돌 제거:
+ * - back 생성 시 front 지시 제거
+ * - front 생성 시 back 지시 제거
  */
 function sanitizeViewConflicts(prompt, view) {
   let p = String(prompt || "")
-
-  // 공통: 공백 정리
   const clean = () => p.replace(/\s+/g, " ").trim()
 
   if (view === "back") {
-    // back 생성 시 front 지시 제거
     p = p.replace(/front view only/gi, "")
     p = p.replace(/front-facing/gi, "")
     p = p.replace(/not back view/gi, "")
@@ -225,7 +244,6 @@ function sanitizeViewConflicts(prompt, view) {
     return clean()
   }
 
-  // front 생성 시 back 지시 제거
   p = p.replace(/back view only/gi, "")
   p = p.replace(/rear view/gi, "")
   p = p.replace(/not front view/gi, "")
@@ -248,6 +266,7 @@ function withViewLock(prompt, view) {
       "not front view",
       "single person",
       "centered",
+      "camera behind subject",
     ].join(", ")
   }
   return [
@@ -261,6 +280,7 @@ function withViewLock(prompt, view) {
     "not back view",
     "single person",
     "centered",
+    "camera in front of subject",
   ].join(", ")
 }
 
@@ -274,12 +294,9 @@ function pickImageUrl(output) {
     if (typeof first?.url === "string") return first.url
     return null
   }
-
   if (typeof output === "string") return output
-
   if (output && typeof output?.url === "function") return output.url()
   if (output && typeof output?.url === "string") return output.url
-
   return null
 }
 
@@ -304,7 +321,7 @@ app.post("/api/s1", async (req, res) => {
   try {
     const base = withAdultGuard(prompt)
     const baseFront = sanitizeViewConflicts(base, "front")
-    const lockedPrompt = withViewLock(baseFront, "front")
+    const lockedPrompt = withViewLock(banTextOverlays(baseFront), "front")
 
     const imageUrl = await runImagen(lockedPrompt)
     if (!imageUrl) return res.status(502).json({ error: "No imageUrl in output" })
@@ -319,15 +336,19 @@ app.post("/api/s1", async (req, res) => {
 })
 
 /**
- * ✅ 신규 엔드포인트: /api/s1/pair
- * - reservationId 필수
- * - front/back sanitize 후 viewLock
- * - frontUrl===backUrl 이면 실패로 처리(환불 + 502) → 프론트가 재시도 가능
+ * ✅ /api/s1/pair (최종)
+ * - 입력 지원:
+ *    1) { promptFront, promptBack, reservationId }  ← ✅ 권장(현재 bridge가 이걸로 수정됐다고 했음)
+ *    2) { prompt, reservationId }                   ← fallback (구버전)
+ * - back이 계속 front로 나오는 문제를 줄이기 위해:
+ *    - view별 sanitize
+ *    - text overlay 금지 강제
+ *    - view lock 강화
+ * - frontUrl===backUrl이면 실패 처리 + release(환불)
  */
 app.post("/api/s1/pair", async (req, res) => {
-  const { prompt, reservationId } = req.body || {}
+  const { prompt, promptFront, promptBack, reservationId } = req.body || {}
   if (!mustHaveToken(res)) return
-  if (!prompt) return res.status(400).json({ error: "Prompt missing" })
 
   // ✅ credit reservation 검증
   let clientId = null
@@ -338,12 +359,12 @@ app.post("/api/s1/pair", async (req, res) => {
     r = reservations.get(String(reservationId))
     if (!r) return res.status(404).json({ error: "reservation_not_found" })
     if (r.clientId !== clientId) return res.status(403).json({ error: "forbidden" })
-    if (r.status !== "reserved") return res.status(400).json({ error: `bad_reservation_status_${r.status}` })
+    if (r.status !== "reserved")
+      return res.status(400).json({ error: `bad_reservation_status_${r.status}` })
   } catch (e) {
     return res.status(400).json({ error: String(e?.message ?? e) })
   }
 
-  // helper: 실패시 환불+release (중복 방지)
   const releaseOnce = (reason) => {
     try {
       const cur = reservations.get(String(reservationId))
@@ -360,18 +381,36 @@ app.post("/api/s1/pair", async (req, res) => {
   }
 
   try {
-    const base = withAdultGuard(prompt)
+    // ✅ 입력 프롬프트 우선순위:
+    // 1) promptFront/promptBack이 오면 그대로 사용
+    // 2) 없으면 prompt 하나로 fallback
+    const rawFront = (promptFront ?? prompt ?? "").toString()
+    const rawBack = (promptBack ?? prompt ?? "").toString()
 
-    // ✅ 중요: view별로 충돌 문구 제거
-    const baseFront = sanitizeViewConflicts(base, "front")
-    const baseBack = sanitizeViewConflicts(base, "back")
+    if (!rawFront || !rawBack) {
+      releaseOnce("prompt_missing")
+      return res.status(400).json({ error: "Prompt missing" })
+    }
 
-    const promptFront = withViewLock(baseFront, "front")
-    const promptBack = withViewLock(baseBack, "back")
+    // ✅ 성인 가드(둘 다 적용)
+    const baseFront0 = withAdultGuard(rawFront)
+    const baseBack0 = withAdultGuard(rawBack)
+
+    // ✅ 충돌 제거(뷰별)
+    const baseFront1 = sanitizeViewConflicts(baseFront0, "front")
+    const baseBack1 = sanitizeViewConflicts(baseBack0, "back")
+
+    // ✅ 텍스트 오버레이 금지 강제
+    const baseFront2 = banTextOverlays(baseFront1)
+    const baseBack2 = banTextOverlays(baseBack1)
+
+    // ✅ 최종 view lock
+    const finalPromptFront = withViewLock(baseFront2, "front")
+    const finalPromptBack = withViewLock(baseBack2, "back")
 
     // ✅ 순차 실행(안정)
-    const frontUrl = await runImagen(promptFront)
-    const backUrl = await runImagen(promptBack)
+    const frontUrl = await runImagen(finalPromptFront)
+    const backUrl = await runImagen(finalPromptBack)
 
     if (!frontUrl || !backUrl) {
       releaseOnce("no_image_url")
@@ -382,7 +421,7 @@ app.post("/api/s1/pair", async (req, res) => {
       })
     }
 
-    // ✅ “앞면 2장” 방지 1차 안전장치: URL이 같으면 실패 처리
+    // ✅ “앞면 2장” 최소 방어: URL 같으면 실패로 처리(환불 + 재시도 유도)
     if (frontUrl === backUrl) {
       releaseOnce("same_url_front_back")
       return res.status(502).json({
@@ -398,8 +437,8 @@ app.post("/api/s1/pair", async (req, res) => {
     return res.json({
       frontUrl,
       backUrl,
-      usedPromptFront: promptFront,
-      usedPromptBack: promptBack,
+      usedPromptFront: finalPromptFront,
+      usedPromptBack: finalPromptBack,
       aspect_ratio: "3:4",
       credit: { committed: true, balance: getBalance(clientId) },
       reservationId,
