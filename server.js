@@ -205,8 +205,6 @@ function withAdultGuard(prompt) {
 
 /**
  * ✅ 텍스트/숫자/치수/인포그래픽 오버레이 방지
- * - 키/몸무게 같은 숫자가 프롬프트에 들어가면 이미지에 글씨로 박히는 현상이 생길 수 있어
- * - 그래서 서버에서 강제로 금지 문구를 주입
  */
 function banTextOverlays(p) {
   return [
@@ -226,9 +224,23 @@ function banTextOverlays(p) {
 }
 
 /**
- * ✅ view 충돌 제거:
- * - back 생성 시 front 지시 제거
- * - front 생성 시 back 지시 제거
+ * ✅ 헤어 일관성(소폭 향상)
+ * - 완벽 고정은 불가능하지만, 재추론 여지를 줄여서 색/웨이브 튐을 감소
+ */
+function enforceHairConsistency(p) {
+  return [
+    p,
+    "same hairstyle",
+    "same hair length",
+    "same hair color",
+    "consistent hair tone",
+    "identical hair",
+    "no hairstyle change",
+  ].join(", ")
+}
+
+/**
+ * ✅ view 충돌 제거
  */
 function sanitizeViewConflicts(prompt, view) {
   let p = String(prompt || "")
@@ -321,12 +333,15 @@ app.post("/api/s1", async (req, res) => {
   try {
     const base = withAdultGuard(prompt)
     const baseFront = sanitizeViewConflicts(base, "front")
-    const lockedPrompt = withViewLock(banTextOverlays(baseFront), "front")
+    const finalPrompt = withViewLock(
+      enforceHairConsistency(banTextOverlays(baseFront)),
+      "front"
+    )
 
-    const imageUrl = await runImagen(lockedPrompt)
+    const imageUrl = await runImagen(finalPrompt)
     if (!imageUrl) return res.status(502).json({ error: "No imageUrl in output" })
 
-    return res.json({ imageUrl, usedPrompt: lockedPrompt })
+    return res.json({ imageUrl, usedPrompt: finalPrompt })
   } catch (e) {
     return res.status(500).json({
       error: "Generation failed",
@@ -338,11 +353,12 @@ app.post("/api/s1", async (req, res) => {
 /**
  * ✅ /api/s1/pair (최종)
  * - 입력 지원:
- *    1) { promptFront, promptBack, reservationId }  ← ✅ 권장(현재 bridge가 이걸로 수정됐다고 했음)
- *    2) { prompt, reservationId }                   ← fallback (구버전)
+ *    1) { promptFront, promptBack, reservationId }  ← ✅ 권장
+ *    2) { prompt, reservationId }                   ← fallback
  * - back이 계속 front로 나오는 문제를 줄이기 위해:
  *    - view별 sanitize
  *    - text overlay 금지 강제
+ *    - hair consistency 소폭 강화
  *    - view lock 강화
  * - frontUrl===backUrl이면 실패 처리 + release(환불)
  */
@@ -400,9 +416,9 @@ app.post("/api/s1/pair", async (req, res) => {
     const baseFront1 = sanitizeViewConflicts(baseFront0, "front")
     const baseBack1 = sanitizeViewConflicts(baseBack0, "back")
 
-    // ✅ 텍스트 오버레이 금지 강제
-    const baseFront2 = banTextOverlays(baseFront1)
-    const baseBack2 = banTextOverlays(baseBack1)
+    // ✅ 텍스트 금지 + 헤어 일관성 소폭 강화
+    const baseFront2 = enforceHairConsistency(banTextOverlays(baseFront1))
+    const baseBack2 = enforceHairConsistency(banTextOverlays(baseBack1))
 
     // ✅ 최종 view lock
     const finalPromptFront = withViewLock(baseFront2, "front")
