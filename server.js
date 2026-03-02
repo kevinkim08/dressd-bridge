@@ -4,6 +4,12 @@ import Replicate from "replicate"
 
 const app = express()
 
+// ✅ Node 18+ 는 fetch 기본 제공.
+// Render/로컬에서 Node 버전이 낮아 fetch가 없으면 에러나니까 안전장치.
+if (typeof globalThis.fetch !== "function") {
+  console.warn("[WARN] fetch is not available. Use Node 18+ or add a fetch polyfill (undici/node-fetch).")
+}
+
 const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true)
@@ -67,10 +73,29 @@ function withViewLock(prompt, view) {
   ].join(", ")
 }
 
+// ✅ Replicate output 형태가 케이스별로 달라서 최대한 안전하게 뽑기
 function pickImageUrl(output) {
-  return Array.isArray(output)
-    ? (output[0]?.url ? output[0].url() : output[0])
-    : (output?.url ? output.url() : output)
+  // 1) 배열 형태
+  if (Array.isArray(output)) {
+    const first = output[0]
+    if (!first) return null
+    // string url
+    if (typeof first === "string") return first
+    // object with url() or url
+    if (typeof first?.url === "function") return first.url()
+    if (typeof first?.url === "string") return first.url
+    return null
+  }
+
+  // 2) 단일 string url
+  if (typeof output === "string") return output
+
+  // 3) object with url() or url
+  if (output && typeof output?.url === "function") return output.url()
+  if (output && typeof output?.url === "string") return output.url
+
+  // 4) 기타 케이스
+  return null
 }
 
 async function runImagen(prompt) {
@@ -85,39 +110,44 @@ async function runImagen(prompt) {
   return pickImageUrl(output)
 }
 
+function mustHaveToken(res) {
+  if (!process.env.REPLICATE_API_TOKEN) {
+    res.status(500).json({ error: "REPLICATE_API_TOKEN missing on server" })
+    return false
+  }
+  return true
+}
+
 // ✅ 기존 엔드포인트 유지: /api/s1 (FRONT 1장만)
 app.post("/api/s1", async (req, res) => {
-  const { prompt } = req.body
-  if (!process.env.REPLICATE_API_TOKEN) {
-    return res.status(500).json({ error: "REPLICATE_API_TOKEN missing on server" })
-  }
+  const { prompt } = req.body || {}
+  if (!mustHaveToken(res)) return
   if (!prompt) return res.status(400).json({ error: "Prompt missing" })
 
   try {
-    const finalPrompt = withAdultGuard(prompt)
-    const lockedPrompt = withViewLock(finalPrompt, "front")
-    const imageUrl = await runImagen(lockedPrompt)
+    const base = withAdultGuard(prompt)
+    const lockedPrompt = withViewLock(base, "front")
 
-    if (!imageUrl) {
-      return res.status(502).json({ error: "No imageUrl in output" })
-    }
+    const imageUrl = await runImagen(lockedPrompt)
+    if (!imageUrl) return res.status(502).json({ error: "No imageUrl in output" })
+
     return res.json({ imageUrl, usedPrompt: lockedPrompt })
   } catch (e) {
-    return res.status(500).json({ error: "Generation failed", detail: String(e?.message ?? e) })
+    return res.status(500).json({
+      error: "Generation failed",
+      detail: String(e?.message ?? e),
+    })
   }
 })
 
 // ✅ 신규 엔드포인트: /api/s1/pair (FRONT+BACK 2장 생성)
 app.post("/api/s1/pair", async (req, res) => {
-  const { prompt } = req.body
-  if (!process.env.REPLICATE_API_TOKEN) {
-    return res.status(500).json({ error: "REPLICATE_API_TOKEN missing on server" })
-  }
+  const { prompt } = req.body || {}
+  if (!mustHaveToken(res)) return
   if (!prompt) return res.status(400).json({ error: "Prompt missing" })
 
   try {
     const base = withAdultGuard(prompt)
-
     const promptFront = withViewLock(base, "front")
     const promptBack = withViewLock(base, "back")
 
@@ -141,14 +171,16 @@ app.post("/api/s1/pair", async (req, res) => {
       aspect_ratio: "3:4",
     })
   } catch (e) {
-    return res.status(500).json({ error: "Generation failed", detail: String(e?.message ?? e) })
+    return res.status(500).json({
+      error: "Generation failed",
+      detail: String(e?.message ?? e),
+    })
   }
 })
 
 /** -------------------------
- *  S3 Dress (FASHN) 붙이기
+ *  S3 Dress (FASHN)
  *  ------------------------- */
-
 const FASHN_BASE = "https://api.fashn.ai/v1"
 const FASHN_MODEL_NAME = "tryon-v1.6"
 
@@ -171,12 +203,10 @@ function fashnHeaders() {
   }
 }
 
-// 안내용
 app.get("/api/dress", (req, res) => {
   res.json({ ok: true, hint: "Use POST /api/dress or GET /api/dress/:id" })
 })
 
-// 1) 합성 시작
 app.post("/api/dress", async (req, res) => {
   try {
     const { view = "front", model, garments = {} } = req.body || {}
@@ -224,7 +254,6 @@ app.post("/api/dress", async (req, res) => {
   }
 })
 
-// 2) 결과 폴링
 app.get("/api/dress/:id", async (req, res) => {
   try {
     const id = req.params.id
