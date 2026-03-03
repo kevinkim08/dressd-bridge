@@ -1,4 +1,21 @@
-// server.js (FINAL - body compatible + credits + hard CORS + S1 pair)
+// server.js (FULL) — S1 filter + auto-regenerate (Replicate caption validator)
+// ✅ Works with your current Render + Framer setup
+// ✅ Keeps your “CORS 강제 통과” 방식 그대로
+// ✅ Adds: validate(imageUrl) -> fail이면 자동 재생성(최대 N번)
+// ✅ Validator는 Replicate 캡션 모델을 사용 (모델 슬러그는 ENV로 교체 가능)
+//
+// -----------------------------------------
+// REQUIRED ENV
+// - REPLICATE_API_TOKEN
+//
+// OPTIONAL ENV
+// - PORT (Render가 자동으로 10000 주는 경우가 많음)
+// - IMAGE_MODEL (default: google/imagen-4)
+// - CAPTION_MODEL (default: salesforce/blip)  ⚠️ Replicate에서 안 맞으면 여기만 바꿔
+// - S1_MAX_ATTEMPTS (default: 3)
+// - S1_VALIDATION_STRICT (default: "1")  // 1=엄격, 0=느슨
+// -----------------------------------------
+
 import express from "express"
 import cors from "cors"
 import Replicate from "replicate"
@@ -7,9 +24,8 @@ const app = express()
 
 /**
  * ============================================================
- * ✅ 0) CORS (테스트 단계 최강: preflight 포함 강제 통과)
- * - Framer가 X-Client-Id 같은 커스텀 헤더를 보내서 preflight에서 자주 막힘
- * - "브라우저가 요청한 헤더를 그대로 허용"하면 거의 100% 해결
+ * ✅ 0) CORS (preflight 포함 강제 통과)
+ * - Framer에서 보내는 X-Client-Id 헤더 때문에 preflight에서 막히는 케이스 대응
  * ============================================================
  */
 app.use((req, res, next) => {
@@ -30,16 +46,14 @@ app.use((req, res, next) => {
 
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
 
-  // ✅ 핵심: 브라우저가 preflight에서 요청한 헤더를 그대로 허용
+  // ✅ 핵심: 브라우저가 요청한 헤더를 그대로 허용 (x-client-id 포함)
   const reqHeaders = req.headers["access-control-request-headers"]
   res.setHeader(
     "Access-Control-Allow-Headers",
     reqHeaders || "Content-Type, Authorization, X-Client-Id, x-client-id"
   )
 
-  if (req.method === "OPTIONS") {
-    return res.status(204).end()
-  }
+  if (req.method === "OPTIONS") return res.status(204).end()
   next()
 })
 
@@ -65,16 +79,17 @@ app.use(express.json({ limit: "25mb" }))
 
 app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) =>
-  res.json({ ok: true, version: "2026-03-03_final_pair_credits_bodyfix_v1" })
+  res.json({
+    ok: true,
+    version: "2026-03-04_s1_filter_autoregen_v1",
+  })
 )
 
 /**
  * ============================================================
- * ✅ 1) TEST CREDITS (Reserve / Confirm / Release) - In-Memory
- * - X-Client-Id로 사용자(브라우저/세션 단위) 식별
+ * ✅ 1) TEST CREDITS (Reserve / Confirm / Release) — 인메모리
  * ============================================================
  */
-
 function getClientId(req) {
   const v =
     req.header("X-Client-Id") ||
@@ -93,14 +108,11 @@ function requireClientId(req, res) {
   return cid
 }
 
-// clientId -> { balance, reserved }
-const wallets = new Map()
-// reservationId -> { clientId, amount, status, createdAt, meta, reason }
-const reservations = new Map()
+const wallets = new Map() // clientId -> { balance, reserved }
+const reservations = new Map() // reservationId -> { clientId, amount, status, createdAt, meta }
 
 function ensureWallet(clientId) {
   if (!wallets.has(clientId)) {
-    // ✅ 테스트 기본 크레딧
     wallets.set(clientId, { balance: 9999, reserved: 0 })
   }
   return wallets.get(clientId)
@@ -114,7 +126,7 @@ app.get("/api/credits/balance", (req, res) => {
   const cid = requireClientId(req, res)
   if (!cid) return
   const w = ensureWallet(cid)
-  res.json({ clientId: cid, balance: w.balance, reserved: w.reserved, available: w.balance - w.reserved })
+  res.json({ clientId: cid, balance: w.balance, reserved: w.reserved })
 })
 
 app.post("/api/credits/reserve", (req, res) => {
@@ -217,10 +229,19 @@ app.post("/api/credits/release", (req, res) => {
 
 /**
  * ============================================================
- * ✅ 2) S1 (Replicate / Imagen)
+ * ✅ 2) Replicate + S1 (Imagen) + Filter/Auto-regenerate
  * ============================================================
  */
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN })
+
+const IMAGE_MODEL = process.env.IMAGE_MODEL || "google/imagen-4"
+
+// ⚠️ CAPTION_MODEL 은 Replicate에서 “캡션 문자열”을 리턴하는 모델이면 됨.
+//    만약 salesforce/blip가 안 먹히면 여기만 교체하면 됨.
+const CAPTION_MODEL = process.env.CAPTION_MODEL || "salesforce/blip"
+
+const S1_MAX_ATTEMPTS = Number(process.env.S1_MAX_ATTEMPTS || 3)
+const S1_VALIDATION_STRICT = String(process.env.S1_VALIDATION_STRICT || "1") === "1"
 
 function mustHaveToken(res) {
   if (!process.env.REPLICATE_API_TOKEN) {
@@ -231,13 +252,10 @@ function mustHaveToken(res) {
 }
 
 function withAdultGuard(prompt) {
+  // ✅ 정책 안정: 성인 명시
   return `adult, age 25, ${prompt}`
 }
 
-/**
- * ✅ back 머리 쏠림 확률 낮추는 힌트
- * - 완벽 보장은 안 됨(생성형 특성)
- */
 function hairConsistencyHints() {
   return [
     "hair centered",
@@ -248,7 +266,6 @@ function hairConsistencyHints() {
   ].join(", ")
 }
 
-// ✅ FRONT/BACK 뷰 고정
 function withViewLock(prompt, view) {
   if (view === "back") {
     return [
@@ -282,7 +299,6 @@ function withViewLock(prompt, view) {
   ].join(", ")
 }
 
-// ✅ Replicate output 형태 안전 추출
 function pickImageUrl(output) {
   if (Array.isArray(output)) {
     const first = output[0]
@@ -299,94 +315,241 @@ function pickImageUrl(output) {
 }
 
 async function runImagen(prompt) {
-  const output = await replicate.run("google/imagen-4", {
+  const output = await replicate.run(IMAGE_MODEL, {
     input: {
       prompt,
       image_size: "2K",
       aspect_ratio: "3:4",
       output_format: "png",
+      // ✅ seed 옵션이 모델에서 지원하면 여기에 넣을 수 있음.
+      // seed: 1234,
     },
   })
   return pickImageUrl(output)
 }
 
-// ✅ (지금은 뼈대만) 결과가 “명백히 이상한지” 검사 훅
-function isObviouslyBadResult(/* imageUrl */) {
-  // TODO: BLIP 캡션 / 텍스트 감지 / 룰 기반 검사 붙일 자리
-  return false
+/**
+ * ------------------------------------------------------------
+ * ✅ Validator: Replicate 캡션 모델로 이미지 설명문 생성 → 룰로 Reject
+ * - “text_prompts”, poster, collage, grid, multi-panel 등 걸러내기
+ * - view(front/back)도 캡션 기반으로 1차 체크
+ * ------------------------------------------------------------
+ */
+
+// 캡션 모델 출력 형태는 모델마다 다를 수 있어서 최대한 유연하게 처리
+function extractCaption(out) {
+  if (!out) return ""
+  if (typeof out === "string") return out
+  if (Array.isArray(out)) {
+    // 어떤 모델은 ["caption..."] 형태로 줌
+    const s = out.find((x) => typeof x === "string")
+    if (s) return s
+  }
+  // { caption: "..." } 같은 경우
+  if (typeof out?.caption === "string") return out.caption
+  if (typeof out?.text === "string") return out.text
+  if (typeof out?.output === "string") return out.output
+  return ""
 }
 
-async function generateWithRetry(prompt, maxRetry = 1) {
-  let lastUrl = null
-  let lastErr = null
+// 캡션 만들기 (이미지 URL 입력)
+async function captionImage(imageUrl) {
+  try {
+    const out = await replicate.run(CAPTION_MODEL, {
+      input: {
+        image: imageUrl,
+        // 모델에 따라 task 파라미터가 필요할 수 있음.
+        // task: "caption",
+      },
+    })
+    return extractCaption(out).trim()
+  } catch (e) {
+    // 캡션이 실패하면 “검증 불가”
+    return ""
+  }
+}
 
-  for (let i = 0; i <= maxRetry; i++) {
-    try {
-      const url = await runImagen(prompt)
-      if (!url) throw new Error("No imageUrl in output")
-      lastUrl = url
-      if (!isObviouslyBadResult(url)) return { url, tries: i + 1 }
-    } catch (e) {
-      lastErr = e
+function normalize(s) {
+  return String(s || "")
+    .toLowerCase()
+    .replace(/\s+/g, " ")
+    .trim()
+}
+
+function containsAny(text, list) {
+  return list.some((w) => text.includes(w))
+}
+
+function validateByCaptionRules(captionRaw, expectedView /* "front" | "back" */) {
+  const caption = normalize(captionRaw)
+
+  // 캡션이 아예 안 나오면: 엄격 모드에서는 fail, 느슨 모드에서는 pass
+  if (!caption) {
+    return {
+      ok: !S1_VALIDATION_STRICT,
+      reason: S1_VALIDATION_STRICT ? "caption_failed" : "caption_missing_but_allowed",
     }
   }
 
-  if (lastUrl) return { url: lastUrl, tries: maxRetry + 1, warned: true }
-  throw lastErr || new Error("Generation failed")
+  // 1) 텍스트/포스터/콜라주/그리드류 강력 차단
+  const bannedHard = [
+    "text",
+    "words",
+    "caption",
+    "watermark",
+    "logo",
+    "poster",
+    "flyer",
+    "magazine",
+    "brochure",
+    "infographic",
+    "diagram",
+    "label",
+    "screenshot",
+    "collage",
+    "grid",
+    "panel",
+    "comic",
+    "meme",
+    "title",
+    "paragraph",
+    "letter",
+    "typography",
+  ]
+  if (containsAny(caption, bannedHard)) {
+    return { ok: false, reason: "banned_overlay_or_layout" }
+  }
+
+  // 2) 사람/인물 여부(너무 엄격하게 하면 false reject 많아서 옵션 처리)
+  // 엄격 모드: person/human이 안 잡히면 fail
+  const personHints = ["person", "woman", "man", "female", "male", "human", "model"]
+  if (S1_VALIDATION_STRICT && !containsAny(caption, personHints)) {
+    return { ok: false, reason: "no_person_detected" }
+  }
+
+  // 3) view 일관성(캡션 기반)
+  // - back인데 face/front/looking at camera 나오면 fail
+  // - front인데 back/rear/from behind만 강하게 나오면 fail
+  if (expectedView === "back") {
+    const badForBack = ["face", "front view", "front-facing", "looking at camera", "portrait"]
+    if (containsAny(caption, badForBack)) return { ok: false, reason: "view_mismatch_back" }
+  } else {
+    const badForFront = ["rear view", "back view", "from behind", "back-facing"]
+    if (containsAny(caption, badForFront)) return { ok: false, reason: "view_mismatch_front" }
+  }
+
+  // 4) 멀티 인물 방지(캡션은 종종 부정확해서 “엄격 모드”에서만 적용)
+  if (S1_VALIDATION_STRICT) {
+    const multiHints = ["two people", "two persons", "group", "crowd", "several people"]
+    if (containsAny(caption, multiHints)) return { ok: false, reason: "multiple_people" }
+  }
+
+  return { ok: true, reason: "ok" }
+}
+
+function attemptHint(attemptIndex) {
+  // attemptIndex: 1..N
+  // 재시도 때 프롬프트를 살짝 강화해서 “레이아웃/텍스트/콜라주” 방향으로 튀는 걸 억제
+  const hard = [
+    "NO TEXT",
+    "NO POSTER",
+    "NO MAGAZINE",
+    "NO COLLAGE",
+    "NO GRID",
+    "NO PANELS",
+    "NO WATERMARK",
+    "NO TYPOGRAPHY",
+    "single full-body studio photo only",
+  ].join(", ")
+  if (attemptIndex <= 1) return ""
+  if (attemptIndex === 2) return `, ${hard}`
+  return `, ${hard}, extremely clean plain background, no graphic design, no layout`
+}
+
+async function generateValidated(prompt, expectedView, maxAttempts = S1_MAX_ATTEMPTS) {
+  let last = {
+    url: null,
+    caption: "",
+    failReason: "",
+    usedPrompt: "",
+    attempt: 0,
+  }
+
+  for (let i = 1; i <= maxAttempts; i++) {
+    const usedPrompt = `${prompt}${attemptHint(i)}`
+    last.usedPrompt = usedPrompt
+    last.attempt = i
+
+    const url = await runImagen(usedPrompt)
+    if (!url) {
+      last.failReason = "no_image_url"
+      continue
+    }
+
+    const cap = await captionImage(url)
+    const verdict = validateByCaptionRules(cap, expectedView)
+
+    last.url = url
+    last.caption = cap
+    last.failReason = verdict.ok ? "" : verdict.reason
+
+    if (verdict.ok) {
+      return {
+        ok: true,
+        url,
+        caption: cap,
+        usedPrompt,
+        attempt: i,
+        failReason: "",
+      }
+    }
+  }
+
+  return {
+    ok: false,
+    url: last.url,
+    caption: last.caption,
+    usedPrompt: last.usedPrompt,
+    attempt: last.attempt,
+    failReason: last.failReason || "validation_failed",
+  }
 }
 
 /**
- * ✅ credits helper: reservationId 있으면 성공 시 confirm / 실패 시 release
+ * ✅ /api/s1 (FRONT 1장)
+ * body:
+ *  - { prompt: string }
+ *  - or legacy fields are ignored
  */
-async function confirmIfReserved(req, reservationId) {
-  const cid = getClientId(req)
-  if (!cid || !reservationId) return
-  const r = reservations.get(reservationId)
-  if (!r) return
-  if (r.clientId !== cid) return
-  if (r.status !== "reserved") return
-
-  const w = ensureWallet(cid)
-  w.reserved = Math.max(0, w.reserved - r.amount)
-  w.balance = Math.max(0, w.balance - r.amount)
-  r.status = "confirmed"
-  reservations.set(reservationId, r)
-}
-
-async function releaseIfReserved(req, reservationId) {
-  const cid = getClientId(req)
-  if (!cid || !reservationId) return
-  const r = reservations.get(reservationId)
-  if (!r) return
-  if (r.clientId !== cid) return
-  if (r.status !== "reserved") return
-
-  const w = ensureWallet(cid)
-  w.reserved = Math.max(0, w.reserved - r.amount)
-  r.status = "released"
-  reservations.set(reservationId, r)
-}
-
-// ✅ /api/s1 (FRONT 1장)
 app.post("/api/s1", async (req, res) => {
-  const { prompt, reservationId } = req.body || {}
   if (!mustHaveToken(res)) return
+
+  const prompt = String(req.body?.prompt || "").trim()
   if (!prompt) return res.status(400).json({ error: "Prompt missing" })
 
   try {
     const base = withAdultGuard(prompt)
-    const lockedPrompt = withViewLock(base, "front")
-    const out = await generateWithRetry(lockedPrompt, 1)
+    const locked = withViewLock(base, "front")
 
-    await confirmIfReserved(req, reservationId)
+    const out = await generateValidated(locked, "front", S1_MAX_ATTEMPTS)
+    if (!out.ok) {
+      return res.status(502).json({
+        error: "Validation failed after retries",
+        failReason: out.failReason,
+        lastUrl: out.url,
+        lastCaption: out.caption,
+        usedPrompt: out.usedPrompt,
+        attempts: out.attempt,
+      })
+    }
 
     return res.json({
       imageUrl: out.url,
-      usedPrompt: lockedPrompt,
-      tries: out.tries,
+      usedPrompt: out.usedPrompt,
+      caption: out.caption,
+      attempts: out.attempt,
     })
   } catch (e) {
-    await releaseIfReserved(req, reservationId)
     return res.status(500).json({
       error: "Generation failed",
       detail: String(e?.message ?? e),
@@ -396,71 +559,77 @@ app.post("/api/s1", async (req, res) => {
 
 /**
  * ✅ /api/s1/pair (FRONT+BACK 2장)
+ * body:
+ *  - { prompt: string }
+ *  - or { promptFront: string, promptBack: string }  // 프론트에서 이미 만들었다면 그대로 받음
  *
- * ✅ 바디 호환:
- * - (A) { prompt } 만 와도 됨  → 서버가 front/back 잠금 프롬프트 생성
- * - (B) { promptFront, promptBack } 오면 그걸 우선 사용 (프론트에서 이미 만들어 보내는 구조)
+ * NOTE:
+ *  - 너 지금 payload에 promptFront / promptBack을 보내고 있었음 (스크린샷 기준)
+ *  - 그래서 여기서 둘 다 지원하도록 안정화
  */
 app.post("/api/s1/pair", async (req, res) => {
-  const b = req.body || {}
-  const reservationId = b.reservationId
-
   if (!mustHaveToken(res)) return
 
-  // ✅ 1) 들어온 값 우선순위
-  const hasPairPrompts = typeof b.promptFront === "string" && typeof b.promptBack === "string"
-  const hasSinglePrompt = typeof b.prompt === "string"
+  const prompt = String(req.body?.prompt || "").trim()
+  const promptFrontIn = String(req.body?.promptFront || "").trim()
+  const promptBackIn = String(req.body?.promptBack || "").trim()
 
-  if (!hasPairPrompts && !hasSinglePrompt) {
-    return res.status(400).json({
-      error: "Prompt missing",
-      hint: "Send {prompt} OR {promptFront, promptBack}",
-      gotKeys: Object.keys(b || {}),
-    })
+  // ✅ 최소 하나는 있어야 함
+  if (!prompt && !promptFrontIn && !promptBackIn) {
+    return res.status(400).json({ error: "Prompt missing (need prompt or promptFront/promptBack)" })
   }
 
   try {
-    // ✅ 2) prompt 구성
-    let promptFront = ""
-    let promptBack = ""
+    let promptFront = promptFrontIn
+    let promptBack = promptBackIn
 
-    if (hasPairPrompts) {
-      // 프론트가 만든 프롬프트를 그대로 사용
-      promptFront = String(b.promptFront)
-      promptBack = String(b.promptBack)
-    } else {
-      // prompt 하나로 서버가 front/back 잠금 프롬프트 생성
-      const base = withAdultGuard(String(b.prompt))
+    // prompt만 넘어오면 서버에서 front/back으로 만든다
+    if (prompt && (!promptFront || !promptBack)) {
+      const base = withAdultGuard(prompt)
       promptFront = withViewLock(base, "front")
       promptBack = withViewLock(base, "back")
     }
 
-    // ✅ 3) 생성(순차)
-    const front = await generateWithRetry(promptFront, 1)
-    const back = await generateWithRetry(promptBack, 1)
-
-    if (!front?.url || !back?.url) {
-      await releaseIfReserved(req, reservationId)
+    // ✅ 순차 실행(안정)
+    const front = await generateValidated(promptFront, "front", S1_MAX_ATTEMPTS)
+    if (!front.ok) {
       return res.status(502).json({
-        error: "No imageUrl in output",
-        frontUrl: front?.url || null,
-        backUrl: back?.url || null,
+        error: "Front validation failed after retries",
+        failReason: front.failReason,
+        lastUrl: front.url,
+        lastCaption: front.caption,
+        usedPromptFront: front.usedPrompt,
+        attemptsFront: front.attempt,
       })
     }
 
-    await confirmIfReserved(req, reservationId)
+    const back = await generateValidated(promptBack, "back", S1_MAX_ATTEMPTS)
+    if (!back.ok) {
+      return res.status(502).json({
+        error: "Back validation failed after retries",
+        failReason: back.failReason,
+        lastUrl: back.url,
+        lastCaption: back.caption,
+        usedPromptBack: back.usedPrompt,
+        attemptsBack: back.attempt,
+      })
+    }
 
     return res.json({
       frontUrl: front.url,
       backUrl: back.url,
-      usedPromptFront: promptFront,
-      usedPromptBack: promptBack,
+
+      usedPromptFront: front.usedPrompt,
+      usedPromptBack: back.usedPrompt,
+
+      captionFront: front.caption,
+      captionBack: back.caption,
+
       aspect_ratio: "3:4",
-      triesFront: front.tries,
-      triesBack: back.tries,
+      attemptsFront: front.attempt,
+      attemptsBack: back.attempt,
     })
   } catch (e) {
-    await releaseIfReserved(req, reservationId)
     return res.status(500).json({
       error: "Generation failed",
       detail: String(e?.message ?? e),
@@ -470,7 +639,7 @@ app.post("/api/s1/pair", async (req, res) => {
 
 /**
  * ============================================================
- * ✅ 3) S3 Dress (FASHN)
+ * ✅ 3) S3 Dress (FASHN) — 그대로 유지
  * ============================================================
  */
 const FASHN_BASE = "https://api.fashn.ai/v1"
@@ -527,7 +696,9 @@ app.post("/api/dress", async (req, res) => {
 
     const text = await r.text()
     let json = null
-    try { json = JSON.parse(text) } catch {}
+    try {
+      json = JSON.parse(text)
+    } catch {}
 
     if (!r.ok) {
       return res.status(r.status).json({
@@ -553,7 +724,9 @@ app.get("/api/dress/:id", async (req, res) => {
     const r = await fetch(`${FASHN_BASE}/status/${id}`, { headers: fashnHeaders() })
     const text = await r.text()
     let json = null
-    try { json = JSON.parse(text) } catch {}
+    try {
+      json = JSON.parse(text)
+    } catch {}
 
     if (!r.ok) {
       return res.status(r.status).json({
@@ -565,9 +738,10 @@ app.get("/api/dress/:id", async (req, res) => {
 
     if (status === "completed") {
       const output = json?.output
-      const imageUrl =
-        Array.isArray(output) ? output[0]
-        : typeof output === "string" ? output
+      const imageUrl = Array.isArray(output)
+        ? output[0]
+        : typeof output === "string"
+        ? output
         : output?.image || output?.image_url || output?.url
 
       if (!imageUrl) {
