@@ -6,7 +6,7 @@ const app = express()
 
 /**
  * ============================================================
- * ✅ 0) CORS (preflight 포함 "강제 통과" - 테스트 단계 최강)
+ * ✅ 0) CORS (가장 확실한 방식: preflight 포함 강제 통과)
  * ============================================================
  */
 app.use((req, res, next) => {
@@ -62,14 +62,15 @@ app.use(express.json({ limit: "25mb" }))
 
 app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) =>
-  res.json({ ok: true, version: "2026-03-03_final_credits_v2_confirm_gate" })
+  res.json({ ok: true, version: "2026-03-03_working_base_plus_safe_retry_v1" })
 )
 
 /**
  * ============================================================
- * ✅ 1) TEST CREDITS (Reserve / Confirm / Release) - in-memory
+ * ✅ 1) TEST CREDITS (Reserve / Confirm / Release)
  * ============================================================
  */
+
 function getClientId(req) {
   const v =
     req.header("X-Client-Id") ||
@@ -88,11 +89,13 @@ function requireClientId(req, res) {
   return cid
 }
 
+// 인메모리 지갑
 const wallets = new Map() // clientId -> { balance, reserved }
 const reservations = new Map() // reservationId -> { clientId, amount, status, createdAt, meta }
 
 function ensureWallet(clientId) {
   if (!wallets.has(clientId)) {
+    // ✅ 테스트 기본 크레딧
     wallets.set(clientId, { balance: 9999, reserved: 0 })
   }
   return wallets.get(clientId)
@@ -109,6 +112,10 @@ app.get("/api/credits/balance", (req, res) => {
   res.json({ clientId: cid, balance: w.balance, reserved: w.reserved })
 })
 
+/**
+ * POST /api/credits/reserve
+ * body: { amount: number, reason?: string, meta?: any }
+ */
 app.post("/api/credits/reserve", (req, res) => {
   const cid = requireClientId(req, res)
   if (!cid) return
@@ -152,6 +159,10 @@ app.post("/api/credits/reserve", (req, res) => {
   })
 })
 
+/**
+ * POST /api/credits/confirm
+ * body: { reservationId: string }
+ */
 app.post("/api/credits/confirm", (req, res) => {
   const cid = requireClientId(req, res)
   if (!cid) return
@@ -180,6 +191,10 @@ app.post("/api/credits/confirm", (req, res) => {
   })
 })
 
+/**
+ * POST /api/credits/release
+ * body: { reservationId: string }
+ */
 app.post("/api/credits/release", (req, res) => {
   const cid = requireClientId(req, res)
   if (!cid) return
@@ -209,7 +224,9 @@ app.post("/api/credits/release", (req, res) => {
 
 /**
  * ============================================================
- * ✅ 2) S1 (Replicate / Imagen) + "확정 게이트(검증/재생성)"
+ * ✅ 2) S1 (Replicate / Imagen)
+ * - ✅ "원본 동작" 유지
+ * - ✅ 최소 변경: prompt key 유연화 + 안전 재시도 + 결과가 "이미지인지"만 확인
  * ============================================================
  */
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN })
@@ -222,7 +239,7 @@ function mustHaveToken(res) {
   return true
 }
 
-// ✅ 프론트가 prompt 키를 실수해도 서버가 받아주기 (400 방지)
+// ✅ 프론트가 prompt 키를 다르게 보내도 서버가 받아줌 (400 방지)
 function pickPromptFromBody(body) {
   const p =
     body?.prompt ||
@@ -237,6 +254,9 @@ function withAdultGuard(prompt) {
   return `adult, age 25, ${prompt}`
 }
 
+/**
+ * ✅ back 머리 쏠림 완화용 (옵션)
+ */
 function hairConsistencyHints() {
   return [
     "hair centered",
@@ -308,82 +328,51 @@ async function runImagen(prompt) {
 }
 
 /**
- * --------------------------
- * ✅ (옵션) BLIP 캡션 검사
- * --------------------------
- * - 켜려면: ENABLE_CAPTION_CHECK="1"
- * - 모델은 환경변수로 받음 (네가 쓰는 슬러그로 교체 가능)
+ * ✅ "거르기"를 무겁게 하면 바로 깨지니까,
+ *    지금은 진짜 최소로: URL이 "이미지"로 응답되는지만 확인.
+ * - HEAD가 막히는 CDN도 있어서: Range GET으로 1~2KB만 읽음
  */
-const ENABLE_CAPTION_CHECK = String(process.env.ENABLE_CAPTION_CHECK || "") === "1"
-const CAPTION_MODEL = process.env.CAPTION_MODEL || "" // 예: "salesforce/blip:..." 형태로 네가 쓰는 걸 넣기
-
-async function getCaptionIfEnabled(imageUrl) {
-  if (!ENABLE_CAPTION_CHECK) return null
-  if (!CAPTION_MODEL) return null
+async function looksLikeImageUrl(url) {
   try {
-    const out = await replicate.run(CAPTION_MODEL, {
-      input: { image: imageUrl },
+    const r = await fetch(url, {
+      method: "GET",
+      headers: { Range: "bytes=0-2047" },
     })
-    if (typeof out === "string") return out
-    if (out && typeof out?.caption === "string") return out.caption
-    if (Array.isArray(out) && typeof out[0] === "string") return out[0]
-    return null
+    if (!r.ok) return false
+    const ct = (r.headers.get("content-type") || "").toLowerCase()
+    if (ct.includes("image/")) return true
+    // content-type이 안 주어지는 경우도 있어서 바이트로 대충 체크(너무 엄격하게 하면 오탐)
+    const buf = await r.arrayBuffer()
+    return buf.byteLength > 16
   } catch {
-    return null
+    return false
   }
 }
 
-// ✅ 아주 보수적인 룰: “완벽”이 아니라 “확률적으로 거르기”
-function captionLooksBad(caption, view) {
-  const c = String(caption || "").toLowerCase()
-  if (!c) return false
-
-  // 텍스트/워터마크/차트/치수표 같은 걸 시사하면 실패 취급
-  const textSignals = ["text", "words", "caption", "watermark", "logo", "numbers", "measurement", "chart"]
-  if (textSignals.some(k => c.includes(k))) return true
-
-  // view가 정반대로 나오면 실패 취급
-  if (view === "front") {
-    if (c.includes("back view") || c.includes("rear view") || c.includes("from behind")) return true
-  } else {
-    if (c.includes("front view") || c.includes("facing the camera") || c.includes("facing forward")) return true
-  }
-
-  return false
-}
-
-// ✅ 최종 “확정 게이트”: (1) 생성 → (2) 캡션 체크(옵션) → (3) 실패면 재생성
-async function generateConfirmed(promptLocked, view, maxRetry = 1) {
+async function generateWithRetry(prompt, maxRetry = 1) {
   let lastUrl = null
-  let lastCaption = null
+  let lastOkImage = false
+  let lastErr = null
 
   for (let i = 0; i <= maxRetry; i++) {
-    const url = await runImagen(promptLocked)
-    if (!url) continue
-    lastUrl = url
+    try {
+      const url = await runImagen(prompt)
+      if (!url) throw new Error("No imageUrl in output")
+      lastUrl = url
 
-    // 옵션 검사
-    const cap = await getCaptionIfEnabled(url)
-    lastCaption = cap
-
-    if (!cap) {
-      // 캡션검사 OFF면, “재시도만”으로 확정 처리
-      return { url, tries: i + 1, caption: null }
+      // ✅ 최소 검증: 이미지로 열리는지
+      const ok = await looksLikeImageUrl(url)
+      lastOkImage = ok
+      if (ok) return { url, tries: i + 1 }
+      // 이미지가 아니면 재시도
+    } catch (e) {
+      lastErr = e
     }
-
-    if (!captionLooksBad(cap, view)) {
-      return { url, tries: i + 1, caption: cap }
-    }
-
-    // 캡션이 이상하면 재시도
   }
 
-  // 재시도 끝나도 마지막 결과는 반환하되 warned 표시
-  if (lastUrl) {
-    return { url: lastUrl, tries: maxRetry + 1, caption: lastCaption, warned: true }
-  }
-
-  throw new Error("Generation failed: no output url")
+  // 재시도 끝나도 마지막 결과는 반환 (warned)
+  if (lastUrl) return { url: lastUrl, tries: maxRetry + 1, warned: true, okImage: lastOkImage }
+  throw lastErr || new Error("Generation failed")
 }
 
 // ✅ /api/s1 (FRONT 1장)
@@ -394,15 +383,15 @@ app.post("/api/s1", async (req, res) => {
 
   try {
     const base = withAdultGuard(prompt)
-    const locked = withViewLock(base, "front")
-    const out = await generateConfirmed(locked, "front", 1)
+    const lockedPrompt = withViewLock(base, "front")
 
+    const out = await generateWithRetry(lockedPrompt, 1)
     return res.json({
       imageUrl: out.url,
-      usedPrompt: locked,
+      usedPrompt: lockedPrompt,
       tries: out.tries,
-      caption: out.caption || null,
       warned: !!out.warned,
+      okImage: out.okImage !== false, // undefined면 true처럼 취급
     })
   } catch (e) {
     return res.status(500).json({
@@ -420,11 +409,12 @@ app.post("/api/s1/pair", async (req, res) => {
 
   try {
     const base = withAdultGuard(prompt)
+
     const promptFront = withViewLock(base, "front")
     const promptBack = withViewLock(base, "back")
 
-    const front = await generateConfirmed(promptFront, "front", 1)
-    const back = await generateConfirmed(promptBack, "back", 1)
+    const front = await generateWithRetry(promptFront, 1)
+    const back = await generateWithRetry(promptBack, 1)
 
     if (!front?.url || !back?.url) {
       return res.status(502).json({
@@ -442,8 +432,6 @@ app.post("/api/s1/pair", async (req, res) => {
       aspect_ratio: "3:4",
       triesFront: front.tries,
       triesBack: back.tries,
-      captionFront: front.caption || null,
-      captionBack: back.caption || null,
       warnedFront: !!front.warned,
       warnedBack: !!back.warned,
     })
