@@ -4,14 +4,43 @@ import Replicate from "replicate"
 
 const app = express()
 
-// ✅ Node 18+ 는 fetch 기본 제공.
-// Render/로컬에서 Node 버전이 낮아 fetch가 없으면 에러나니까 안전장치.
-if (typeof globalThis.fetch !== "function") {
-  console.warn(
-    "[WARN] fetch is not available. Use Node 18+ or add a fetch polyfill (undici/node-fetch)."
-  )
-}
+/**
+ * ============================================================
+ * ✅ 0) CORS (preflight 포함 "강제 통과" - 테스트 단계 최강)
+ * ============================================================
+ */
+app.use((req, res, next) => {
+  const origin = req.headers.origin
 
+  const ok =
+    !origin ||
+    origin.includes("framer.app") ||
+    origin.includes("framer.com") ||
+    origin.includes("framercanvas.com") ||
+    origin.includes("localhost") ||
+    origin.includes("127.0.0.1")
+
+  if (ok && origin) {
+    res.setHeader("Access-Control-Allow-Origin", origin)
+    res.setHeader("Vary", "Origin")
+  }
+
+  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+
+  // ✅ 핵심: 브라우저가 요청한 헤더를 그대로 허용 (x-client-id 포함)
+  const reqHeaders = req.headers["access-control-request-headers"]
+  res.setHeader(
+    "Access-Control-Allow-Headers",
+    reqHeaders || "Content-Type, Authorization, X-Client-Id, x-client-id"
+  )
+
+  if (req.method === "OPTIONS") {
+    return res.status(204).end()
+  }
+  next()
+})
+
+// (보조) cors 패키지도 같이 둬도 됨
 const corsOptions = {
   origin: (origin, cb) => {
     if (!origin) return cb(null, true)
@@ -25,170 +54,164 @@ const corsOptions = {
     return cb(new Error("Not allowed by CORS: " + origin))
   },
   methods: ["GET", "POST", "OPTIONS"],
-  // ✅ 중요: 프론트에서 X-Client-Id 헤더를 보내므로 허용해야 함
-  allowedHeaders: ["Content-Type", "Authorization", "X-Client-Id"],
+  allowedHeaders: ["Content-Type", "Authorization", "X-Client-Id", "x-client-id"],
 }
-
 app.use(cors(corsOptions))
-app.options("*", cors(corsOptions))
+
 app.use(express.json({ limit: "25mb" }))
 
 app.get("/", (req, res) => res.send("DRESSD server running"))
-app.get("/health", (req, res) => res.json({ ok: true }))
+app.get("/health", (req, res) =>
+  res.json({ ok: true, version: "2026-03-03_final_credits_v2_confirm_gate" })
+)
 
-/** -------------------------
- *  Credits (MVP B안: reserve/commit/release)
- *  - 로그인 없음: clientId(브라우저 localStorage)로 관리
- *  - 메모리 저장: 서버 재시작 시 초기화(현재 단계에 OK)
- *  ------------------------- */
-const DEFAULT_BALANCE = 1000 // 테스트 기본 지급 (원하면 0으로)
-const RESERVE_TTL_MS = 5 * 60 * 1000 // 5분
-
-const balances = new Map() // clientId -> number
-const reservations = new Map()
-// reservationId -> { reservationId, clientId, amount, status, createdAt, expiresAt, reason, committedAt?, releasedAt?, releaseReason? }
-
-function now() {
-  return Date.now()
-}
-
+/**
+ * ============================================================
+ * ✅ 1) TEST CREDITS (Reserve / Confirm / Release) - in-memory
+ * ============================================================
+ */
 function getClientId(req) {
-  const id = req.header("X-Client-Id")
-  if (!id) throw new Error("Missing X-Client-Id")
-  return id
+  const v =
+    req.header("X-Client-Id") ||
+    req.header("x-client-id") ||
+    req.header("X-CLIENT-ID") ||
+    ""
+  return String(v || "").trim()
 }
 
-function getBalance(clientId) {
-  if (!balances.has(clientId)) balances.set(clientId, DEFAULT_BALANCE)
-  return balances.get(clientId)
-}
-
-function setBalance(clientId, v) {
-  balances.set(clientId, v)
-}
-
-function cleanupExpiredReservations() {
-  const t = now()
-  for (const [rid, r] of reservations.entries()) {
-    if (r.status === "reserved" && r.expiresAt <= t) {
-      // 만료면 자동 환불(=release)
-      const bal = getBalance(r.clientId)
-      setBalance(r.clientId, bal + r.amount)
-      reservations.set(rid, {
-        ...r,
-        status: "released",
-        releasedAt: t,
-        releaseReason: "expired",
-      })
-    }
+function requireClientId(req, res) {
+  const cid = getClientId(req)
+  if (!cid) {
+    res.status(400).json({ error: "Missing X-Client-Id" })
+    return null
   }
+  return cid
 }
-setInterval(cleanupExpiredReservations, 15000)
 
-app.post("/api/credits/balance", (req, res) => {
-  try {
-    const clientId = getClientId(req)
-    return res.json({ clientId, balance: getBalance(clientId) })
-  } catch (e) {
-    return res.status(400).json({ error: String(e?.message ?? e) })
+const wallets = new Map() // clientId -> { balance, reserved }
+const reservations = new Map() // reservationId -> { clientId, amount, status, createdAt, meta }
+
+function ensureWallet(clientId) {
+  if (!wallets.has(clientId)) {
+    wallets.set(clientId, { balance: 9999, reserved: 0 })
   }
+  return wallets.get(clientId)
+}
+
+function makeReservationId() {
+  return `r_${Date.now()}_${Math.random().toString(16).slice(2)}`
+}
+
+app.get("/api/credits/balance", (req, res) => {
+  const cid = requireClientId(req, res)
+  if (!cid) return
+  const w = ensureWallet(cid)
+  res.json({ clientId: cid, balance: w.balance, reserved: w.reserved })
 })
 
 app.post("/api/credits/reserve", (req, res) => {
-  try {
-    const clientId = getClientId(req)
-    const amount = Number(req.body?.amount || 0)
-    const reason = String(req.body?.reason || "")
+  const cid = requireClientId(req, res)
+  if (!cid) return
 
-    if (!Number.isFinite(amount) || amount <= 0) {
-      return res.status(400).json({ error: "amount must be > 0" })
-    }
-
-    const balance = getBalance(clientId)
-    if (balance < amount) {
-      return res.status(402).json({ error: "insufficient_credits", balance })
-    }
-
-    // reserve 시점에 hold 차감
-    setBalance(clientId, balance - amount)
-
-    const reservationId = `r_${now()}_${Math.random().toString(16).slice(2)}`
-    const createdAt = now()
-    const expiresAt = createdAt + RESERVE_TTL_MS
-
-    reservations.set(reservationId, {
-      reservationId,
-      clientId,
-      amount,
-      status: "reserved",
-      createdAt,
-      expiresAt,
-      reason,
-    })
-
-    return res.json({ reservationId, expiresAt, balance: getBalance(clientId) })
-  } catch (e) {
-    return res.status(400).json({ error: String(e?.message ?? e) })
+  const amount = Number(req.body?.amount ?? 0)
+  if (!Number.isFinite(amount) || amount <= 0) {
+    return res.status(400).json({ error: "Invalid amount" })
   }
+
+  const w = ensureWallet(cid)
+  const available = w.balance - w.reserved
+
+  if (available < amount) {
+    return res.status(402).json({
+      error: "Insufficient credits",
+      balance: w.balance,
+      reserved: w.reserved,
+      available,
+      need: amount,
+    })
+  }
+
+  const reservationId = makeReservationId()
+  w.reserved += amount
+
+  reservations.set(reservationId, {
+    clientId: cid,
+    amount,
+    status: "reserved",
+    createdAt: Date.now(),
+    meta: req.body?.meta ?? null,
+    reason: req.body?.reason ?? null,
+  })
+
+  return res.json({
+    ok: true,
+    reservationId,
+    balance: w.balance,
+    reserved: w.reserved,
+    available: w.balance - w.reserved,
+  })
 })
 
-app.post("/api/credits/commit", (req, res) => {
-  try {
-    const clientId = getClientId(req)
-    const reservationId = String(req.body?.reservationId || "")
-    const r = reservations.get(reservationId)
-    if (!r) return res.status(404).json({ error: "reservation_not_found" })
-    if (r.clientId !== clientId) return res.status(403).json({ error: "forbidden" })
+app.post("/api/credits/confirm", (req, res) => {
+  const cid = requireClientId(req, res)
+  if (!cid) return
 
-    if (r.status === "committed") {
-      return res.json({ ok: true, idempotent: true, balance: getBalance(clientId) })
-    }
-    if (r.status !== "reserved") {
-      return res.status(400).json({ error: `cannot_commit_status_${r.status}` })
-    }
-
-    reservations.set(reservationId, { ...r, status: "committed", committedAt: now() })
-    return res.json({ ok: true, balance: getBalance(clientId) })
-  } catch (e) {
-    return res.status(400).json({ error: String(e?.message ?? e) })
+  const reservationId = String(req.body?.reservationId ?? "")
+  const r = reservations.get(reservationId)
+  if (!r) return res.status(404).json({ error: "Reservation not found" })
+  if (r.clientId !== cid) return res.status(403).json({ error: "Forbidden" })
+  if (r.status !== "reserved") {
+    return res.status(400).json({ error: `Bad status: ${r.status}` })
   }
+
+  const w = ensureWallet(cid)
+  w.reserved = Math.max(0, w.reserved - r.amount)
+  w.balance = Math.max(0, w.balance - r.amount)
+
+  r.status = "confirmed"
+  reservations.set(reservationId, r)
+
+  return res.json({
+    ok: true,
+    reservationId,
+    balance: w.balance,
+    reserved: w.reserved,
+    available: w.balance - w.reserved,
+  })
 })
 
 app.post("/api/credits/release", (req, res) => {
-  try {
-    const clientId = getClientId(req)
-    const reservationId = String(req.body?.reservationId || "")
-    const reason = String(req.body?.reason || "release")
-    const r = reservations.get(reservationId)
-    if (!r) return res.status(404).json({ error: "reservation_not_found" })
-    if (r.clientId !== clientId) return res.status(403).json({ error: "forbidden" })
+  const cid = requireClientId(req, res)
+  if (!cid) return
 
-    if (r.status === "released") {
-      return res.json({ ok: true, idempotent: true, balance: getBalance(clientId) })
-    }
-    if (r.status !== "reserved") {
-      return res.status(400).json({ error: `cannot_release_status_${r.status}` })
-    }
-
-    // 환불(hold 되돌리기)
-    setBalance(clientId, getBalance(clientId) + r.amount)
-
-    reservations.set(reservationId, {
-      ...r,
-      status: "released",
-      releasedAt: now(),
-      releaseReason: reason,
-    })
-
-    return res.json({ ok: true, balance: getBalance(clientId) })
-  } catch (e) {
-    return res.status(400).json({ error: String(e?.message ?? e) })
+  const reservationId = String(req.body?.reservationId ?? "")
+  const r = reservations.get(reservationId)
+  if (!r) return res.status(404).json({ error: "Reservation not found" })
+  if (r.clientId !== cid) return res.status(403).json({ error: "Forbidden" })
+  if (r.status !== "reserved") {
+    return res.status(400).json({ error: `Bad status: ${r.status}` })
   }
+
+  const w = ensureWallet(cid)
+  w.reserved = Math.max(0, w.reserved - r.amount)
+
+  r.status = "released"
+  reservations.set(reservationId, r)
+
+  return res.json({
+    ok: true,
+    reservationId,
+    balance: w.balance,
+    reserved: w.reserved,
+    available: w.balance - w.reserved,
+  })
 })
 
-/** -------------------------
- *  S1 (Replicate / Imagen)
- *  ------------------------- */
+/**
+ * ============================================================
+ * ✅ 2) S1 (Replicate / Imagen) + "확정 게이트(검증/재생성)"
+ * ============================================================
+ */
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN })
 
 function mustHaveToken(res) {
@@ -199,72 +222,31 @@ function mustHaveToken(res) {
   return true
 }
 
+// ✅ 프론트가 prompt 키를 실수해도 서버가 받아주기 (400 방지)
+function pickPromptFromBody(body) {
+  const p =
+    body?.prompt ||
+    body?.finalPrompt ||
+    body?.positivePrompt ||
+    body?.positive ||
+    ""
+  return String(p || "").trim()
+}
+
 function withAdultGuard(prompt) {
   return `adult, age 25, ${prompt}`
 }
 
-/**
- * ✅ 텍스트/숫자/치수/인포그래픽 오버레이 방지
- */
-function banTextOverlays(p) {
+function hairConsistencyHints() {
   return [
-    p,
-    "no text",
-    "no typography",
-    "no labels",
-    "no captions",
-    "no numbers",
-    "no measurements",
-    "no watermark",
-    "no UI",
-    "no infographic",
-    "no chart",
-    "no diagram",
+    "hair centered",
+    "symmetrical hairstyle",
+    "hair not swept to one side",
+    "no wind",
+    "no dramatic motion",
   ].join(", ")
 }
 
-/**
- * ✅ 헤어 일관성(소폭 향상)
- * - 완벽 고정은 불가능하지만, 재추론 여지를 줄여서 색/웨이브 튐을 감소
- */
-function enforceHairConsistency(p) {
-  return [
-    p,
-    "same hairstyle",
-    "same hair length",
-    "same hair color",
-    "consistent hair tone",
-    "identical hair",
-    "no hairstyle change",
-  ].join(", ")
-}
-
-/**
- * ✅ view 충돌 제거
- */
-function sanitizeViewConflicts(prompt, view) {
-  let p = String(prompt || "")
-  const clean = () => p.replace(/\s+/g, " ").trim()
-
-  if (view === "back") {
-    p = p.replace(/front view only/gi, "")
-    p = p.replace(/front-facing/gi, "")
-    p = p.replace(/not back view/gi, "")
-    p = p.replace(/facing camera/gi, "")
-    p = p.replace(/looking at camera/gi, "")
-    p = p.replace(/camera-facing/gi, "")
-    return clean()
-  }
-
-  p = p.replace(/back view only/gi, "")
-  p = p.replace(/rear view/gi, "")
-  p = p.replace(/not front view/gi, "")
-  p = p.replace(/facing away/gi, "")
-  p = p.replace(/back-facing/gi, "")
-  return clean()
-}
-
-// ✅ FRONT/BACK 뷰를 강하게 고정
 function withViewLock(prompt, view) {
   if (view === "back") {
     return [
@@ -272,13 +254,14 @@ function withViewLock(prompt, view) {
       "back view only",
       "rear view",
       "standing straight",
+      "symmetrical posture",
       "full body",
       "head to toe",
       "feet visible",
       "not front view",
       "single person",
       "centered",
-      "camera behind subject",
+      hairConsistencyHints(),
     ].join(", ")
   }
   return [
@@ -286,17 +269,17 @@ function withViewLock(prompt, view) {
     "front view only",
     "front-facing",
     "standing straight",
+    "symmetrical posture",
     "full body",
     "head to toe",
     "feet visible",
     "not back view",
     "single person",
     "centered",
-    "camera in front of subject",
+    hairConsistencyHints(),
   ].join(", ")
 }
 
-// ✅ Replicate output 형태가 케이스별로 달라서 최대한 안전하게 뽑기
 function pickImageUrl(output) {
   if (Array.isArray(output)) {
     const first = output[0]
@@ -324,24 +307,146 @@ async function runImagen(prompt) {
   return pickImageUrl(output)
 }
 
-// ✅ 기존 엔드포인트 유지: /api/s1 (FRONT 1장만)
+/**
+ * --------------------------
+ * ✅ (옵션) BLIP 캡션 검사
+ * --------------------------
+ * - 켜려면: ENABLE_CAPTION_CHECK="1"
+ * - 모델은 환경변수로 받음 (네가 쓰는 슬러그로 교체 가능)
+ */
+const ENABLE_CAPTION_CHECK = String(process.env.ENABLE_CAPTION_CHECK || "") === "1"
+const CAPTION_MODEL = process.env.CAPTION_MODEL || "" // 예: "salesforce/blip:..." 형태로 네가 쓰는 걸 넣기
+
+async function getCaptionIfEnabled(imageUrl) {
+  if (!ENABLE_CAPTION_CHECK) return null
+  if (!CAPTION_MODEL) return null
+  try {
+    const out = await replicate.run(CAPTION_MODEL, {
+      input: { image: imageUrl },
+    })
+    if (typeof out === "string") return out
+    if (out && typeof out?.caption === "string") return out.caption
+    if (Array.isArray(out) && typeof out[0] === "string") return out[0]
+    return null
+  } catch {
+    return null
+  }
+}
+
+// ✅ 아주 보수적인 룰: “완벽”이 아니라 “확률적으로 거르기”
+function captionLooksBad(caption, view) {
+  const c = String(caption || "").toLowerCase()
+  if (!c) return false
+
+  // 텍스트/워터마크/차트/치수표 같은 걸 시사하면 실패 취급
+  const textSignals = ["text", "words", "caption", "watermark", "logo", "numbers", "measurement", "chart"]
+  if (textSignals.some(k => c.includes(k))) return true
+
+  // view가 정반대로 나오면 실패 취급
+  if (view === "front") {
+    if (c.includes("back view") || c.includes("rear view") || c.includes("from behind")) return true
+  } else {
+    if (c.includes("front view") || c.includes("facing the camera") || c.includes("facing forward")) return true
+  }
+
+  return false
+}
+
+// ✅ 최종 “확정 게이트”: (1) 생성 → (2) 캡션 체크(옵션) → (3) 실패면 재생성
+async function generateConfirmed(promptLocked, view, maxRetry = 1) {
+  let lastUrl = null
+  let lastCaption = null
+
+  for (let i = 0; i <= maxRetry; i++) {
+    const url = await runImagen(promptLocked)
+    if (!url) continue
+    lastUrl = url
+
+    // 옵션 검사
+    const cap = await getCaptionIfEnabled(url)
+    lastCaption = cap
+
+    if (!cap) {
+      // 캡션검사 OFF면, “재시도만”으로 확정 처리
+      return { url, tries: i + 1, caption: null }
+    }
+
+    if (!captionLooksBad(cap, view)) {
+      return { url, tries: i + 1, caption: cap }
+    }
+
+    // 캡션이 이상하면 재시도
+  }
+
+  // 재시도 끝나도 마지막 결과는 반환하되 warned 표시
+  if (lastUrl) {
+    return { url: lastUrl, tries: maxRetry + 1, caption: lastCaption, warned: true }
+  }
+
+  throw new Error("Generation failed: no output url")
+}
+
+// ✅ /api/s1 (FRONT 1장)
 app.post("/api/s1", async (req, res) => {
-  const { prompt } = req.body || {}
+  const prompt = pickPromptFromBody(req.body)
   if (!mustHaveToken(res)) return
   if (!prompt) return res.status(400).json({ error: "Prompt missing" })
 
   try {
     const base = withAdultGuard(prompt)
-    const baseFront = sanitizeViewConflicts(base, "front")
-    const finalPrompt = withViewLock(
-      enforceHairConsistency(banTextOverlays(baseFront)),
-      "front"
-    )
+    const locked = withViewLock(base, "front")
+    const out = await generateConfirmed(locked, "front", 1)
 
-    const imageUrl = await runImagen(finalPrompt)
-    if (!imageUrl) return res.status(502).json({ error: "No imageUrl in output" })
+    return res.json({
+      imageUrl: out.url,
+      usedPrompt: locked,
+      tries: out.tries,
+      caption: out.caption || null,
+      warned: !!out.warned,
+    })
+  } catch (e) {
+    return res.status(500).json({
+      error: "Generation failed",
+      detail: String(e?.message ?? e),
+    })
+  }
+})
 
-    return res.json({ imageUrl, usedPrompt: finalPrompt })
+// ✅ /api/s1/pair (FRONT+BACK 2장)
+app.post("/api/s1/pair", async (req, res) => {
+  const prompt = pickPromptFromBody(req.body)
+  if (!mustHaveToken(res)) return
+  if (!prompt) return res.status(400).json({ error: "Prompt missing" })
+
+  try {
+    const base = withAdultGuard(prompt)
+    const promptFront = withViewLock(base, "front")
+    const promptBack = withViewLock(base, "back")
+
+    const front = await generateConfirmed(promptFront, "front", 1)
+    const back = await generateConfirmed(promptBack, "back", 1)
+
+    if (!front?.url || !back?.url) {
+      return res.status(502).json({
+        error: "No imageUrl in output",
+        frontUrl: front?.url || null,
+        backUrl: back?.url || null,
+      })
+    }
+
+    return res.json({
+      frontUrl: front.url,
+      backUrl: back.url,
+      usedPromptFront: promptFront,
+      usedPromptBack: promptBack,
+      aspect_ratio: "3:4",
+      triesFront: front.tries,
+      triesBack: back.tries,
+      captionFront: front.caption || null,
+      captionBack: back.caption || null,
+      warnedFront: !!front.warned,
+      warnedBack: !!back.warned,
+    })
   } catch (e) {
     return res.status(500).json({
       error: "Generation failed",
@@ -351,127 +456,10 @@ app.post("/api/s1", async (req, res) => {
 })
 
 /**
- * ✅ /api/s1/pair (최종)
- * - 입력 지원:
- *    1) { promptFront, promptBack, reservationId }  ← ✅ 권장
- *    2) { prompt, reservationId }                   ← fallback
- * - back이 계속 front로 나오는 문제를 줄이기 위해:
- *    - view별 sanitize
- *    - text overlay 금지 강제
- *    - hair consistency 소폭 강화
- *    - view lock 강화
- * - frontUrl===backUrl이면 실패 처리 + release(환불)
+ * ============================================================
+ * ✅ 3) S3 Dress (FASHN)
+ * ============================================================
  */
-app.post("/api/s1/pair", async (req, res) => {
-  const { prompt, promptFront, promptBack, reservationId } = req.body || {}
-  if (!mustHaveToken(res)) return
-
-  // ✅ credit reservation 검증
-  let clientId = null
-  let r = null
-  try {
-    clientId = getClientId(req)
-    if (!reservationId) return res.status(400).json({ error: "Missing reservationId" })
-    r = reservations.get(String(reservationId))
-    if (!r) return res.status(404).json({ error: "reservation_not_found" })
-    if (r.clientId !== clientId) return res.status(403).json({ error: "forbidden" })
-    if (r.status !== "reserved")
-      return res.status(400).json({ error: `bad_reservation_status_${r.status}` })
-  } catch (e) {
-    return res.status(400).json({ error: String(e?.message ?? e) })
-  }
-
-  const releaseOnce = (reason) => {
-    try {
-      const cur = reservations.get(String(reservationId))
-      if (cur && cur.status === "reserved") {
-        setBalance(clientId, getBalance(clientId) + cur.amount)
-        reservations.set(String(reservationId), {
-          ...cur,
-          status: "released",
-          releasedAt: now(),
-          releaseReason: reason,
-        })
-      }
-    } catch {}
-  }
-
-  try {
-    // ✅ 입력 프롬프트 우선순위:
-    // 1) promptFront/promptBack이 오면 그대로 사용
-    // 2) 없으면 prompt 하나로 fallback
-    const rawFront = (promptFront ?? prompt ?? "").toString()
-    const rawBack = (promptBack ?? prompt ?? "").toString()
-
-    if (!rawFront || !rawBack) {
-      releaseOnce("prompt_missing")
-      return res.status(400).json({ error: "Prompt missing" })
-    }
-
-    // ✅ 성인 가드(둘 다 적용)
-    const baseFront0 = withAdultGuard(rawFront)
-    const baseBack0 = withAdultGuard(rawBack)
-
-    // ✅ 충돌 제거(뷰별)
-    const baseFront1 = sanitizeViewConflicts(baseFront0, "front")
-    const baseBack1 = sanitizeViewConflicts(baseBack0, "back")
-
-    // ✅ 텍스트 금지 + 헤어 일관성 소폭 강화
-    const baseFront2 = enforceHairConsistency(banTextOverlays(baseFront1))
-    const baseBack2 = enforceHairConsistency(banTextOverlays(baseBack1))
-
-    // ✅ 최종 view lock
-    const finalPromptFront = withViewLock(baseFront2, "front")
-    const finalPromptBack = withViewLock(baseBack2, "back")
-
-    // ✅ 순차 실행(안정)
-    const frontUrl = await runImagen(finalPromptFront)
-    const backUrl = await runImagen(finalPromptBack)
-
-    if (!frontUrl || !backUrl) {
-      releaseOnce("no_image_url")
-      return res.status(502).json({
-        error: "No imageUrl in output",
-        frontUrl: frontUrl || null,
-        backUrl: backUrl || null,
-      })
-    }
-
-    // ✅ “앞면 2장” 최소 방어: URL 같으면 실패로 처리(환불 + 재시도 유도)
-    if (frontUrl === backUrl) {
-      releaseOnce("same_url_front_back")
-      return res.status(502).json({
-        error: "front/back identical (retry)",
-        frontUrl,
-        backUrl,
-      })
-    }
-
-    // ✅ 성공 → commit
-    reservations.set(String(reservationId), { ...r, status: "committed", committedAt: now() })
-
-    return res.json({
-      frontUrl,
-      backUrl,
-      usedPromptFront: finalPromptFront,
-      usedPromptBack: finalPromptBack,
-      aspect_ratio: "3:4",
-      credit: { committed: true, balance: getBalance(clientId) },
-      reservationId,
-    })
-  } catch (e) {
-    releaseOnce("generation_failed")
-    return res.status(500).json({
-      error: "Generation failed",
-      detail: String(e?.message ?? e),
-      reservationId,
-    })
-  }
-})
-
-/** -------------------------
- *  S3 Dress (FASHN)
- *  ------------------------- */
 const FASHN_BASE = "https://api.fashn.ai/v1"
 const FASHN_MODEL_NAME = "tryon-v1.6"
 
@@ -490,7 +478,7 @@ function fashnHeaders() {
   if (!key) throw new Error("FASHN_API_KEY missing on server")
   return {
     "Content-Type": "application/json",
-    Authorization: `Bearer ${key}`,
+    "Authorization": `Bearer ${key}`,
   }
 }
 
