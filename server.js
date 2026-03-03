@@ -1,4 +1,4 @@
-// server.js (FINAL+++ - bootsafe + credits + hard CORS + S1 pair + 429 handling + E005 safe-fallback + filter best-effort)
+// server.js (FINAL+++ patched - BODY LOCK + UNDERWEAR/BIKINI SHAPE LOCK on top of your stable version)
 // ✅ Requires Node 18+ (Render에서 Node 버전 고정 추천)
 import express from "express"
 import cors from "cors"
@@ -89,7 +89,7 @@ app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) =>
   res.json({
     ok: true,
-    version: "2026-03-04_finalppp_bootsafe_filter_429_e005_v1",
+    version: "2026-03-04_finalppp_bootsafe_filter_429_e005_BODYLOCK_UNDERWEARLOCK_v2",
     node: process.versions.node,
   })
 )
@@ -117,9 +117,7 @@ function requireClientId(req, res) {
   return cid
 }
 
-// clientId -> { balance, reserved }
 const wallets = new Map()
-// reservationId -> { clientId, amount, status, createdAt, meta, reason }
 const reservations = new Map()
 
 function ensureWallet(clientId) {
@@ -348,16 +346,70 @@ function withViewLock(prompt, view) {
   ].join(", ")
 }
 
-// ✅ pair에서 front/back 베이스레이어(기본 착장) 컬러/스타일 맞추는 “공통 잠금”
-// - "underwear only" 같은 표현은 안전필터(E005)에 걸릴 확률↑
-// - base layer로 포장 + modest / non-lingerie로 안전화
-const ENABLE_BASE_LAYER_LOCK = process.env.ENABLE_UNDERWEAR_LOCK !== "0" // 기존 env 그대로 호환
-const BASE_LAYER_LOCK_PROMPT = [
-  "wearing simple seamless base layer shorts and a basic fitted base-layer top (non-sheer)",
-  "consistent base-layer color across all views",
-  "solid color, no logo, no pattern",
-  "modest, non-revealing, non-lingerie",
+/**
+ * ============================================================
+ * ✅ 5-A) BODY LOCK (너가 말한: 허리/어깨/머리 길이/모양)
+ * - 너무 길게 쓰면 오히려 이상해질 수 있어서 “짧고 강하게”만
+ * ============================================================
+ */
+const ENABLE_BODY_LOCK = process.env.ENABLE_BODY_LOCK !== "0"
+const BODY_LOCK_PROMPT = [
+  "same person across all views",
+  "same waist circumference and same waistline position",
+  "same shoulder width",
+  "same hairstyle, same hair length and shape",
+  "same head size and neck length",
+  "consistent camera distance and framing",
+  "studio catalog full-body photo, centered",
 ].join(", ")
+
+/**
+ * ============================================================
+ * ✅ 5-B) UNDERWEAR / BIKINI SHAPE LOCK
+ * - 기존 BASE_LAYER는 쇼츠/탑이 흔들려서 허리 실루엣이 달라보일 수 있음
+ * - 그래서 “색 + 형태(컷/디자인)”까지 잠금
+ *
+ * ENV:
+ *  - ENABLE_UNDERWEAR_LOCK=1  (기본 ON, 기존 호환)
+ *  - UNDERWEAR_STYLE=underwear | bikini   (기본 underwear)
+ *  - UNDERWEAR_COLOR=pure white | ivory | beige | black ...
+ * ============================================================
+ */
+const ENABLE_UNDERWEAR_LOCK = process.env.ENABLE_UNDERWEAR_LOCK !== "0"
+const UNDERWEAR_STYLE = String(process.env.UNDERWEAR_STYLE || "underwear").toLowerCase().trim()
+const UNDERWEAR_COLOR = String(process.env.UNDERWEAR_COLOR || "pure white").trim()
+
+// ✅ underwear(브라 훅/스트랩 때문에 back에서 다른 제품으로 튀는 걸 막기 위해 “NO hooks” 타입 고정)
+const UNDERWEAR_LOCK_PROMPT = [
+  // top
+  "wearing a matching seamless pullover bralette (NO hooks, NO clasp, NO adjustable straps)",
+  "wide shoulder straps, smooth fabric, non-sheer",
+  `solid ${UNDERWEAR_COLOR} color`,
+  // bottom
+  "wearing matching mid-rise seamless briefs (NOT shorts), non-sheer",
+  `solid ${UNDERWEAR_COLOR} color`,
+  // consistency
+  "same exact underwear set in front and back view, identical cut and identical design",
+  "no lace, no mesh, no pattern, no logo",
+  // safety tone (E005 완화)
+  "commercial fashion catalog styling, modest, non-revealing",
+].join(", ")
+
+// ✅ bikini(여름 제품 촬영용): “two-piece bikini set”으로 형태/색 고정
+const BIKINI_LOCK_PROMPT = [
+  "wearing a matching simple two-piece bikini set",
+  "high-coverage bikini top, non-sheer",
+  `solid ${UNDERWEAR_COLOR} color`,
+  "matching bikini bottom, mid-rise (NOT shorts), non-sheer",
+  `solid ${UNDERWEAR_COLOR} color`,
+  "same exact bikini set in front and back view, identical cut and identical design",
+  "no pattern, no logo, no text",
+  "commercial fashion catalog styling, modest, non-revealing",
+].join(", ")
+
+function baseOutfitLockPrompt() {
+  return UNDERWEAR_STYLE === "bikini" ? BIKINI_LOCK_PROMPT : UNDERWEAR_LOCK_PROMPT
+}
 
 // ✅ back에서 “가슴 과장/측면 돌출” 완화(Back만)
 const BACK_BUST_SAFETY_HINTS = [
@@ -421,7 +473,6 @@ function isRateLimitError(err) {
 }
 
 function parseRetryAfterSeconds(err) {
-  // Replicate ApiError: message에 JSON이 포함되는 케이스
   try {
     const msg = String(err?.message || "")
     const i = msg.indexOf("{")
@@ -430,8 +481,6 @@ function parseRetryAfterSeconds(err) {
       if (j?.retry_after && Number.isFinite(Number(j.retry_after))) return Number(j.retry_after)
     }
   } catch {}
-
-  // 기본
   return 6
 }
 
@@ -445,16 +494,17 @@ function isSensitiveFlagError(err) {
   return msg.includes("(E005)") || msg.toLowerCase().includes("flagged as sensitive")
 }
 
-// E005 폴백용: 위험 단어를 "base layer"로 완화 + modest 강화
+// E005 폴백용: 너무 직접적인 단어를 완화 + 카탈로그 톤 강화
 function makeSaferPrompt(p) {
   const s = String(p || "")
   return (
     s
-      .replace(/underwear\s*only/gi, "modest base layer")
-      .replace(/underwear/gi, "base layer")
-      .replace(/lingerie/gi, "base layer")
+      .replace(/underwear\s*only/gi, "matching base garment set")
+      .replace(/underwear/gi, "matching base garment set")
+      .replace(/bikini/gi, "matching swimwear set")
+      .replace(/lingerie/gi, "base garment")
       .replace(/\s+/g, " ")
-      .trim() + ", modest, non-revealing, non-sheer, not lingerie"
+      .trim() + ", modest, non-revealing, non-sheer, commercial catalog"
   )
 }
 
@@ -478,7 +528,6 @@ async function captionImageBestEffort(imageUrl) {
     const out = await replicate.run(CAPTION_MODEL_VERSION, { input: { image: imageUrl } })
     return { caption: normalizeCaption(out), model: CAPTION_MODEL_VERSION }
   } catch {
-    // 캡션 실패해도 생성은 살림
     return { caption: "", model: "caption_failed" }
   }
 }
@@ -487,6 +536,8 @@ function looksBadByCaption(caption) {
   const c = String(caption || "").toLowerCase()
   if (!c) return false
 
+  // 너무 공격적으로 잡으면 “정상 인물”도 걸리는 케이스가 있어서,
+  // 최소한 “텍스트/콜라주/그리드/멀티피플” 중심으로만 둔다.
   const badTokens = [
     "text",
     "words",
@@ -504,15 +555,10 @@ function looksBadByCaption(caption) {
     "grid",
     "panel",
     "split",
-    "multi",
-    "multiple",
+    "multiple people",
     "two people",
     "group",
     "crowd",
-    "close up",
-    "portrait",
-    "headshot",
-    "upper body",
   ]
 
   return badTokens.some((t) => c.includes(t))
@@ -521,7 +567,6 @@ function looksBadByCaption(caption) {
 async function checkBadBestEffort(imageUrl, usedPrompt) {
   if (!ENABLE_RESULT_FILTER) return { bad: false, why: "filter_disabled", caption: "" }
 
-  // 프롬프트 길이 이상치 방어
   if (String(usedPrompt || "").length > 6000) {
     return { bad: true, why: "bad_prompt_heuristic", caption: "" }
   }
@@ -553,11 +598,8 @@ async function generateWithRetry(prompt, maxRetry = 1) {
       }
 
       if (!check.bad) return last
-      // bad면 재생성
     } catch (e) {
       lastErr = e
-      // 429/E005는 여기서 억지로 반복해도 소용 없을 수 있어서,
-      // 라우트에서 정책적으로 처리하는 게 더 낫다.
       if (isRateLimitError(e) || isSensitiveFlagError(e)) break
     }
   }
@@ -581,8 +623,15 @@ app.post("/api/s1", async (req, res) => {
   if (!prompt) return res.status(400).json({ requestId, error: "Prompt missing" })
 
   try {
-    const base = withAdultGuard(prompt)
-    const lockedPrompt = withViewLock(base, "front")
+    let base = withAdultGuard(prompt)
+
+    // ✅ BODY LOCK 주입 (단일도 동일하게 고정)
+    if (ENABLE_BODY_LOCK) base = `${base}, ${BODY_LOCK_PROMPT}`
+
+    let lockedPrompt = withViewLock(base, "front")
+
+    // ✅ UNDERWEAR/BIKINI lock (형태/색 고정)
+    if (ENABLE_UNDERWEAR_LOCK) lockedPrompt = `${lockedPrompt}, ${baseOutfitLockPrompt()}`
 
     // 단일 1장: 필터/재생성 2회까지 허용
     const out = await generateWithRetry(lockedPrompt, 2)
@@ -633,16 +682,6 @@ app.post("/api/s1", async (req, res) => {
 
 /**
  * ✅ /api/s1/pair (FRONT+BACK 2장)
- *
- * ✅ 바디 호환:
- * - (A) { prompt } 만 와도 됨  → 서버가 front/back 잠금 프롬프트 생성
- * - (B) { promptFront, promptBack } 오면 우선 사용
- *
- * ✅ 추가:
- * - base layer lock (front/back 컬러 일치, underwear 표현 제거)
- * - back bust safety hints (과장 방지)
- * - 429는 429로 내려서 프론트가 retryAfter 기반 재시도 가능
- * - E005는 safePrompt로 "1회만" 폴백 재시도 후 실패 시 422 반환
  */
 app.post("/api/s1/pair", async (req, res) => {
   const requestId = rid()
@@ -669,26 +708,33 @@ app.post("/api/s1/pair", async (req, res) => {
     let promptBack = ""
 
     if (hasPairPrompts) {
+      // 프론트에서 이미 만들어 보내는 경우에도 BODY/OUTFIT lock을 서버가 “덧씌움”
       promptFront = String(b.promptFront)
       promptBack = String(b.promptBack)
+
+      if (ENABLE_BODY_LOCK) {
+        promptFront = `${promptFront}, ${BODY_LOCK_PROMPT}`
+        promptBack = `${promptBack}, ${BODY_LOCK_PROMPT}`
+      }
     } else {
-      const base = withAdultGuard(String(b.prompt))
+      let base = withAdultGuard(String(b.prompt))
+      if (ENABLE_BODY_LOCK) base = `${base}, ${BODY_LOCK_PROMPT}`
+
       promptFront = withViewLock(base, "front")
       promptBack = withViewLock(base, "back")
     }
 
-    // ✅ base layer lock (기본 ON)
-    if (ENABLE_BASE_LAYER_LOCK) {
-      promptFront = `${promptFront}, ${BASE_LAYER_LOCK_PROMPT}`
-      promptBack = `${promptBack}, ${BASE_LAYER_LOCK_PROMPT}`
+    // ✅ UNDERWEAR/BIKINI lock (형태/색 고정)
+    if (ENABLE_UNDERWEAR_LOCK) {
+      const outfitLock = baseOutfitLockPrompt()
+      promptFront = `${promptFront}, ${outfitLock}`
+      promptBack = `${promptBack}, ${outfitLock}`
     }
 
     // ✅ back 가슴 과장 완화(Back만)
     promptBack = `${promptBack}, ${BACK_BUST_SAFETY_HINTS}`
 
     // ✅ pair는 호출 수가 많아 rate limit 민감
-    // - 기본은 retry 0 (필터로 bad 판정되어도 재생성 안함)
-    // - 개발 중이라면 여기서 1로 올릴 수도 있지만 429 더 잘 터짐
     const PAIR_RETRY = Number(process.env.PAIR_RETRY ?? 0)
 
     let front = null
@@ -698,10 +744,8 @@ app.post("/api/s1/pair", async (req, res) => {
       front = await generateWithRetry(promptFront, PAIR_RETRY)
       back = await generateWithRetry(promptBack, PAIR_RETRY)
     } catch (e) {
-      // 429는 즉시 위로
       if (isRateLimitError(e)) throw e
 
-      // E005면 "안전 프롬프트"로 1회만 폴백
       if (isSensitiveFlagError(e)) {
         const safeFront = makeSaferPrompt(promptFront)
         const safeBack = makeSaferPrompt(promptBack)
@@ -709,7 +753,6 @@ app.post("/api/s1/pair", async (req, res) => {
         front = await generateWithRetry(safeFront, 0)
         back = await generateWithRetry(safeBack, 0)
 
-        // usedPrompt도 safe로 내려서 디버깅 가능하게
         promptFront = safeFront
         promptBack = safeBack
       } else {
@@ -748,7 +791,6 @@ app.post("/api/s1/pair", async (req, res) => {
   } catch (e) {
     await releaseIfReserved(req, reservationId)
 
-    // ✅ 429는 429로 반환 (프론트가 retryAfter 후 재시도 가능)
     if (isRateLimitError(e)) {
       const retryAfterSeconds = parseRetryAfterSeconds(e)
       console.error(`[${requestId}] /api/s1/pair 429`, {
@@ -763,7 +805,6 @@ app.post("/api/s1/pair", async (req, res) => {
       })
     }
 
-    // ✅ E005가 폴백에서도 터지면 422로 반환
     if (isSensitiveFlagError(e)) {
       console.error(`[${requestId}] /api/s1/pair E005`, { message: e?.message ?? String(e) })
       return res.status(422).json({
