@@ -1,3 +1,4 @@
+// server.js (FINAL - body compatible + credits + hard CORS + S1 pair)
 import express from "express"
 import cors from "cors"
 import Replicate from "replicate"
@@ -6,7 +7,9 @@ const app = express()
 
 /**
  * ============================================================
- * ✅ 0) CORS (가장 확실한 방식: preflight 포함 강제 통과)
+ * ✅ 0) CORS (테스트 단계 최강: preflight 포함 강제 통과)
+ * - Framer가 X-Client-Id 같은 커스텀 헤더를 보내서 preflight에서 자주 막힘
+ * - "브라우저가 요청한 헤더를 그대로 허용"하면 거의 100% 해결
  * ============================================================
  */
 app.use((req, res, next) => {
@@ -27,7 +30,7 @@ app.use((req, res, next) => {
 
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
 
-  // ✅ 핵심: 브라우저가 요청한 헤더를 그대로 허용 (x-client-id 포함)
+  // ✅ 핵심: 브라우저가 preflight에서 요청한 헤더를 그대로 허용
   const reqHeaders = req.headers["access-control-request-headers"]
   res.setHeader(
     "Access-Control-Allow-Headers",
@@ -62,12 +65,13 @@ app.use(express.json({ limit: "25mb" }))
 
 app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) =>
-  res.json({ ok: true, version: "2026-03-03_working_base_plus_safe_retry_v1" })
+  res.json({ ok: true, version: "2026-03-03_final_pair_credits_bodyfix_v1" })
 )
 
 /**
  * ============================================================
- * ✅ 1) TEST CREDITS (Reserve / Confirm / Release)
+ * ✅ 1) TEST CREDITS (Reserve / Confirm / Release) - In-Memory
+ * - X-Client-Id로 사용자(브라우저/세션 단위) 식별
  * ============================================================
  */
 
@@ -89,9 +93,10 @@ function requireClientId(req, res) {
   return cid
 }
 
-// 인메모리 지갑
-const wallets = new Map() // clientId -> { balance, reserved }
-const reservations = new Map() // reservationId -> { clientId, amount, status, createdAt, meta }
+// clientId -> { balance, reserved }
+const wallets = new Map()
+// reservationId -> { clientId, amount, status, createdAt, meta, reason }
+const reservations = new Map()
 
 function ensureWallet(clientId) {
   if (!wallets.has(clientId)) {
@@ -109,13 +114,9 @@ app.get("/api/credits/balance", (req, res) => {
   const cid = requireClientId(req, res)
   if (!cid) return
   const w = ensureWallet(cid)
-  res.json({ clientId: cid, balance: w.balance, reserved: w.reserved })
+  res.json({ clientId: cid, balance: w.balance, reserved: w.reserved, available: w.balance - w.reserved })
 })
 
-/**
- * POST /api/credits/reserve
- * body: { amount: number, reason?: string, meta?: any }
- */
 app.post("/api/credits/reserve", (req, res) => {
   const cid = requireClientId(req, res)
   if (!cid) return
@@ -159,10 +160,6 @@ app.post("/api/credits/reserve", (req, res) => {
   })
 })
 
-/**
- * POST /api/credits/confirm
- * body: { reservationId: string }
- */
 app.post("/api/credits/confirm", (req, res) => {
   const cid = requireClientId(req, res)
   if (!cid) return
@@ -191,10 +188,6 @@ app.post("/api/credits/confirm", (req, res) => {
   })
 })
 
-/**
- * POST /api/credits/release
- * body: { reservationId: string }
- */
 app.post("/api/credits/release", (req, res) => {
   const cid = requireClientId(req, res)
   if (!cid) return
@@ -225,8 +218,6 @@ app.post("/api/credits/release", (req, res) => {
 /**
  * ============================================================
  * ✅ 2) S1 (Replicate / Imagen)
- * - ✅ "원본 동작" 유지
- * - ✅ 최소 변경: prompt key 유연화 + 안전 재시도 + 결과가 "이미지인지"만 확인
  * ============================================================
  */
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN })
@@ -239,23 +230,13 @@ function mustHaveToken(res) {
   return true
 }
 
-// ✅ 프론트가 prompt 키를 다르게 보내도 서버가 받아줌 (400 방지)
-function pickPromptFromBody(body) {
-  const p =
-    body?.prompt ||
-    body?.finalPrompt ||
-    body?.positivePrompt ||
-    body?.positive ||
-    ""
-  return String(p || "").trim()
-}
-
 function withAdultGuard(prompt) {
   return `adult, age 25, ${prompt}`
 }
 
 /**
- * ✅ back 머리 쏠림 완화용 (옵션)
+ * ✅ back 머리 쏠림 확률 낮추는 힌트
+ * - 완벽 보장은 안 됨(생성형 특성)
  */
 function hairConsistencyHints() {
   return [
@@ -267,6 +248,7 @@ function hairConsistencyHints() {
   ].join(", ")
 }
 
+// ✅ FRONT/BACK 뷰 고정
 function withViewLock(prompt, view) {
   if (view === "back") {
     return [
@@ -300,6 +282,7 @@ function withViewLock(prompt, view) {
   ].join(", ")
 }
 
+// ✅ Replicate output 형태 안전 추출
 function pickImageUrl(output) {
   if (Array.isArray(output)) {
     const first = output[0]
@@ -327,31 +310,14 @@ async function runImagen(prompt) {
   return pickImageUrl(output)
 }
 
-/**
- * ✅ "거르기"를 무겁게 하면 바로 깨지니까,
- *    지금은 진짜 최소로: URL이 "이미지"로 응답되는지만 확인.
- * - HEAD가 막히는 CDN도 있어서: Range GET으로 1~2KB만 읽음
- */
-async function looksLikeImageUrl(url) {
-  try {
-    const r = await fetch(url, {
-      method: "GET",
-      headers: { Range: "bytes=0-2047" },
-    })
-    if (!r.ok) return false
-    const ct = (r.headers.get("content-type") || "").toLowerCase()
-    if (ct.includes("image/")) return true
-    // content-type이 안 주어지는 경우도 있어서 바이트로 대충 체크(너무 엄격하게 하면 오탐)
-    const buf = await r.arrayBuffer()
-    return buf.byteLength > 16
-  } catch {
-    return false
-  }
+// ✅ (지금은 뼈대만) 결과가 “명백히 이상한지” 검사 훅
+function isObviouslyBadResult(/* imageUrl */) {
+  // TODO: BLIP 캡션 / 텍스트 감지 / 룰 기반 검사 붙일 자리
+  return false
 }
 
 async function generateWithRetry(prompt, maxRetry = 1) {
   let lastUrl = null
-  let lastOkImage = false
   let lastErr = null
 
   for (let i = 0; i <= maxRetry; i++) {
@@ -359,41 +325,68 @@ async function generateWithRetry(prompt, maxRetry = 1) {
       const url = await runImagen(prompt)
       if (!url) throw new Error("No imageUrl in output")
       lastUrl = url
-
-      // ✅ 최소 검증: 이미지로 열리는지
-      const ok = await looksLikeImageUrl(url)
-      lastOkImage = ok
-      if (ok) return { url, tries: i + 1 }
-      // 이미지가 아니면 재시도
+      if (!isObviouslyBadResult(url)) return { url, tries: i + 1 }
     } catch (e) {
       lastErr = e
     }
   }
 
-  // 재시도 끝나도 마지막 결과는 반환 (warned)
-  if (lastUrl) return { url: lastUrl, tries: maxRetry + 1, warned: true, okImage: lastOkImage }
+  if (lastUrl) return { url: lastUrl, tries: maxRetry + 1, warned: true }
   throw lastErr || new Error("Generation failed")
+}
+
+/**
+ * ✅ credits helper: reservationId 있으면 성공 시 confirm / 실패 시 release
+ */
+async function confirmIfReserved(req, reservationId) {
+  const cid = getClientId(req)
+  if (!cid || !reservationId) return
+  const r = reservations.get(reservationId)
+  if (!r) return
+  if (r.clientId !== cid) return
+  if (r.status !== "reserved") return
+
+  const w = ensureWallet(cid)
+  w.reserved = Math.max(0, w.reserved - r.amount)
+  w.balance = Math.max(0, w.balance - r.amount)
+  r.status = "confirmed"
+  reservations.set(reservationId, r)
+}
+
+async function releaseIfReserved(req, reservationId) {
+  const cid = getClientId(req)
+  if (!cid || !reservationId) return
+  const r = reservations.get(reservationId)
+  if (!r) return
+  if (r.clientId !== cid) return
+  if (r.status !== "reserved") return
+
+  const w = ensureWallet(cid)
+  w.reserved = Math.max(0, w.reserved - r.amount)
+  r.status = "released"
+  reservations.set(reservationId, r)
 }
 
 // ✅ /api/s1 (FRONT 1장)
 app.post("/api/s1", async (req, res) => {
-  const prompt = pickPromptFromBody(req.body)
+  const { prompt, reservationId } = req.body || {}
   if (!mustHaveToken(res)) return
   if (!prompt) return res.status(400).json({ error: "Prompt missing" })
 
   try {
     const base = withAdultGuard(prompt)
     const lockedPrompt = withViewLock(base, "front")
-
     const out = await generateWithRetry(lockedPrompt, 1)
+
+    await confirmIfReserved(req, reservationId)
+
     return res.json({
       imageUrl: out.url,
       usedPrompt: lockedPrompt,
       tries: out.tries,
-      warned: !!out.warned,
-      okImage: out.okImage !== false, // undefined면 true처럼 취급
     })
   } catch (e) {
+    await releaseIfReserved(req, reservationId)
     return res.status(500).json({
       error: "Generation failed",
       detail: String(e?.message ?? e),
@@ -401,28 +394,61 @@ app.post("/api/s1", async (req, res) => {
   }
 })
 
-// ✅ /api/s1/pair (FRONT+BACK 2장)
+/**
+ * ✅ /api/s1/pair (FRONT+BACK 2장)
+ *
+ * ✅ 바디 호환:
+ * - (A) { prompt } 만 와도 됨  → 서버가 front/back 잠금 프롬프트 생성
+ * - (B) { promptFront, promptBack } 오면 그걸 우선 사용 (프론트에서 이미 만들어 보내는 구조)
+ */
 app.post("/api/s1/pair", async (req, res) => {
-  const prompt = pickPromptFromBody(req.body)
+  const b = req.body || {}
+  const reservationId = b.reservationId
+
   if (!mustHaveToken(res)) return
-  if (!prompt) return res.status(400).json({ error: "Prompt missing" })
+
+  // ✅ 1) 들어온 값 우선순위
+  const hasPairPrompts = typeof b.promptFront === "string" && typeof b.promptBack === "string"
+  const hasSinglePrompt = typeof b.prompt === "string"
+
+  if (!hasPairPrompts && !hasSinglePrompt) {
+    return res.status(400).json({
+      error: "Prompt missing",
+      hint: "Send {prompt} OR {promptFront, promptBack}",
+      gotKeys: Object.keys(b || {}),
+    })
+  }
 
   try {
-    const base = withAdultGuard(prompt)
+    // ✅ 2) prompt 구성
+    let promptFront = ""
+    let promptBack = ""
 
-    const promptFront = withViewLock(base, "front")
-    const promptBack = withViewLock(base, "back")
+    if (hasPairPrompts) {
+      // 프론트가 만든 프롬프트를 그대로 사용
+      promptFront = String(b.promptFront)
+      promptBack = String(b.promptBack)
+    } else {
+      // prompt 하나로 서버가 front/back 잠금 프롬프트 생성
+      const base = withAdultGuard(String(b.prompt))
+      promptFront = withViewLock(base, "front")
+      promptBack = withViewLock(base, "back")
+    }
 
+    // ✅ 3) 생성(순차)
     const front = await generateWithRetry(promptFront, 1)
     const back = await generateWithRetry(promptBack, 1)
 
     if (!front?.url || !back?.url) {
+      await releaseIfReserved(req, reservationId)
       return res.status(502).json({
         error: "No imageUrl in output",
         frontUrl: front?.url || null,
         backUrl: back?.url || null,
       })
     }
+
+    await confirmIfReserved(req, reservationId)
 
     return res.json({
       frontUrl: front.url,
@@ -432,10 +458,9 @@ app.post("/api/s1/pair", async (req, res) => {
       aspect_ratio: "3:4",
       triesFront: front.tries,
       triesBack: back.tries,
-      warnedFront: !!front.warned,
-      warnedBack: !!back.warned,
     })
   } catch (e) {
+    await releaseIfReserved(req, reservationId)
     return res.status(500).json({
       error: "Generation failed",
       detail: String(e?.message ?? e),
@@ -466,7 +491,7 @@ function fashnHeaders() {
   if (!key) throw new Error("FASHN_API_KEY missing on server")
   return {
     "Content-Type": "application/json",
-    "Authorization": `Bearer ${key}`,
+    Authorization: `Bearer ${key}`,
   }
 }
 
