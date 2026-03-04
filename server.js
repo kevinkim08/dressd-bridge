@@ -1,6 +1,6 @@
-// server.js (FINAL++++ patched - PAIR BACK CANDIDATES + CLIP BEST PICK + keeps your BODY/UNDERWEAR/VIEW LOCK)
+// server.js (FINAL+++++ patched - BACK candidates filtered + CLIP best pick + PARALLEL generation)
 // ✅ Node 18+
-// ✅ Imagen-4 does NOT reliably support seed/reference on Replicate → so we do: FRONT 1 + BACK N candidates → pick best BACK by CLIP similarity
+// ✅ Imagen-4: seed/reference not reliable on Replicate → FRONT 1 + BACK N candidates → filter(back-only) → CLIP pick best
 import express from "express"
 import cors from "cors"
 import Replicate from "replicate"
@@ -91,16 +91,18 @@ app.get("/health", (req, res) =>
   res.json({
     ok: true,
     version:
-      "2026-03-05_finalpppp_pairBackCandidates_clipPick_BODYLOCK_UNDERWEARLOCK_viewlock_filter_429_e005",
+      "2026-03-05_finalppppp_pairBackCandidates_captionFilter_clipPick_parallel_BODYLOCK_UNDERWEARLOCK_viewlock_filter_429_e005",
     node: process.versions.node,
     config: {
       ENABLE_BODY_LOCK: process.env.ENABLE_BODY_LOCK !== "0",
       ENABLE_UNDERWEAR_LOCK: process.env.ENABLE_UNDERWEAR_LOCK !== "0",
       ENABLE_RESULT_FILTER: process.env.ENABLE_RESULT_FILTER !== "0",
-      BACK_CANDIDATES: Number(process.env.BACK_CANDIDATES || 6),
+      BACK_CANDIDATES: Number(process.env.BACK_CANDIDATES || 8),
+      BACK_CONCURRENCY: Number(process.env.BACK_CONCURRENCY || 3),
       BACK_MIN_SCORE: Number(process.env.BACK_MIN_SCORE || 0),
-      BACK_EXTRA_ROUNDS: Number(process.env.BACK_EXTRA_ROUNDS || 0),
+      BACK_EXTRA_ROUNDS: Number(process.env.BACK_EXTRA_ROUNDS || 1),
       CLIP_MODEL_VERSION: process.env.CLIP_MODEL_VERSION || "openai/clip",
+      PAIR_DEBUG: process.env.PAIR_DEBUG || "0",
     },
   })
 )
@@ -281,7 +283,7 @@ async function releaseIfReserved(req, reservationId) {
 
 /**
  * ============================================================
- * ✅ 5) Replicate / Imagen + Filter (best-effort) + 429/E005 helpers
+ * ✅ 5) Replicate / Imagen + Filter + 429/E005 helpers
  * ============================================================
  */
 const replicate = new Replicate({ auth: process.env.REPLICATE_API_TOKEN })
@@ -311,23 +313,13 @@ function withAdultGuard(prompt) {
 }
 
 /**
- * ✅ back 머리 쏠림 확률 낮추는 힌트
- * - NOTE: BACK에서 너무 강하게 걸면 pose가 틀어질 수 있어서 BACK은 약화
+ * ✅ hair hints
  */
 function hairHintsFront() {
-  return [
-    "hair centered",
-    "symmetrical hairstyle",
-    "no wind",
-    "no dramatic motion",
-  ].join(", ")
+  return ["hair centered", "symmetrical hairstyle", "no wind", "no dramatic motion"].join(", ")
 }
 function hairHintsBack() {
-  return [
-    "no wind",
-    "no dramatic motion",
-    "natural hair fall",
-  ].join(", ")
+  return ["no wind", "no dramatic motion", "natural hair fall"].join(", ")
 }
 
 // ✅ FRONT/BACK 뷰 고정
@@ -366,7 +358,7 @@ function withViewLock(prompt, view) {
 
 /**
  * ============================================================
- * ✅ 5-A) BODY LOCK (짧고 강하게)
+ * ✅ 5-A) BODY LOCK
  * ============================================================
  */
 const ENABLE_BODY_LOCK = process.env.ENABLE_BODY_LOCK !== "0"
@@ -383,7 +375,6 @@ const BODY_LOCK_PROMPT = [
 /**
  * ============================================================
  * ✅ 5-B) UNDERWEAR / BIKINI SHAPE LOCK (압축 버전)
- * - 너무 길면 identity가 흔들릴 수 있어서 '색/심플/동일세트'만 남김
  * ============================================================
  */
 const ENABLE_UNDERWEAR_LOCK = process.env.ENABLE_UNDERWEAR_LOCK !== "0"
@@ -410,7 +401,7 @@ function baseOutfitLockPrompt() {
   return UNDERWEAR_STYLE === "bikini" ? BIKINI_LOCK_PROMPT : UNDERWEAR_LOCK_PROMPT
 }
 
-// ✅ back에서 “가슴 과장/측면 돌출” 완화(Back만)
+// ✅ back에서 과장 완화
 const BACK_BUST_SAFETY_HINTS = [
   "natural back silhouette",
   "no exaggerated chest protrusion",
@@ -418,15 +409,14 @@ const BACK_BUST_SAFETY_HINTS = [
   "realistic anatomy",
 ].join(", ")
 
-// ✅ Filter toggle
+// ✅ Result Filter toggle (caption-based)
 const ENABLE_RESULT_FILTER = process.env.ENABLE_RESULT_FILTER !== "0"
 
-// ✅ 캡션 모델(바뀔 수 있으니 env로 교체 가능)
 const CAPTION_MODEL_VERSION =
   process.env.CAPTION_MODEL_VERSION ||
   "salesforce/blip:2e1dddc8621f72155f24cf2e0adbde548458d3cab9f00c0139c1a7fe2a1b3b3f"
 
-// ✅ Replicate output 형태 안전 추출
+// ✅ Replicate output -> url
 function pickImageUrl(output) {
   if (Array.isArray(output)) {
     const first = output[0]
@@ -456,7 +446,7 @@ async function runImagen(prompt) {
 
 /**
  * ============================================================
- * ✅ 5-1) 429 Too Many Requests helpers
+ * ✅ 5-1) 429 Too Many Requests
  * ============================================================
  */
 function isRateLimitError(err) {
@@ -485,7 +475,7 @@ function parseRetryAfterSeconds(err) {
 
 /**
  * ============================================================
- * ✅ 5-2) E005 sensitive-flag helpers
+ * ✅ 5-2) E005 sensitive-flag
  * ============================================================
  */
 function isSensitiveFlagError(err) {
@@ -493,7 +483,6 @@ function isSensitiveFlagError(err) {
   return msg.includes("(E005)") || msg.toLowerCase().includes("flagged as sensitive")
 }
 
-// E005 폴백용: 너무 직접적인 단어를 완화 + 카탈로그 톤 강화
 function makeSaferPrompt(p) {
   const s = String(p || "")
   return (
@@ -509,7 +498,7 @@ function makeSaferPrompt(p) {
 
 /**
  * ============================================================
- * ✅ 5-3) Result Filter (caption based) - best-effort
+ * ✅ 5-3) Caption tools (best-effort)
  * ============================================================
  */
 function normalizeCaption(out) {
@@ -531,6 +520,9 @@ async function captionImageBestEffort(imageUrl) {
   }
 }
 
+/**
+ * ✅ 기존 "나쁜 이미지" 감지(텍스트/콜라주/멀티피플 등)
+ */
 function looksBadByCaption(caption) {
   const c = String(caption || "").toLowerCase()
   if (!c) return false
@@ -557,7 +549,6 @@ function looksBadByCaption(caption) {
     "group",
     "crowd",
   ]
-
   return badTokens.some((t) => c.includes(t))
 }
 
@@ -607,19 +598,47 @@ async function generateWithRetry(prompt, maxRetry = 1) {
 
 /**
  * ============================================================
- * ✅ 5-4) CLIP scoring for FRONT vs BACK candidates
- * - Imagen-4 on Replicate: seed/reference not reliable → we pick best BACK by visual similarity.
- *
- * ENV:
- *  - BACK_CANDIDATES=6 (추천 4~8)
- *  - BACK_MIN_SCORE=0 (원하면 0.90~0.94 정도로 시작)
- *  - BACK_EXTRA_ROUNDS=0 (minScore 미달 시 추가 후보 생성 라운드 수)
- *  - CLIP_MODEL_VERSION=openai/clip (필요하면 버전 pin 가능)
+ * ✅ 5-4) BACK-only caption filter (핵심)
+ * - back 후보에서 front/side/3-4 angle 등을 1차 제거
  * ============================================================
  */
-const BACK_CANDIDATES = Number(process.env.BACK_CANDIDATES || 6)
+function isNotBackByCaption(caption) {
+  const c = String(caption || "").toLowerCase()
+  if (!c) return false // 캡션 실패면 통과(너무 공격적으로 막지 않음)
+
+  const bad = [
+    "front view",
+    "front-facing",
+    "facing camera",
+    "side view",
+    "profile",
+    "three-quarter",
+    "three quarter",
+    "3/4",
+    "quarter view",
+    "over the shoulder",
+    "looking back",
+  ]
+  // back을 직접 언급하는 키워드가 있으면 더 안전
+  const good = ["back view", "rear view", "from behind", "back of", "facing away", "rear"]
+
+  const hasGood = good.some((t) => c.includes(t))
+  const hasBad = bad.some((t) => c.includes(t))
+
+  // hasBad면 탈락, 단 hasGood이 강하게 있으면 통과
+  if (hasBad && !hasGood) return true
+  return false
+}
+
+/**
+ * ============================================================
+ * ✅ 5-5) CLIP scoring for FRONT vs BACK candidates
+ * ============================================================
+ */
+const BACK_CANDIDATES = Number(process.env.BACK_CANDIDATES || 8)
+const BACK_CONCURRENCY = Number(process.env.BACK_CONCURRENCY || 3)
 const BACK_MIN_SCORE = Number(process.env.BACK_MIN_SCORE || 0)
-const BACK_EXTRA_ROUNDS = Number(process.env.BACK_EXTRA_ROUNDS || 0)
+const BACK_EXTRA_ROUNDS = Number(process.env.BACK_EXTRA_ROUNDS || 1)
 const CLIP_MODEL_VERSION = process.env.CLIP_MODEL_VERSION || "openai/clip"
 
 function cosineSim(a, b) {
@@ -639,7 +658,6 @@ function cosineSim(a, b) {
 }
 
 function extractEmbedding(out) {
-  // 가능한 형태들을 최대한 방어적으로 처리
   if (!out) return null
   if (Array.isArray(out) && out.length > 0 && typeof out[0] === "number") return out
   if (out?.embedding && Array.isArray(out.embedding)) return out.embedding
@@ -655,19 +673,73 @@ async function clipEmbedImage(imageUrl) {
   return emb
 }
 
-async function generateBackCandidates(promptBack, n) {
-  const arr = []
-  for (let i = 0; i < n; i++) {
-    // ✅ pair에서 rate limit 민감 → 여기서는 retry 0 추천
-    const r = await generateWithRetry(promptBack, 0)
-    if (r?.url) arr.push(r)
+/**
+ * ✅ 간단한 concurrency pool (rate limit 방지 + 속도 개선)
+ */
+async function runPool(tasks, concurrency) {
+  const results = new Array(tasks.length)
+  let idx = 0
+
+  async function worker() {
+    while (idx < tasks.length) {
+      const cur = idx++
+      try {
+        results[cur] = await tasks[cur]()
+      } catch (e) {
+        results[cur] = { __error: true, error: e }
+      }
+    }
   }
-  if (!arr.length) throw new Error("No back candidates generated")
-  return arr
+
+  const c = Math.max(1, Math.min(8, Number(concurrency || 3)))
+  const workers = Array.from({ length: c }, () => worker())
+  await Promise.all(workers)
+  return results
+}
+
+/**
+ * ✅ BACK 후보 N장 생성 + caption으로 back-only 필터
+ * - 필터로 다 날아갈 수 있으니 rounds로 추가 생성 가능
+ */
+async function generateBackCandidates(promptBack, n) {
+  const want = Math.max(1, Math.min(12, Number(n || 8)))
+  const rounds = Math.max(0, Math.min(3, Number(BACK_EXTRA_ROUNDS || 0)))
+
+  let collected = []
+
+  for (let round = 0; round <= rounds; round++) {
+    const tasks = Array.from({ length: want }, () => async () => {
+      // ✅ pair에서 rate limit 민감 → 여기서는 retry 0
+      const r = await generateWithRetry(promptBack, 0)
+      if (!r?.url) return null
+
+      // ✅ 캡션(가능하면)으로 back-only 1차 필터
+      const cap = await captionImageBestEffort(r.url)
+      const caption = cap.caption || ""
+
+      if (isNotBackByCaption(caption)) return null
+
+      return { ...r, caption }
+    })
+
+    const out = await runPool(tasks, BACK_CONCURRENCY)
+
+    const ok = out
+      .map((x) => (x && x.__error ? null : x))
+      .filter(Boolean)
+
+    collected = collected.concat(ok)
+
+    // ✅ 충분히 모였으면 종료 (최소 2장만 넘어도 CLIP pick 의미가 커짐)
+    if (collected.length >= Math.max(2, Math.floor(want / 2))) break
+  }
+
+  if (!collected.length) throw new Error("No usable back candidates")
+
+  return collected
 }
 
 async function pickBestBackByClip(frontUrl, backCandidates) {
-  // ✅ CLIP 자체가 429 걸릴 수 있음 → 실패하면 first로 fallback
   try {
     const fEmb = await clipEmbedImage(frontUrl)
 
@@ -701,15 +773,12 @@ app.post("/api/s1", async (req, res) => {
   try {
     let base = withAdultGuard(prompt)
 
-    // ✅ BODY LOCK
     if (ENABLE_BODY_LOCK) base = `${base}, ${BODY_LOCK_PROMPT}`
 
     let lockedPrompt = withViewLock(base, "front")
 
-    // ✅ UNDERWEAR/BIKINI lock
     if (ENABLE_UNDERWEAR_LOCK) lockedPrompt = `${lockedPrompt}, ${baseOutfitLockPrompt()}`
 
-    // 단일 1장: 필터/재생성 2회까지 허용
     const out = await generateWithRetry(lockedPrompt, 2)
 
     await confirmIfReserved(req, reservationId)
@@ -758,7 +827,9 @@ app.post("/api/s1", async (req, res) => {
 
 /**
  * ✅ /api/s1/pair (FRONT+BACK 2장)
- * - NEW: BACK is selected from N candidates by CLIP similarity to FRONT.
+ * - FRONT 1장
+ * - BACK 후보 N장(병렬) + caption back-only 1차 필터
+ * - CLIP으로 best pick
  */
 app.post("/api/s1/pair", async (req, res) => {
   const requestId = rid()
@@ -785,7 +856,6 @@ app.post("/api/s1/pair", async (req, res) => {
     let promptBack = ""
 
     if (hasPairPrompts) {
-      // 프론트에서 이미 만들어 보내는 경우에도 BODY lock을 서버가 “덧씌움”
       promptFront = String(b.promptFront)
       promptBack = String(b.promptBack)
 
@@ -808,10 +878,18 @@ app.post("/api/s1/pair", async (req, res) => {
       promptBack = `${promptBack}, ${outfitLock}`
     }
 
-    // ✅ back 가슴 과장 완화(Back만)
-    promptBack = `${promptBack}, ${BACK_BUST_SAFETY_HINTS}`
+    // ✅ BACK prompt를 "앞쪽"에 강하게(Imagen은 앞쪽 영향이 큼)
+    promptBack = [
+      "STRICT FULL BACK VIEW ONLY",
+      "REAR VIEW ONLY",
+      "SUBJECT FACING AWAY FROM CAMERA",
+      "CAMERA DIRECTLY BEHIND SUBJECT",
+      "NO THREE-QUARTER ANGLE",
+      "NO SIDE VIEW",
+      promptBack,
+      BACK_BUST_SAFETY_HINTS,
+    ].join(", ")
 
-    // ✅ pair는 rate limit 민감
     const PAIR_RETRY = Number(process.env.PAIR_RETRY ?? 0)
 
     let front = null
@@ -822,29 +900,26 @@ app.post("/api/s1/pair", async (req, res) => {
       // 1) FRONT 1장
       front = await generateWithRetry(promptFront, PAIR_RETRY)
 
-      // 2) BACK 후보 N장
-      const n = Math.max(1, Math.min(12, BACK_CANDIDATES || 6))
+      // 2) BACK 후보 N장 (병렬 + 캡션 필터)
+      const n = Math.max(1, Math.min(12, BACK_CANDIDATES || 8))
       backCandidates = await generateBackCandidates(promptBack, n)
 
-      // 3) CLIP으로 best 선택
+      // 3) CLIP pick best
       bestBack = await pickBestBackByClip(front.url, backCandidates)
 
-      // 4) min score 미달이면 추가 라운드(선택)
-      let rounds = Math.max(0, Math.min(3, BACK_EXTRA_ROUNDS || 0))
-      while (rounds > 0 && bestBack && bestBack.score >= 0 && bestBack.score < BACK_MIN_SCORE) {
-        rounds -= 1
-        const more = await generateBackCandidates(promptBack, n)
-        backCandidates = backCandidates.concat(more)
-        bestBack = await pickBestBackByClip(front.url, backCandidates)
+      // 4) min score 조건(선택)
+      if (BACK_MIN_SCORE > 0 && bestBack?.score >= 0 && bestBack.score < BACK_MIN_SCORE) {
+        // score가 너무 낮으면 backCandidates 중 2~3개를 debug로 보내서 확인할 수 있게
+        // (추가 라운드는 generateBackCandidates에서 이미 BACK_EXTRA_ROUNDS로 처리)
       }
     } catch (e) {
-      // E005면 saferPrompt로 폴백
       if (isSensitiveFlagError(e)) {
         const safeFront = makeSaferPrompt(promptFront)
         const safeBack = makeSaferPrompt(promptBack)
 
         front = await generateWithRetry(safeFront, 0)
-        const n = Math.max(1, Math.min(12, BACK_CANDIDATES || 6))
+
+        const n = Math.max(1, Math.min(12, BACK_CANDIDATES || 8))
         backCandidates = await generateBackCandidates(safeBack, n)
         bestBack = await pickBestBackByClip(front.url, backCandidates)
 
@@ -877,22 +952,25 @@ app.post("/api/s1/pair", async (req, res) => {
       usedPromptBack: promptBack,
       aspect_ratio: "3:4",
       triesFront: front.tries,
-      // 후보 생성은 retry 0이므로 triesBack은 의미 없어서 bestBack.tries만 노출
       triesBack: bestBack.tries ?? 1,
       clip: {
         model: CLIP_MODEL_VERSION,
         bestScore: bestBack.score,
         minScore: BACK_MIN_SCORE,
-        candidates: backCandidates.length,
+        candidatesUsed: backCandidates.length,
+        candidatesRequested: Math.max(1, Math.min(12, BACK_CANDIDATES || 8)),
+        concurrency: BACK_CONCURRENCY,
         extraRounds: BACK_EXTRA_ROUNDS,
       },
       debug: includeDebug
         ? {
-            backCandidates: backCandidates.map((c) => ({
+            backCandidates: backCandidates.slice(0, 12).map((c) => ({
               url: c.url,
               tries: c.tries,
               warned: c.warned,
               badWhy: c.badWhy,
+              caption: c.caption || "",
+              score: c.score ?? null,
             })),
           }
         : undefined,
@@ -934,7 +1012,9 @@ app.post("/api/s1/pair", async (req, res) => {
       message: e?.message ?? String(e),
       stack: e?.stack,
       gotKeys: safeKeys(req.body || {}),
-      hasPairPrompts: typeof (req.body || {})?.promptFront === "string" && typeof (req.body || {})?.promptBack === "string",
+      hasPairPrompts:
+        typeof (req.body || {})?.promptFront === "string" &&
+        typeof (req.body || {})?.promptBack === "string",
       hasSinglePrompt: typeof (req.body || {})?.prompt === "string",
     })
 
