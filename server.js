@@ -1,5 +1,6 @@
-// server.js (FINAL+++ patched - BODY LOCK + UNDERWEAR/BIKINI SHAPE LOCK on top of your stable version)
-// ✅ Requires Node 18+ (Render에서 Node 버전 고정 추천)
+// server.js (FINAL++++ patched - PAIR BACK CANDIDATES + CLIP BEST PICK + keeps your BODY/UNDERWEAR/VIEW LOCK)
+// ✅ Node 18+
+// ✅ Imagen-4 does NOT reliably support seed/reference on Replicate → so we do: FRONT 1 + BACK N candidates → pick best BACK by CLIP similarity
 import express from "express"
 import cors from "cors"
 import Replicate from "replicate"
@@ -89,8 +90,18 @@ app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) =>
   res.json({
     ok: true,
-    version: "2026-03-04_finalppp_bootsafe_filter_429_e005_BODYLOCK_UNDERWEARLOCK_v2",
+    version:
+      "2026-03-05_finalpppp_pairBackCandidates_clipPick_BODYLOCK_UNDERWEARLOCK_viewlock_filter_429_e005",
     node: process.versions.node,
+    config: {
+      ENABLE_BODY_LOCK: process.env.ENABLE_BODY_LOCK !== "0",
+      ENABLE_UNDERWEAR_LOCK: process.env.ENABLE_UNDERWEAR_LOCK !== "0",
+      ENABLE_RESULT_FILTER: process.env.ENABLE_RESULT_FILTER !== "0",
+      BACK_CANDIDATES: Number(process.env.BACK_CANDIDATES || 6),
+      BACK_MIN_SCORE: Number(process.env.BACK_MIN_SCORE || 0),
+      BACK_EXTRA_ROUNDS: Number(process.env.BACK_EXTRA_ROUNDS || 0),
+      CLIP_MODEL_VERSION: process.env.CLIP_MODEL_VERSION || "openai/clip",
+    },
   })
 )
 
@@ -301,14 +312,21 @@ function withAdultGuard(prompt) {
 
 /**
  * ✅ back 머리 쏠림 확률 낮추는 힌트
+ * - NOTE: BACK에서 너무 강하게 걸면 pose가 틀어질 수 있어서 BACK은 약화
  */
-function hairConsistencyHints() {
+function hairHintsFront() {
   return [
     "hair centered",
     "symmetrical hairstyle",
-    "hair not swept to one side",
     "no wind",
     "no dramatic motion",
+  ].join(", ")
+}
+function hairHintsBack() {
+  return [
+    "no wind",
+    "no dramatic motion",
+    "natural hair fall",
   ].join(", ")
 }
 
@@ -319,15 +337,16 @@ function withViewLock(prompt, view) {
       prompt,
       "back view only",
       "rear view only",
+      "back facing camera",
+      "looking away from camera",
       "standing straight",
       "symmetrical posture",
       "full body",
       "head to toe",
       "feet visible",
-      "not front view",
       "single person",
       "centered",
-      hairConsistencyHints(),
+      hairHintsBack(),
     ].join(", ")
   }
   return [
@@ -339,17 +358,15 @@ function withViewLock(prompt, view) {
     "full body",
     "head to toe",
     "feet visible",
-    "not back view",
     "single person",
     "centered",
-    hairConsistencyHints(),
+    hairHintsFront(),
   ].join(", ")
 }
 
 /**
  * ============================================================
- * ✅ 5-A) BODY LOCK (너가 말한: 허리/어깨/머리 길이/모양)
- * - 너무 길게 쓰면 오히려 이상해질 수 있어서 “짧고 강하게”만
+ * ✅ 5-A) BODY LOCK (짧고 강하게)
  * ============================================================
  */
 const ENABLE_BODY_LOCK = process.env.ENABLE_BODY_LOCK !== "0"
@@ -365,45 +382,27 @@ const BODY_LOCK_PROMPT = [
 
 /**
  * ============================================================
- * ✅ 5-B) UNDERWEAR / BIKINI SHAPE LOCK
- * - 기존 BASE_LAYER는 쇼츠/탑이 흔들려서 허리 실루엣이 달라보일 수 있음
- * - 그래서 “색 + 형태(컷/디자인)”까지 잠금
- *
- * ENV:
- *  - ENABLE_UNDERWEAR_LOCK=1  (기본 ON, 기존 호환)
- *  - UNDERWEAR_STYLE=underwear | bikini   (기본 underwear)
- *  - UNDERWEAR_COLOR=pure white | ivory | beige | black ...
+ * ✅ 5-B) UNDERWEAR / BIKINI SHAPE LOCK (압축 버전)
+ * - 너무 길면 identity가 흔들릴 수 있어서 '색/심플/동일세트'만 남김
  * ============================================================
  */
 const ENABLE_UNDERWEAR_LOCK = process.env.ENABLE_UNDERWEAR_LOCK !== "0"
 const UNDERWEAR_STYLE = String(process.env.UNDERWEAR_STYLE || "underwear").toLowerCase().trim()
 const UNDERWEAR_COLOR = String(process.env.UNDERWEAR_COLOR || "pure white").trim()
 
-// ✅ underwear(브라 훅/스트랩 때문에 back에서 다른 제품으로 튀는 걸 막기 위해 “NO hooks” 타입 고정)
 const UNDERWEAR_LOCK_PROMPT = [
-  // top
-  "wearing a matching seamless pullover bralette (NO hooks, NO clasp, NO adjustable straps)",
-  "wide shoulder straps, smooth fabric, non-sheer",
+  "wearing a simple matching seamless underwear set",
   `solid ${UNDERWEAR_COLOR} color`,
-  // bottom
-  "wearing matching mid-rise seamless briefs (NOT shorts), non-sheer",
-  `solid ${UNDERWEAR_COLOR} color`,
-  // consistency
-  "same exact underwear set in front and back view, identical cut and identical design",
-  "no lace, no mesh, no pattern, no logo",
-  // safety tone (E005 완화)
+  "non-sheer, modest, no pattern, no logo",
+  "same exact underwear set in front and back view",
   "commercial fashion catalog styling, modest, non-revealing",
 ].join(", ")
 
-// ✅ bikini(여름 제품 촬영용): “two-piece bikini set”으로 형태/색 고정
 const BIKINI_LOCK_PROMPT = [
-  "wearing a matching simple two-piece bikini set",
-  "high-coverage bikini top, non-sheer",
+  "wearing a simple matching two-piece swimwear set",
   `solid ${UNDERWEAR_COLOR} color`,
-  "matching bikini bottom, mid-rise (NOT shorts), non-sheer",
-  `solid ${UNDERWEAR_COLOR} color`,
-  "same exact bikini set in front and back view, identical cut and identical design",
-  "no pattern, no logo, no text",
+  "non-sheer, modest, no pattern, no logo",
+  "same exact swimwear set in front and back view",
   "commercial fashion catalog styling, modest, non-revealing",
 ].join(", ")
 
@@ -536,8 +535,6 @@ function looksBadByCaption(caption) {
   const c = String(caption || "").toLowerCase()
   if (!c) return false
 
-  // 너무 공격적으로 잡으면 “정상 인물”도 걸리는 케이스가 있어서,
-  // 최소한 “텍스트/콜라주/그리드/멀티피플” 중심으로만 둔다.
   const badTokens = [
     "text",
     "words",
@@ -610,6 +607,85 @@ async function generateWithRetry(prompt, maxRetry = 1) {
 
 /**
  * ============================================================
+ * ✅ 5-4) CLIP scoring for FRONT vs BACK candidates
+ * - Imagen-4 on Replicate: seed/reference not reliable → we pick best BACK by visual similarity.
+ *
+ * ENV:
+ *  - BACK_CANDIDATES=6 (추천 4~8)
+ *  - BACK_MIN_SCORE=0 (원하면 0.90~0.94 정도로 시작)
+ *  - BACK_EXTRA_ROUNDS=0 (minScore 미달 시 추가 후보 생성 라운드 수)
+ *  - CLIP_MODEL_VERSION=openai/clip (필요하면 버전 pin 가능)
+ * ============================================================
+ */
+const BACK_CANDIDATES = Number(process.env.BACK_CANDIDATES || 6)
+const BACK_MIN_SCORE = Number(process.env.BACK_MIN_SCORE || 0)
+const BACK_EXTRA_ROUNDS = Number(process.env.BACK_EXTRA_ROUNDS || 0)
+const CLIP_MODEL_VERSION = process.env.CLIP_MODEL_VERSION || "openai/clip"
+
+function cosineSim(a, b) {
+  let dot = 0,
+    na = 0,
+    nb = 0
+  const n = Math.min(a?.length || 0, b?.length || 0)
+  for (let i = 0; i < n; i++) {
+    const x = Number(a[i] || 0)
+    const y = Number(b[i] || 0)
+    dot += x * y
+    na += x * x
+    nb += y * y
+  }
+  const denom = Math.sqrt(na) * Math.sqrt(nb)
+  return denom ? dot / denom : -1
+}
+
+function extractEmbedding(out) {
+  // 가능한 형태들을 최대한 방어적으로 처리
+  if (!out) return null
+  if (Array.isArray(out) && out.length > 0 && typeof out[0] === "number") return out
+  if (out?.embedding && Array.isArray(out.embedding)) return out.embedding
+  if (out?.image_embedding && Array.isArray(out.image_embedding)) return out.image_embedding
+  if (out?.embeddings && Array.isArray(out.embeddings)) return out.embeddings
+  return null
+}
+
+async function clipEmbedImage(imageUrl) {
+  const out = await replicate.run(CLIP_MODEL_VERSION, { input: { image: imageUrl } })
+  const emb = extractEmbedding(out)
+  if (!emb) throw new Error("CLIP output shape unexpected")
+  return emb
+}
+
+async function generateBackCandidates(promptBack, n) {
+  const arr = []
+  for (let i = 0; i < n; i++) {
+    // ✅ pair에서 rate limit 민감 → 여기서는 retry 0 추천
+    const r = await generateWithRetry(promptBack, 0)
+    if (r?.url) arr.push(r)
+  }
+  if (!arr.length) throw new Error("No back candidates generated")
+  return arr
+}
+
+async function pickBestBackByClip(frontUrl, backCandidates) {
+  // ✅ CLIP 자체가 429 걸릴 수 있음 → 실패하면 first로 fallback
+  try {
+    const fEmb = await clipEmbedImage(frontUrl)
+
+    let best = null
+    for (const cand of backCandidates) {
+      const bEmb = await clipEmbedImage(cand.url)
+      const score = cosineSim(fEmb, bEmb)
+      if (!best || score > best.score) best = { ...cand, score }
+    }
+    return best || { ...backCandidates[0], score: -1 }
+  } catch (e) {
+    console.warn("[CLIP] scoring failed, fallback to first back candidate:", e?.message || e)
+    return { ...backCandidates[0], score: -1 }
+  }
+}
+
+/**
+ * ============================================================
  * ✅ 6) S1 endpoints
  * ============================================================
  */
@@ -625,12 +701,12 @@ app.post("/api/s1", async (req, res) => {
   try {
     let base = withAdultGuard(prompt)
 
-    // ✅ BODY LOCK 주입 (단일도 동일하게 고정)
+    // ✅ BODY LOCK
     if (ENABLE_BODY_LOCK) base = `${base}, ${BODY_LOCK_PROMPT}`
 
     let lockedPrompt = withViewLock(base, "front")
 
-    // ✅ UNDERWEAR/BIKINI lock (형태/색 고정)
+    // ✅ UNDERWEAR/BIKINI lock
     if (ENABLE_UNDERWEAR_LOCK) lockedPrompt = `${lockedPrompt}, ${baseOutfitLockPrompt()}`
 
     // 단일 1장: 필터/재생성 2회까지 허용
@@ -682,6 +758,7 @@ app.post("/api/s1", async (req, res) => {
 
 /**
  * ✅ /api/s1/pair (FRONT+BACK 2장)
+ * - NEW: BACK is selected from N candidates by CLIP similarity to FRONT.
  */
 app.post("/api/s1/pair", async (req, res) => {
   const requestId = rid()
@@ -708,7 +785,7 @@ app.post("/api/s1/pair", async (req, res) => {
     let promptBack = ""
 
     if (hasPairPrompts) {
-      // 프론트에서 이미 만들어 보내는 경우에도 BODY/OUTFIT lock을 서버가 “덧씌움”
+      // 프론트에서 이미 만들어 보내는 경우에도 BODY lock을 서버가 “덧씌움”
       promptFront = String(b.promptFront)
       promptBack = String(b.promptBack)
 
@@ -724,7 +801,7 @@ app.post("/api/s1/pair", async (req, res) => {
       promptBack = withViewLock(base, "back")
     }
 
-    // ✅ UNDERWEAR/BIKINI lock (형태/색 고정)
+    // ✅ UNDERWEAR/BIKINI lock
     if (ENABLE_UNDERWEAR_LOCK) {
       const outfitLock = baseOutfitLockPrompt()
       promptFront = `${promptFront}, ${outfitLock}`
@@ -734,24 +811,42 @@ app.post("/api/s1/pair", async (req, res) => {
     // ✅ back 가슴 과장 완화(Back만)
     promptBack = `${promptBack}, ${BACK_BUST_SAFETY_HINTS}`
 
-    // ✅ pair는 호출 수가 많아 rate limit 민감
+    // ✅ pair는 rate limit 민감
     const PAIR_RETRY = Number(process.env.PAIR_RETRY ?? 0)
 
     let front = null
-    let back = null
+    let bestBack = null
+    let backCandidates = []
 
     try {
+      // 1) FRONT 1장
       front = await generateWithRetry(promptFront, PAIR_RETRY)
-      back = await generateWithRetry(promptBack, PAIR_RETRY)
-    } catch (e) {
-      if (isRateLimitError(e)) throw e
 
+      // 2) BACK 후보 N장
+      const n = Math.max(1, Math.min(12, BACK_CANDIDATES || 6))
+      backCandidates = await generateBackCandidates(promptBack, n)
+
+      // 3) CLIP으로 best 선택
+      bestBack = await pickBestBackByClip(front.url, backCandidates)
+
+      // 4) min score 미달이면 추가 라운드(선택)
+      let rounds = Math.max(0, Math.min(3, BACK_EXTRA_ROUNDS || 0))
+      while (rounds > 0 && bestBack && bestBack.score >= 0 && bestBack.score < BACK_MIN_SCORE) {
+        rounds -= 1
+        const more = await generateBackCandidates(promptBack, n)
+        backCandidates = backCandidates.concat(more)
+        bestBack = await pickBestBackByClip(front.url, backCandidates)
+      }
+    } catch (e) {
+      // E005면 saferPrompt로 폴백
       if (isSensitiveFlagError(e)) {
         const safeFront = makeSaferPrompt(promptFront)
         const safeBack = makeSaferPrompt(promptBack)
 
         front = await generateWithRetry(safeFront, 0)
-        back = await generateWithRetry(safeBack, 0)
+        const n = Math.max(1, Math.min(12, BACK_CANDIDATES || 6))
+        backCandidates = await generateBackCandidates(safeBack, n)
+        bestBack = await pickBestBackByClip(front.url, backCandidates)
 
         promptFront = safeFront
         promptBack = safeBack
@@ -760,31 +855,51 @@ app.post("/api/s1/pair", async (req, res) => {
       }
     }
 
-    if (!front?.url || !back?.url) {
+    if (!front?.url || !bestBack?.url) {
       await releaseIfReserved(req, reservationId)
       return res.status(502).json({
         requestId,
         error: "No imageUrl in output",
         frontUrl: front?.url || null,
-        backUrl: back?.url || null,
+        backUrl: bestBack?.url || null,
       })
     }
 
     await confirmIfReserved(req, reservationId)
 
+    const includeDebug = String(process.env.PAIR_DEBUG || "0") === "1"
+
     return res.json({
       requestId,
       frontUrl: front.url,
-      backUrl: back.url,
+      backUrl: bestBack.url,
       usedPromptFront: promptFront,
       usedPromptBack: promptBack,
       aspect_ratio: "3:4",
       triesFront: front.tries,
-      triesBack: back.tries,
+      // 후보 생성은 retry 0이므로 triesBack은 의미 없어서 bestBack.tries만 노출
+      triesBack: bestBack.tries ?? 1,
+      clip: {
+        model: CLIP_MODEL_VERSION,
+        bestScore: bestBack.score,
+        minScore: BACK_MIN_SCORE,
+        candidates: backCandidates.length,
+        extraRounds: BACK_EXTRA_ROUNDS,
+      },
+      debug: includeDebug
+        ? {
+            backCandidates: backCandidates.map((c) => ({
+              url: c.url,
+              tries: c.tries,
+              warned: c.warned,
+              badWhy: c.badWhy,
+            })),
+          }
+        : undefined,
       filter: ENABLE_RESULT_FILTER
         ? {
             front: { warned: front.warned, badWhy: front.badWhy, caption: front.caption },
-            back: { warned: back.warned, badWhy: back.badWhy, caption: back.caption },
+            back: { warned: bestBack.warned, badWhy: bestBack.badWhy, caption: bestBack.caption },
           }
         : { enabled: false },
     })
@@ -818,9 +933,9 @@ app.post("/api/s1/pair", async (req, res) => {
     console.error(`[${requestId}] /api/s1/pair ERROR`, {
       message: e?.message ?? String(e),
       stack: e?.stack,
-      gotKeys: safeKeys(b),
-      hasPairPrompts: typeof b.promptFront === "string" && typeof b.promptBack === "string",
-      hasSinglePrompt: typeof b.prompt === "string",
+      gotKeys: safeKeys(req.body || {}),
+      hasPairPrompts: typeof (req.body || {})?.promptFront === "string" && typeof (req.body || {})?.promptBack === "string",
+      hasSinglePrompt: typeof (req.body || {})?.prompt === "string",
     })
 
     return res.status(500).json({
