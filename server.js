@@ -1,4 +1,4 @@
-// server.js (FINAL+++++ patched - BACK candidates filtered + CLIP best pick + PARALLEL generation + BIKINI LOCK 강화)
+// server.js (FINAL+++++ patched - MINOR FEMALE => BODYSUIT + no adult-guard for minors)
 // ✅ Node 18+
 // ✅ Imagen-4: seed/reference not reliable on Replicate → FRONT 1 + BACK N candidates → filter(back-only) → CLIP pick best
 import express from "express"
@@ -91,20 +91,24 @@ app.get("/health", (req, res) =>
   res.json({
     ok: true,
     version:
-      "2026-03-05_finalppppp_pairBackCandidates_captionFilter_clipPick_parallel_BODYLOCK_UNDERWEARLOCK_viewlock_filter_429_e005__BIKINI_LOCK_STRONG",
+      "2026-03-06_finalppppp_MINOR_FEMALE_BODYSUIT_noAdultGuardForMinors_pairBackCandidates_captionFilter_clipPick_parallel",
     node: process.versions.node,
     config: {
       ENABLE_BODY_LOCK: process.env.ENABLE_BODY_LOCK !== "0",
       ENABLE_UNDERWEAR_LOCK: process.env.ENABLE_UNDERWEAR_LOCK !== "0",
       ENABLE_RESULT_FILTER: process.env.ENABLE_RESULT_FILTER !== "0",
-      UNDERWEAR_STYLE: String(process.env.UNDERWEAR_STYLE || "underwear"),
-      UNDERWEAR_COLOR: String(process.env.UNDERWEAR_COLOR || "pure white"),
       BACK_CANDIDATES: Number(process.env.BACK_CANDIDATES || 8),
       BACK_CONCURRENCY: Number(process.env.BACK_CONCURRENCY || 3),
       BACK_MIN_SCORE: Number(process.env.BACK_MIN_SCORE || 0),
       BACK_EXTRA_ROUNDS: Number(process.env.BACK_EXTRA_ROUNDS || 1),
       CLIP_MODEL_VERSION: process.env.CLIP_MODEL_VERSION || "openai/clip",
       PAIR_DEBUG: process.env.PAIR_DEBUG || "0",
+
+      // ✅ minor 정책
+      MINOR_AGE_CUTOFF: Number(process.env.MINOR_AGE_CUTOFF || 20),
+      MINOR_FEMALE_OUTFIT: process.env.MINOR_FEMALE_OUTFIT || "bodysuit",
+      UNDERWEAR_STYLE: process.env.UNDERWEAR_STYLE || "underwear",
+      UNDERWEAR_COLOR: process.env.UNDERWEAR_COLOR || "pure white",
     },
   })
 )
@@ -310,7 +314,54 @@ function safeKeys(obj) {
   }
 }
 
-function withAdultGuard(prompt) {
+/**
+ * ============================================================
+ * ✅ 5-0) Minor detection (프롬프트 기반 추론)
+ * - S1PromptCore의 ageToLabel() 문구를 그대로 인식
+ * ============================================================
+ */
+const MINOR_AGE_CUTOFF = Number(process.env.MINOR_AGE_CUTOFF || 20)
+
+function inferIsMinorFromPrompt(prompt) {
+  const p = String(prompt || "").toLowerCase()
+
+  // S1PromptCore ageToLabel()에서 나오는 고정 문구들
+  const minorMarkers = [
+    "child model under 10 years old",
+    "teenage model in teens",
+    "model in teens",
+    "teenage",
+    "child model",
+    "under 10 years old",
+  ]
+
+  // 혹시 커스텀에서 age 숫자를 넣는 경우 대비 (엄청 보수적으로)
+  // "age 12" 같은 패턴이 있으면 minor로 간주
+  const ageNumMatch = p.match(/\bage\s*(\d{1,2})\b/)
+  if (ageNumMatch) {
+    const n = Number(ageNumMatch[1])
+    if (Number.isFinite(n) && n < MINOR_AGE_CUTOFF) return true
+  }
+
+  return minorMarkers.some((t) => p.includes(t))
+}
+
+function inferGenderFromPrompt(prompt) {
+  const p = String(prompt || "").toLowerCase()
+  // S1PromptCore baseFemale/baseMale가 "ultra-realistic female/male fashion body model" 포함
+  if (p.includes("female fashion body model") || p.includes("ultra-realistic female")) return "female"
+  if (p.includes("male fashion body model") || p.includes("ultra-realistic male")) return "male"
+  // fallback: 못 찾으면 female로 가정하지 말고 unknown
+  return "unknown"
+}
+
+/**
+ * ✅ Adult guard:
+ * - 기존엔 무조건 "adult, age 25"를 붙였는데
+ * - 이제는 minor로 추정되면 붙이지 않음
+ */
+function withAdultGuardMaybe(prompt) {
+  if (inferIsMinorFromPrompt(prompt)) return String(prompt || "")
   return `adult, age 25, ${prompt}`
 }
 
@@ -376,7 +427,9 @@ const BODY_LOCK_PROMPT = [
 
 /**
  * ============================================================
- * ✅ 5-B) UNDERWEAR / BIKINI SHAPE LOCK (레깅스/스포츠웨어 튐 방지 강화)
+ * ✅ 5-B) OUTFIT LOCK
+ * - 일반: underwear / bikini
+ * - (NEW) 20 미만 + female: bodysuit
  * ============================================================
  */
 const ENABLE_UNDERWEAR_LOCK = process.env.ENABLE_UNDERWEAR_LOCK !== "0"
@@ -388,25 +441,42 @@ const UNDERWEAR_LOCK_PROMPT = [
   `solid ${UNDERWEAR_COLOR} color`,
   "non-sheer, modest, no pattern, no logo",
   "same exact underwear set in front and back view",
-  // ✅ 레깅스/스포츠웨어로 도망가는 케이스 방지
-  "no leggings, no yoga pants, no sportswear, no athletic wear, no sports bra",
   "commercial fashion catalog styling, modest, non-revealing",
+  // 레깅스/스포츠웨어로 튀는 것 방지
+  "no leggings, no yoga pants, no sportswear, no sports bra",
 ].join(", ")
 
-// ✅ 핵심: 'two-piece bikini'를 명시 + 레깅스/스포츠웨어 금지 + (shorts 아님) 하단 형태 고정
 const BIKINI_LOCK_PROMPT = [
-  "wearing a simple matching two-piece bikini set (NOT one-piece)",
+  "wearing a simple matching two-piece bikini set",
   `solid ${UNDERWEAR_COLOR} color`,
-  "non-sheer, modest coverage, no pattern, no logo, no text",
-  "bikini top and bikini bottom, matching set",
-  "bikini bottom is mid-rise (NOT shorts), not a skirt, not a cover-up",
-  "same exact bikini set in front and back view, identical cut and identical design",
-  // ✅ 레깅스/스포츠웨어로 튀는 걸 확실히 막기
-  "no leggings, no yoga pants, no sportswear, no athletic wear, no sports bra",
+  "non-sheer, modest, no pattern, no logo",
+  "same exact bikini set in front and back view",
   "commercial fashion catalog styling, modest, non-revealing",
+  "no leggings, no yoga pants, no sportswear, no sports bra",
 ].join(", ")
 
-function baseOutfitLockPrompt() {
+// ✅ (NEW) Minor female bodysuit lock (속옷/비키니 대신)
+const MINOR_FEMALE_BODYSUIT_PROMPT = [
+  "wearing a plain full-coverage one-piece bodysuit",
+  `solid ${UNDERWEAR_COLOR} color`,
+  "non-sheer, modest, no pattern, no logo",
+  "smooth fabric, simple seams",
+  "covers torso fully; modest coverage",
+  "same exact bodysuit in front and back view",
+  "commercial fashion catalog styling",
+  // 중요한 안전 가드
+  "no lingerie, no bra, no panties, no bikini, no underwear focus",
+  "no revealing design",
+].join(", ")
+
+// ✅ outfit 선택 로직: (minor + female) => bodysuit, else underwear/bikini
+function baseOutfitLockPromptFor(prompt) {
+  const isMinor = inferIsMinorFromPrompt(prompt)
+  const g = inferGenderFromPrompt(prompt)
+
+  if (isMinor && g === "female") return MINOR_FEMALE_BODYSUIT_PROMPT
+
+  // 남자 미성년은 "상관없다"는 니 요구를 반영해서 기존 유지
   return UNDERWEAR_STYLE === "bikini" ? BIKINI_LOCK_PROMPT : UNDERWEAR_LOCK_PROMPT
 }
 
@@ -500,6 +570,7 @@ function makeSaferPrompt(p) {
       .replace(/underwear/gi, "matching base garment set")
       .replace(/bikini/gi, "matching swimwear set")
       .replace(/lingerie/gi, "base garment")
+      .replace(/bodysuit/gi, "base garment")
       .replace(/\s+/g, " ")
       .trim() + ", modest, non-revealing, non-sheer, commercial catalog"
   )
@@ -613,7 +684,7 @@ async function generateWithRetry(prompt, maxRetry = 1) {
  */
 function isNotBackByCaption(caption) {
   const c = String(caption || "").toLowerCase()
-  if (!c) return false // 캡션 실패면 통과(너무 공격적으로 막지 않음)
+  if (!c) return false // 캡션 실패면 통과
 
   const bad = [
     "front view",
@@ -681,7 +752,7 @@ async function clipEmbedImage(imageUrl) {
 }
 
 /**
- * ✅ 간단한 concurrency pool (rate limit 방지 + 속도 개선)
+ * ✅ 간단한 concurrency pool
  */
 async function runPool(tasks, concurrency) {
   const results = new Array(tasks.length)
@@ -706,7 +777,6 @@ async function runPool(tasks, concurrency) {
 
 /**
  * ✅ BACK 후보 N장 생성 + caption으로 back-only 필터
- * - 필터로 다 날아갈 수 있으니 rounds로 추가 생성 가능
  */
 async function generateBackCandidates(promptBack, n) {
   const want = Math.max(1, Math.min(12, Number(n || 8)))
@@ -775,13 +845,14 @@ app.post("/api/s1", async (req, res) => {
   if (!prompt) return res.status(400).json({ requestId, error: "Prompt missing" })
 
   try {
-    let base = withAdultGuard(prompt)
+    // ✅ minor면 adult guard 붙이지 않음
+    let base = withAdultGuardMaybe(prompt)
 
     if (ENABLE_BODY_LOCK) base = `${base}, ${BODY_LOCK_PROMPT}`
 
     let lockedPrompt = withViewLock(base, "front")
 
-    if (ENABLE_UNDERWEAR_LOCK) lockedPrompt = `${lockedPrompt}, ${baseOutfitLockPrompt()}`
+    if (ENABLE_UNDERWEAR_LOCK) lockedPrompt = `${lockedPrompt}, ${baseOutfitLockPromptFor(lockedPrompt)}`
 
     const out = await generateWithRetry(lockedPrompt, 2)
 
@@ -792,6 +863,12 @@ app.post("/api/s1", async (req, res) => {
       imageUrl: out.url,
       usedPrompt: lockedPrompt,
       tries: out.tries,
+      minor: inferIsMinorFromPrompt(lockedPrompt),
+      gender: inferGenderFromPrompt(lockedPrompt),
+      outfitMode:
+        inferIsMinorFromPrompt(lockedPrompt) && inferGenderFromPrompt(lockedPrompt) === "female"
+          ? "bodysuit"
+          : UNDERWEAR_STYLE,
       filter: ENABLE_RESULT_FILTER
         ? { warned: out.warned, badWhy: out.badWhy, caption: out.caption }
         : { enabled: false },
@@ -842,7 +919,8 @@ app.post("/api/s1/pair", async (req, res) => {
 
   if (!mustHaveToken(res)) return
 
-  const hasPairPrompts = typeof b.promptFront === "string" && typeof b.promptBack === "string"
+  const hasPairPrompts =
+    typeof b.promptFront === "string" && typeof b.promptBack === "string"
   const hasSinglePrompt = typeof b.prompt === "string"
 
   if (!hasPairPrompts && !hasSinglePrompt) {
@@ -867,21 +945,23 @@ app.post("/api/s1/pair", async (req, res) => {
         promptBack = `${promptBack}, ${BODY_LOCK_PROMPT}`
       }
     } else {
-      let base = withAdultGuard(String(b.prompt))
+      // ✅ minor면 adult guard 붙이지 않음
+      let base = withAdultGuardMaybe(String(b.prompt))
       if (ENABLE_BODY_LOCK) base = `${base}, ${BODY_LOCK_PROMPT}`
 
       promptFront = withViewLock(base, "front")
       promptBack = withViewLock(base, "back")
     }
 
-    // ✅ UNDERWEAR/BIKINI lock
+    // ✅ OUTFIT lock (minor female => bodysuit)
     if (ENABLE_UNDERWEAR_LOCK) {
-      const outfitLock = baseOutfitLockPrompt()
-      promptFront = `${promptFront}, ${outfitLock}`
-      promptBack = `${promptBack}, ${outfitLock}`
+      const outfitLockFront = baseOutfitLockPromptFor(promptFront)
+      const outfitLockBack = baseOutfitLockPromptFor(promptBack)
+      promptFront = `${promptFront}, ${outfitLockFront}`
+      promptBack = `${promptBack}, ${outfitLockBack}`
     }
 
-    // ✅ BACK prompt를 "앞쪽"에 강하게(Imagen은 앞쪽 영향이 큼)
+    // ✅ BACK prompt를 "앞쪽"에 강하게
     promptBack = [
       "STRICT FULL BACK VIEW ONLY",
       "REAR VIEW ONLY",
@@ -903,12 +983,17 @@ app.post("/api/s1/pair", async (req, res) => {
       // 1) FRONT 1장
       front = await generateWithRetry(promptFront, PAIR_RETRY)
 
-      // 2) BACK 후보 N장 (병렬 + 캡션 필터)
+      // 2) BACK 후보 N장
       const n = Math.max(1, Math.min(12, BACK_CANDIDATES || 8))
       backCandidates = await generateBackCandidates(promptBack, n)
 
       // 3) CLIP pick best
       bestBack = await pickBestBackByClip(front.url, backCandidates)
+
+      // 4) min score 조건(선택)
+      if (BACK_MIN_SCORE > 0 && bestBack?.score >= 0 && bestBack.score < BACK_MIN_SCORE) {
+        // (추가 라운드는 generateBackCandidates에서 BACK_EXTRA_ROUNDS로 처리)
+      }
     } catch (e) {
       if (isSensitiveFlagError(e)) {
         const safeFront = makeSaferPrompt(promptFront)
@@ -950,6 +1035,13 @@ app.post("/api/s1/pair", async (req, res) => {
       aspect_ratio: "3:4",
       triesFront: front.tries,
       triesBack: bestBack.tries ?? 1,
+      minor: inferIsMinorFromPrompt(promptFront) || inferIsMinorFromPrompt(promptBack),
+      gender: inferGenderFromPrompt(promptFront),
+      outfitMode:
+        (inferIsMinorFromPrompt(promptFront) || inferIsMinorFromPrompt(promptBack)) &&
+        inferGenderFromPrompt(promptFront) === "female"
+          ? "bodysuit"
+          : UNDERWEAR_STYLE,
       clip: {
         model: CLIP_MODEL_VERSION,
         bestScore: bestBack.score,
