@@ -1,7 +1,7 @@
-// server.js (FINAL++++++ patched - KIDS SAFE MODE + ADULT unchanged + BACK candidates filtered + CLIP best pick + PARALLEL generation + idempotent release)
+// server.js (FINAL++++++ patched - ADULT ONLY + BACK candidates filtered + CLIP best pick + PARALLEL generation + idempotent release)
 // ✅ Node 18+
 // ✅ Imagen-4: seed/reference not reliable on Replicate → FRONT 1 + BACK N candidates → filter(back-only) → CLIP pick best
-// ✅ Kids(<20): NO underwear/bikini keywords, NO "adult, age 25" guard. Force safe outfit (bodysuit/rashguard/one-piece) instead.
+// ✅ Adult only: keeps underwear/bikini lock + "adult, age 25" guard
 
 import express from "express"
 import cors from "cors"
@@ -93,7 +93,7 @@ app.get("/health", (req, res) =>
   res.json({
     ok: true,
     version:
-      "2026-03-06_finalpppppp_kidsSafeMode_adultUnchanged_pairBackCandidates_captionFilter_clipPick_parallel_BODYLOCK_UNDERWEARLOCK_viewlock_filter_429_e005_idempotentRelease",
+      "2026-03-06_finalpppppp_adultOnly_pairBackCandidates_captionFilter_clipPick_parallel_BODYLOCK_UNDERWEARLOCK_viewlock_filter_429_e005_idempotentRelease",
     node: process.versions.node,
     config: {
       ENABLE_BODY_LOCK: process.env.ENABLE_BODY_LOCK !== "0",
@@ -116,8 +116,6 @@ app.get("/health", (req, res) =>
       UNDERWEAR_STYLE: String(process.env.UNDERWEAR_STYLE || "underwear"),
       UNDERWEAR_COLOR: String(process.env.UNDERWEAR_COLOR || "pure white"),
 
-      // kids
-      KIDS_MAX_AGE: Number(process.env.KIDS_MAX_AGE || 19),
       PAIR_DEBUG: process.env.PAIR_DEBUG || "0",
     },
   })
@@ -236,7 +234,6 @@ app.post("/api/credits/confirm", (req, res) => {
   }
 
   if (r.status !== "reserved") {
-    // released/other -> treat as ok (idempotent-ish)
     const w = ensureWallet(cid)
     return res.json({
       ok: true,
@@ -272,7 +269,7 @@ app.post("/api/credits/release", (req, res) => {
   const reservationId = String(req.body?.reservationId ?? "")
   const r = reservations.get(reservationId)
 
-  // ✅ idempotent release: 없는 reservationId도 OK로 처리(클라 중복 방어)
+  // ✅ idempotent release: 없는 reservationId도 OK
   if (!r) {
     const w = ensureWallet(cid)
     return res.json({
@@ -286,11 +283,9 @@ app.post("/api/credits/release", (req, res) => {
   }
 
   if (r.clientId !== cid) {
-    // 보안상은 403이 맞지만, 중복/레이스에서 UX 망가질 수 있음 → 그대로 403 유지
     return res.status(403).json({ error: "Forbidden" })
   }
 
-  // 이미 released/confirmed여도 OK 반환
   if (r.status !== "reserved") {
     const w = ensureWallet(cid)
     return res.json({
@@ -376,26 +371,7 @@ function safeKeys(obj) {
 }
 
 /**
- * ✅ Kids/Adult routing
- */
-const KIDS_MAX_AGE = Number(process.env.KIDS_MAX_AGE || 19)
-
-function parseAge(v) {
-  const n = Number(v)
-  return Number.isFinite(n) ? n : null
-}
-
-function resolveIsKids(body) {
-  const explicit = body?.isKids
-  if (explicit === true || explicit === "true") return true
-  if (explicit === false || explicit === "false") return false
-  const age = parseAge(body?.age)
-  if (age == null) return false
-  return age <= KIDS_MAX_AGE
-}
-
-/**
- * ✅ Adult guard ONLY for adult mode (kids에서는 절대 넣지 않음)
+ * ✅ Adult guard
  */
 function withAdultGuard(prompt) {
   return `adult, age 25, ${prompt}`
@@ -463,7 +439,7 @@ const BODY_LOCK_PROMPT = [
 
 /**
  * ============================================================
- * ✅ 5-B) OUTFIT LOCK (Adult: underwear/bikini, Kids: safe full outfit)
+ * ✅ 5-B) UNDERWEAR / BIKINI SHAPE LOCK (Adult)
  * ============================================================
  */
 const ENABLE_UNDERWEAR_LOCK = process.env.ENABLE_UNDERWEAR_LOCK !== "0"
@@ -486,21 +462,7 @@ const BIKINI_LOCK_PROMPT = [
   "commercial fashion catalog styling, modest, non-revealing",
 ].join(", ")
 
-/**
- * ✅ Kids safe outfit:
- * - no underwear/bikini/lingerie words
- * - force fully-covered base garment appropriate for minors
- */
-const KIDS_SAFE_OUTFIT_PROMPT = [
-  "wearing a modest full-coverage one-piece bodysuit or one-piece swimsuit",
-  `solid ${UNDERWEAR_COLOR} color`,
-  "non-sheer, no pattern, no logo",
-  "same exact outfit in front and back view",
-  "commercial fashion catalog styling",
-].join(", ")
-
-function baseOutfitLockPrompt(isKids) {
-  if (isKids) return KIDS_SAFE_OUTFIT_PROMPT
+function baseOutfitLockPrompt() {
   return UNDERWEAR_STYLE === "bikini" ? BIKINI_LOCK_PROMPT : UNDERWEAR_LOCK_PROMPT
 }
 
@@ -586,32 +548,17 @@ function isSensitiveFlagError(err) {
   return msg.includes("(E005)") || msg.toLowerCase().includes("flagged as sensitive")
 }
 
-/**
- * ✅ Safer prompt:
- * - Adult mode: soften underwear/bikini/lingerie
- * - Kids mode: further ensure no underwear-like keywords
- */
-function makeSaferPrompt(p, isKids) {
+function makeSaferPrompt(p) {
   const s = String(p || "")
-  let out = s
-    .replace(/underwear\s*only/gi, "matching base garment set")
-    .replace(/underwear/gi, "matching base garment set")
-    .replace(/bikini/gi, "matching swimwear set")
-    .replace(/lingerie/gi, "base garment")
-    .replace(/\s+/g, " ")
-    .trim()
-
-  if (isKids) {
-    out = out
-      .replace(/adult\s*,?\s*age\s*\d+/gi, "")
-      .replace(/adult/gi, "")
-      .replace(/matching base garment set/gi, "modest one-piece bodysuit")
-      .replace(/matching swimwear set/gi, "modest one-piece swimsuit")
+  return (
+    s
+      .replace(/underwear\s*only/gi, "matching base garment set")
+      .replace(/underwear/gi, "matching base garment set")
+      .replace(/bikini/gi, "matching swimwear set")
+      .replace(/lingerie/gi, "base garment")
       .replace(/\s+/g, " ")
-      .trim()
-  }
-
-  return out + ", modest, non-revealing, non-sheer, commercial catalog"
+      .trim() + ", modest, non-revealing, non-sheer, commercial catalog"
+  )
 }
 
 /**
@@ -638,9 +585,6 @@ async function captionImageBestEffort(imageUrl) {
   }
 }
 
-/**
- * ✅ 기존 "나쁜 이미지" 감지(텍스트/콜라주/멀티피플 등)
- */
 function looksBadByCaption(caption) {
   const c = String(caption || "").toLowerCase()
   if (!c) return false
@@ -716,8 +660,7 @@ async function generateWithRetry(prompt, maxRetry = 1) {
 
 /**
  * ============================================================
- * ✅ 5-4) BACK-only caption filter (핵심)
- * - back 후보에서 front/side/3-4 angle 등을 1차 제거
+ * ✅ 5-4) BACK-only caption filter
  * ============================================================
  */
 function isNotBackByCaption(caption) {
@@ -824,11 +767,9 @@ async function generateBackCandidates(promptBack, n) {
 
   for (let round = 0; round <= rounds; round++) {
     const tasks = Array.from({ length: want }, () => async () => {
-      // ✅ pair에서 rate limit 민감 → 여기서는 retry 0
       const r = await generateWithRetry(promptBack, 0)
       if (!r?.url) return null
 
-      // ✅ 캡션(가능하면)으로 back-only 1차 필터
       const cap = await captionImageBestEffort(r.url)
       const caption = cap.caption || ""
 
@@ -845,7 +786,6 @@ async function generateBackCandidates(promptBack, n) {
 
     collected = collected.concat(ok)
 
-    // ✅ 충분히 모였으면 종료
     if (collected.length >= Math.max(2, Math.floor(want / 2))) break
   }
 
@@ -885,18 +825,14 @@ app.post("/api/s1", async (req, res) => {
   if (!mustHaveToken(res)) return
   if (!prompt) return res.status(400).json({ requestId, error: "Prompt missing" })
 
-  const isKids = resolveIsKids(req.body || {})
-
   try {
-    // ✅ Adult only: adult guard
-    let base = isKids ? String(prompt) : withAdultGuard(String(prompt))
+    let base = withAdultGuard(String(prompt))
 
     if (ENABLE_BODY_LOCK) base = `${base}, ${BODY_LOCK_PROMPT}`
 
     let lockedPrompt = withViewLock(base, "front")
 
-    // ✅ Outfit lock: adult=underwear/bikini, kids=safe outfit
-    if (ENABLE_UNDERWEAR_LOCK) lockedPrompt = `${lockedPrompt}, ${baseOutfitLockPrompt(isKids)}`
+    if (ENABLE_UNDERWEAR_LOCK) lockedPrompt = `${lockedPrompt}, ${baseOutfitLockPrompt()}`
 
     const out = await generateWithRetry(lockedPrompt, 2)
 
@@ -907,7 +843,6 @@ app.post("/api/s1", async (req, res) => {
       imageUrl: out.url,
       usedPrompt: lockedPrompt,
       tries: out.tries,
-      isKids,
       filter: ENABLE_RESULT_FILTER
         ? { warned: out.warned, badWhy: out.badWhy, caption: out.caption }
         : { enabled: false },
@@ -971,14 +906,11 @@ app.post("/api/s1/pair", async (req, res) => {
     })
   }
 
-  const isKids = resolveIsKids(b)
-
   try {
     let promptFront = ""
     let promptBack = ""
 
     if (hasPairPrompts) {
-      // ✅ 클라가 front/back 따로 보내는 경우: 그대로 사용(서버는 body/outfit/view lock만 덧씌움)
       promptFront = String(b.promptFront)
       promptBack = String(b.promptBack)
 
@@ -987,17 +919,15 @@ app.post("/api/s1/pair", async (req, res) => {
         promptBack = `${promptBack}, ${BODY_LOCK_PROMPT}`
       }
     } else {
-      // ✅ 단일 prompt로 서버가 front/back 만들 때만 adult guard 적용 (kids는 적용 X)
-      let base = isKids ? String(b.prompt) : withAdultGuard(String(b.prompt))
+      let base = withAdultGuard(String(b.prompt))
       if (ENABLE_BODY_LOCK) base = `${base}, ${BODY_LOCK_PROMPT}`
 
       promptFront = withViewLock(base, "front")
       promptBack = withViewLock(base, "back")
     }
 
-    // ✅ Outfit lock: adult=underwear/bikini, kids=safe full outfit
     if (ENABLE_UNDERWEAR_LOCK) {
-      const outfitLock = baseOutfitLockPrompt(isKids)
+      const outfitLock = baseOutfitLockPrompt()
       promptFront = `${promptFront}, ${outfitLock}`
       promptBack = `${promptBack}, ${outfitLock}`
     }
@@ -1021,19 +951,16 @@ app.post("/api/s1/pair", async (req, res) => {
     let backCandidates = []
 
     try {
-      // 1) FRONT 1장
       front = await generateWithRetry(promptFront, PAIR_RETRY)
 
-      // 2) BACK 후보 N장 (병렬 + 캡션 필터)
       const n = Math.max(1, Math.min(12, BACK_CANDIDATES || 8))
       backCandidates = await generateBackCandidates(promptBack, n)
 
-      // 3) CLIP pick best
       bestBack = await pickBestBackByClip(front.url, backCandidates)
     } catch (e) {
       if (isSensitiveFlagError(e)) {
-        const safeFront = makeSaferPrompt(promptFront, isKids)
-        const safeBack = makeSaferPrompt(promptBack, isKids)
+        const safeFront = makeSaferPrompt(promptFront)
+        const safeBack = makeSaferPrompt(promptBack)
 
         front = await generateWithRetry(safeFront, 0)
 
@@ -1071,7 +998,6 @@ app.post("/api/s1/pair", async (req, res) => {
       aspect_ratio: "3:4",
       triesFront: front.tries,
       triesBack: bestBack.tries ?? 1,
-      isKids,
       clip: {
         model: CLIP_MODEL_VERSION,
         bestScore: bestBack.score,
@@ -1135,8 +1061,6 @@ app.post("/api/s1/pair", async (req, res) => {
         typeof (req.body || {})?.promptFront === "string" &&
         typeof (req.body || {})?.promptBack === "string",
       hasSinglePrompt: typeof (req.body || {})?.prompt === "string",
-      isKids,
-      age: req.body?.age ?? null,
     })
 
     return res.status(500).json({
