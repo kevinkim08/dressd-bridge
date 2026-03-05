@@ -1,4 +1,4 @@
-// server.js (FINAL+++++ patched - BACK candidates filtered + CLIP best pick + PARALLEL generation)
+// server.js (FINAL+++++ patched - BACK candidates filtered + CLIP best pick + PARALLEL generation + BIKINI LOCK 강화)
 // ✅ Node 18+
 // ✅ Imagen-4: seed/reference not reliable on Replicate → FRONT 1 + BACK N candidates → filter(back-only) → CLIP pick best
 import express from "express"
@@ -91,12 +91,14 @@ app.get("/health", (req, res) =>
   res.json({
     ok: true,
     version:
-      "2026-03-05_finalppppp_pairBackCandidates_captionFilter_clipPick_parallel_BODYLOCK_UNDERWEARLOCK_viewlock_filter_429_e005",
+      "2026-03-05_finalppppp_pairBackCandidates_captionFilter_clipPick_parallel_BODYLOCK_UNDERWEARLOCK_viewlock_filter_429_e005__BIKINI_LOCK_STRONG",
     node: process.versions.node,
     config: {
       ENABLE_BODY_LOCK: process.env.ENABLE_BODY_LOCK !== "0",
       ENABLE_UNDERWEAR_LOCK: process.env.ENABLE_UNDERWEAR_LOCK !== "0",
       ENABLE_RESULT_FILTER: process.env.ENABLE_RESULT_FILTER !== "0",
+      UNDERWEAR_STYLE: String(process.env.UNDERWEAR_STYLE || "underwear"),
+      UNDERWEAR_COLOR: String(process.env.UNDERWEAR_COLOR || "pure white"),
       BACK_CANDIDATES: Number(process.env.BACK_CANDIDATES || 8),
       BACK_CONCURRENCY: Number(process.env.BACK_CONCURRENCY || 3),
       BACK_MIN_SCORE: Number(process.env.BACK_MIN_SCORE || 0),
@@ -374,7 +376,7 @@ const BODY_LOCK_PROMPT = [
 
 /**
  * ============================================================
- * ✅ 5-B) UNDERWEAR / BIKINI SHAPE LOCK (압축 버전)
+ * ✅ 5-B) UNDERWEAR / BIKINI SHAPE LOCK (레깅스/스포츠웨어 튐 방지 강화)
  * ============================================================
  */
 const ENABLE_UNDERWEAR_LOCK = process.env.ENABLE_UNDERWEAR_LOCK !== "0"
@@ -386,14 +388,21 @@ const UNDERWEAR_LOCK_PROMPT = [
   `solid ${UNDERWEAR_COLOR} color`,
   "non-sheer, modest, no pattern, no logo",
   "same exact underwear set in front and back view",
+  // ✅ 레깅스/스포츠웨어로 도망가는 케이스 방지
+  "no leggings, no yoga pants, no sportswear, no athletic wear, no sports bra",
   "commercial fashion catalog styling, modest, non-revealing",
 ].join(", ")
 
+// ✅ 핵심: 'two-piece bikini'를 명시 + 레깅스/스포츠웨어 금지 + (shorts 아님) 하단 형태 고정
 const BIKINI_LOCK_PROMPT = [
-  "wearing a simple matching two-piece swimwear set",
+  "wearing a simple matching two-piece bikini set (NOT one-piece)",
   `solid ${UNDERWEAR_COLOR} color`,
-  "non-sheer, modest, no pattern, no logo",
-  "same exact swimwear set in front and back view",
+  "non-sheer, modest coverage, no pattern, no logo, no text",
+  "bikini top and bikini bottom, matching set",
+  "bikini bottom is mid-rise (NOT shorts), not a skirt, not a cover-up",
+  "same exact bikini set in front and back view, identical cut and identical design",
+  // ✅ 레깅스/스포츠웨어로 튀는 걸 확실히 막기
+  "no leggings, no yoga pants, no sportswear, no athletic wear, no sports bra",
   "commercial fashion catalog styling, modest, non-revealing",
 ].join(", ")
 
@@ -619,13 +628,11 @@ function isNotBackByCaption(caption) {
     "over the shoulder",
     "looking back",
   ]
-  // back을 직접 언급하는 키워드가 있으면 더 안전
   const good = ["back view", "rear view", "from behind", "back of", "facing away", "rear"]
 
   const hasGood = good.some((t) => c.includes(t))
   const hasBad = bad.some((t) => c.includes(t))
 
-  // hasBad면 탈락, 단 hasGood이 강하게 있으면 통과
   if (hasBad && !hasGood) return true
   return false
 }
@@ -709,11 +716,9 @@ async function generateBackCandidates(promptBack, n) {
 
   for (let round = 0; round <= rounds; round++) {
     const tasks = Array.from({ length: want }, () => async () => {
-      // ✅ pair에서 rate limit 민감 → 여기서는 retry 0
       const r = await generateWithRetry(promptBack, 0)
       if (!r?.url) return null
 
-      // ✅ 캡션(가능하면)으로 back-only 1차 필터
       const cap = await captionImageBestEffort(r.url)
       const caption = cap.caption || ""
 
@@ -730,7 +735,6 @@ async function generateBackCandidates(promptBack, n) {
 
     collected = collected.concat(ok)
 
-    // ✅ 충분히 모였으면 종료 (최소 2장만 넘어도 CLIP pick 의미가 커짐)
     if (collected.length >= Math.max(2, Math.floor(want / 2))) break
   }
 
@@ -838,8 +842,7 @@ app.post("/api/s1/pair", async (req, res) => {
 
   if (!mustHaveToken(res)) return
 
-  const hasPairPrompts =
-    typeof b.promptFront === "string" && typeof b.promptBack === "string"
+  const hasPairPrompts = typeof b.promptFront === "string" && typeof b.promptBack === "string"
   const hasSinglePrompt = typeof b.prompt === "string"
 
   if (!hasPairPrompts && !hasSinglePrompt) {
@@ -906,12 +909,6 @@ app.post("/api/s1/pair", async (req, res) => {
 
       // 3) CLIP pick best
       bestBack = await pickBestBackByClip(front.url, backCandidates)
-
-      // 4) min score 조건(선택)
-      if (BACK_MIN_SCORE > 0 && bestBack?.score >= 0 && bestBack.score < BACK_MIN_SCORE) {
-        // score가 너무 낮으면 backCandidates 중 2~3개를 debug로 보내서 확인할 수 있게
-        // (추가 라운드는 generateBackCandidates에서 이미 BACK_EXTRA_ROUNDS로 처리)
-      }
     } catch (e) {
       if (isSensitiveFlagError(e)) {
         const safeFront = makeSaferPrompt(promptFront)
