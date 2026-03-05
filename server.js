@@ -1,6 +1,8 @@
-// server.js (FINAL+++++ patched - MINOR FEMALE => BODYSUIT + no adult-guard for minors)
+// server.js (FINAL++++++ patched - KIDS SAFE MODE + ADULT unchanged + BACK candidates filtered + CLIP best pick + PARALLEL generation + idempotent release)
 // ✅ Node 18+
 // ✅ Imagen-4: seed/reference not reliable on Replicate → FRONT 1 + BACK N candidates → filter(back-only) → CLIP pick best
+// ✅ Kids(<20): NO underwear/bikini keywords, NO "adult, age 25" guard. Force safe outfit (bodysuit/rashguard/one-piece) instead.
+
 import express from "express"
 import cors from "cors"
 import Replicate from "replicate"
@@ -91,24 +93,32 @@ app.get("/health", (req, res) =>
   res.json({
     ok: true,
     version:
-      "2026-03-06_finalppppp_MINOR_FEMALE_BODYSUIT_noAdultGuardForMinors_pairBackCandidates_captionFilter_clipPick_parallel",
+      "2026-03-06_finalpppppp_kidsSafeMode_adultUnchanged_pairBackCandidates_captionFilter_clipPick_parallel_BODYLOCK_UNDERWEARLOCK_viewlock_filter_429_e005_idempotentRelease",
     node: process.versions.node,
     config: {
       ENABLE_BODY_LOCK: process.env.ENABLE_BODY_LOCK !== "0",
       ENABLE_UNDERWEAR_LOCK: process.env.ENABLE_UNDERWEAR_LOCK !== "0",
       ENABLE_RESULT_FILTER: process.env.ENABLE_RESULT_FILTER !== "0",
+
+      // back candidates
       BACK_CANDIDATES: Number(process.env.BACK_CANDIDATES || 8),
       BACK_CONCURRENCY: Number(process.env.BACK_CONCURRENCY || 3),
       BACK_MIN_SCORE: Number(process.env.BACK_MIN_SCORE || 0),
       BACK_EXTRA_ROUNDS: Number(process.env.BACK_EXTRA_ROUNDS || 1),
-      CLIP_MODEL_VERSION: process.env.CLIP_MODEL_VERSION || "openai/clip",
-      PAIR_DEBUG: process.env.PAIR_DEBUG || "0",
 
-      // ✅ minor 정책
-      MINOR_AGE_CUTOFF: Number(process.env.MINOR_AGE_CUTOFF || 20),
-      MINOR_FEMALE_OUTFIT: process.env.MINOR_FEMALE_OUTFIT || "bodysuit",
-      UNDERWEAR_STYLE: process.env.UNDERWEAR_STYLE || "underwear",
-      UNDERWEAR_COLOR: process.env.UNDERWEAR_COLOR || "pure white",
+      // models
+      CLIP_MODEL_VERSION: process.env.CLIP_MODEL_VERSION || "openai/clip",
+      CAPTION_MODEL_VERSION:
+        process.env.CAPTION_MODEL_VERSION ||
+        "salesforce/blip:2e1dddc8621f72155f24cf2e0adbde548458d3cab9f00c0139c1a7fe2a1b3b3f",
+
+      // outfit
+      UNDERWEAR_STYLE: String(process.env.UNDERWEAR_STYLE || "underwear"),
+      UNDERWEAR_COLOR: String(process.env.UNDERWEAR_COLOR || "pure white"),
+
+      // kids
+      KIDS_MAX_AGE: Number(process.env.KIDS_MAX_AGE || 19),
+      PAIR_DEBUG: process.env.PAIR_DEBUG || "0",
     },
   })
 )
@@ -211,8 +221,31 @@ app.post("/api/credits/confirm", (req, res) => {
   const r = reservations.get(reservationId)
   if (!r) return res.status(404).json({ error: "Reservation not found" })
   if (r.clientId !== cid) return res.status(403).json({ error: "Forbidden" })
+
+  // ✅ idempotent confirm
+  if (r.status === "confirmed") {
+    const w = ensureWallet(cid)
+    return res.json({
+      ok: true,
+      reservationId,
+      status: "confirmed",
+      balance: w.balance,
+      reserved: w.reserved,
+      available: w.balance - w.reserved,
+    })
+  }
+
   if (r.status !== "reserved") {
-    return res.status(400).json({ error: `Bad status: ${r.status}` })
+    // released/other -> treat as ok (idempotent-ish)
+    const w = ensureWallet(cid)
+    return res.json({
+      ok: true,
+      reservationId,
+      status: r.status,
+      balance: w.balance,
+      reserved: w.reserved,
+      available: w.balance - w.reserved,
+    })
   }
 
   const w = ensureWallet(cid)
@@ -225,6 +258,7 @@ app.post("/api/credits/confirm", (req, res) => {
   return res.json({
     ok: true,
     reservationId,
+    status: "confirmed",
     balance: w.balance,
     reserved: w.reserved,
     available: w.balance - w.reserved,
@@ -237,10 +271,36 @@ app.post("/api/credits/release", (req, res) => {
 
   const reservationId = String(req.body?.reservationId ?? "")
   const r = reservations.get(reservationId)
-  if (!r) return res.status(404).json({ error: "Reservation not found" })
-  if (r.clientId !== cid) return res.status(403).json({ error: "Forbidden" })
+
+  // ✅ idempotent release: 없는 reservationId도 OK로 처리(클라 중복 방어)
+  if (!r) {
+    const w = ensureWallet(cid)
+    return res.json({
+      ok: true,
+      reservationId,
+      status: "not_found",
+      balance: w.balance,
+      reserved: w.reserved,
+      available: w.balance - w.reserved,
+    })
+  }
+
+  if (r.clientId !== cid) {
+    // 보안상은 403이 맞지만, 중복/레이스에서 UX 망가질 수 있음 → 그대로 403 유지
+    return res.status(403).json({ error: "Forbidden" })
+  }
+
+  // 이미 released/confirmed여도 OK 반환
   if (r.status !== "reserved") {
-    return res.status(400).json({ error: `Bad status: ${r.status}` })
+    const w = ensureWallet(cid)
+    return res.json({
+      ok: true,
+      reservationId,
+      status: r.status,
+      balance: w.balance,
+      reserved: w.reserved,
+      available: w.balance - w.reserved,
+    })
   }
 
   const w = ensureWallet(cid)
@@ -252,6 +312,7 @@ app.post("/api/credits/release", (req, res) => {
   return res.json({
     ok: true,
     reservationId,
+    status: "released",
     balance: w.balance,
     reserved: w.reserved,
     available: w.balance - w.reserved,
@@ -315,53 +376,28 @@ function safeKeys(obj) {
 }
 
 /**
- * ============================================================
- * ✅ 5-0) Minor detection (프롬프트 기반 추론)
- * - S1PromptCore의 ageToLabel() 문구를 그대로 인식
- * ============================================================
+ * ✅ Kids/Adult routing
  */
-const MINOR_AGE_CUTOFF = Number(process.env.MINOR_AGE_CUTOFF || 20)
+const KIDS_MAX_AGE = Number(process.env.KIDS_MAX_AGE || 19)
 
-function inferIsMinorFromPrompt(prompt) {
-  const p = String(prompt || "").toLowerCase()
-
-  // S1PromptCore ageToLabel()에서 나오는 고정 문구들
-  const minorMarkers = [
-    "child model under 10 years old",
-    "teenage model in teens",
-    "model in teens",
-    "teenage",
-    "child model",
-    "under 10 years old",
-  ]
-
-  // 혹시 커스텀에서 age 숫자를 넣는 경우 대비 (엄청 보수적으로)
-  // "age 12" 같은 패턴이 있으면 minor로 간주
-  const ageNumMatch = p.match(/\bage\s*(\d{1,2})\b/)
-  if (ageNumMatch) {
-    const n = Number(ageNumMatch[1])
-    if (Number.isFinite(n) && n < MINOR_AGE_CUTOFF) return true
-  }
-
-  return minorMarkers.some((t) => p.includes(t))
+function parseAge(v) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : null
 }
 
-function inferGenderFromPrompt(prompt) {
-  const p = String(prompt || "").toLowerCase()
-  // S1PromptCore baseFemale/baseMale가 "ultra-realistic female/male fashion body model" 포함
-  if (p.includes("female fashion body model") || p.includes("ultra-realistic female")) return "female"
-  if (p.includes("male fashion body model") || p.includes("ultra-realistic male")) return "male"
-  // fallback: 못 찾으면 female로 가정하지 말고 unknown
-  return "unknown"
+function resolveIsKids(body) {
+  const explicit = body?.isKids
+  if (explicit === true || explicit === "true") return true
+  if (explicit === false || explicit === "false") return false
+  const age = parseAge(body?.age)
+  if (age == null) return false
+  return age <= KIDS_MAX_AGE
 }
 
 /**
- * ✅ Adult guard:
- * - 기존엔 무조건 "adult, age 25"를 붙였는데
- * - 이제는 minor로 추정되면 붙이지 않음
+ * ✅ Adult guard ONLY for adult mode (kids에서는 절대 넣지 않음)
  */
-function withAdultGuardMaybe(prompt) {
-  if (inferIsMinorFromPrompt(prompt)) return String(prompt || "")
+function withAdultGuard(prompt) {
   return `adult, age 25, ${prompt}`
 }
 
@@ -427,9 +463,7 @@ const BODY_LOCK_PROMPT = [
 
 /**
  * ============================================================
- * ✅ 5-B) OUTFIT LOCK
- * - 일반: underwear / bikini
- * - (NEW) 20 미만 + female: bodysuit
+ * ✅ 5-B) OUTFIT LOCK (Adult: underwear/bikini, Kids: safe full outfit)
  * ============================================================
  */
 const ENABLE_UNDERWEAR_LOCK = process.env.ENABLE_UNDERWEAR_LOCK !== "0"
@@ -442,41 +476,31 @@ const UNDERWEAR_LOCK_PROMPT = [
   "non-sheer, modest, no pattern, no logo",
   "same exact underwear set in front and back view",
   "commercial fashion catalog styling, modest, non-revealing",
-  // 레깅스/스포츠웨어로 튀는 것 방지
-  "no leggings, no yoga pants, no sportswear, no sports bra",
 ].join(", ")
 
 const BIKINI_LOCK_PROMPT = [
-  "wearing a simple matching two-piece bikini set",
+  "wearing a simple matching two-piece swimwear set",
   `solid ${UNDERWEAR_COLOR} color`,
   "non-sheer, modest, no pattern, no logo",
-  "same exact bikini set in front and back view",
+  "same exact swimwear set in front and back view",
   "commercial fashion catalog styling, modest, non-revealing",
-  "no leggings, no yoga pants, no sportswear, no sports bra",
 ].join(", ")
 
-// ✅ (NEW) Minor female bodysuit lock (속옷/비키니 대신)
-const MINOR_FEMALE_BODYSUIT_PROMPT = [
-  "wearing a plain full-coverage one-piece bodysuit",
+/**
+ * ✅ Kids safe outfit:
+ * - no underwear/bikini/lingerie words
+ * - force fully-covered base garment appropriate for minors
+ */
+const KIDS_SAFE_OUTFIT_PROMPT = [
+  "wearing a modest full-coverage one-piece bodysuit or one-piece swimsuit",
   `solid ${UNDERWEAR_COLOR} color`,
-  "non-sheer, modest, no pattern, no logo",
-  "smooth fabric, simple seams",
-  "covers torso fully; modest coverage",
-  "same exact bodysuit in front and back view",
+  "non-sheer, no pattern, no logo",
+  "same exact outfit in front and back view",
   "commercial fashion catalog styling",
-  // 중요한 안전 가드
-  "no lingerie, no bra, no panties, no bikini, no underwear focus",
-  "no revealing design",
 ].join(", ")
 
-// ✅ outfit 선택 로직: (minor + female) => bodysuit, else underwear/bikini
-function baseOutfitLockPromptFor(prompt) {
-  const isMinor = inferIsMinorFromPrompt(prompt)
-  const g = inferGenderFromPrompt(prompt)
-
-  if (isMinor && g === "female") return MINOR_FEMALE_BODYSUIT_PROMPT
-
-  // 남자 미성년은 "상관없다"는 니 요구를 반영해서 기존 유지
+function baseOutfitLockPrompt(isKids) {
+  if (isKids) return KIDS_SAFE_OUTFIT_PROMPT
   return UNDERWEAR_STYLE === "bikini" ? BIKINI_LOCK_PROMPT : UNDERWEAR_LOCK_PROMPT
 }
 
@@ -562,18 +586,32 @@ function isSensitiveFlagError(err) {
   return msg.includes("(E005)") || msg.toLowerCase().includes("flagged as sensitive")
 }
 
-function makeSaferPrompt(p) {
+/**
+ * ✅ Safer prompt:
+ * - Adult mode: soften underwear/bikini/lingerie
+ * - Kids mode: further ensure no underwear-like keywords
+ */
+function makeSaferPrompt(p, isKids) {
   const s = String(p || "")
-  return (
-    s
-      .replace(/underwear\s*only/gi, "matching base garment set")
-      .replace(/underwear/gi, "matching base garment set")
-      .replace(/bikini/gi, "matching swimwear set")
-      .replace(/lingerie/gi, "base garment")
-      .replace(/bodysuit/gi, "base garment")
+  let out = s
+    .replace(/underwear\s*only/gi, "matching base garment set")
+    .replace(/underwear/gi, "matching base garment set")
+    .replace(/bikini/gi, "matching swimwear set")
+    .replace(/lingerie/gi, "base garment")
+    .replace(/\s+/g, " ")
+    .trim()
+
+  if (isKids) {
+    out = out
+      .replace(/adult\s*,?\s*age\s*\d+/gi, "")
+      .replace(/adult/gi, "")
+      .replace(/matching base garment set/gi, "modest one-piece bodysuit")
+      .replace(/matching swimwear set/gi, "modest one-piece swimsuit")
       .replace(/\s+/g, " ")
-      .trim() + ", modest, non-revealing, non-sheer, commercial catalog"
-  )
+      .trim()
+  }
+
+  return out + ", modest, non-revealing, non-sheer, commercial catalog"
 }
 
 /**
@@ -752,7 +790,7 @@ async function clipEmbedImage(imageUrl) {
 }
 
 /**
- * ✅ 간단한 concurrency pool
+ * ✅ 간단한 concurrency pool (rate limit 방지 + 속도 개선)
  */
 async function runPool(tasks, concurrency) {
   const results = new Array(tasks.length)
@@ -786,9 +824,11 @@ async function generateBackCandidates(promptBack, n) {
 
   for (let round = 0; round <= rounds; round++) {
     const tasks = Array.from({ length: want }, () => async () => {
+      // ✅ pair에서 rate limit 민감 → 여기서는 retry 0
       const r = await generateWithRetry(promptBack, 0)
       if (!r?.url) return null
 
+      // ✅ 캡션(가능하면)으로 back-only 1차 필터
       const cap = await captionImageBestEffort(r.url)
       const caption = cap.caption || ""
 
@@ -805,6 +845,7 @@ async function generateBackCandidates(promptBack, n) {
 
     collected = collected.concat(ok)
 
+    // ✅ 충분히 모였으면 종료
     if (collected.length >= Math.max(2, Math.floor(want / 2))) break
   }
 
@@ -844,15 +885,18 @@ app.post("/api/s1", async (req, res) => {
   if (!mustHaveToken(res)) return
   if (!prompt) return res.status(400).json({ requestId, error: "Prompt missing" })
 
+  const isKids = resolveIsKids(req.body || {})
+
   try {
-    // ✅ minor면 adult guard 붙이지 않음
-    let base = withAdultGuardMaybe(prompt)
+    // ✅ Adult only: adult guard
+    let base = isKids ? String(prompt) : withAdultGuard(String(prompt))
 
     if (ENABLE_BODY_LOCK) base = `${base}, ${BODY_LOCK_PROMPT}`
 
     let lockedPrompt = withViewLock(base, "front")
 
-    if (ENABLE_UNDERWEAR_LOCK) lockedPrompt = `${lockedPrompt}, ${baseOutfitLockPromptFor(lockedPrompt)}`
+    // ✅ Outfit lock: adult=underwear/bikini, kids=safe outfit
+    if (ENABLE_UNDERWEAR_LOCK) lockedPrompt = `${lockedPrompt}, ${baseOutfitLockPrompt(isKids)}`
 
     const out = await generateWithRetry(lockedPrompt, 2)
 
@@ -863,12 +907,7 @@ app.post("/api/s1", async (req, res) => {
       imageUrl: out.url,
       usedPrompt: lockedPrompt,
       tries: out.tries,
-      minor: inferIsMinorFromPrompt(lockedPrompt),
-      gender: inferGenderFromPrompt(lockedPrompt),
-      outfitMode:
-        inferIsMinorFromPrompt(lockedPrompt) && inferGenderFromPrompt(lockedPrompt) === "female"
-          ? "bodysuit"
-          : UNDERWEAR_STYLE,
+      isKids,
       filter: ENABLE_RESULT_FILTER
         ? { warned: out.warned, badWhy: out.badWhy, caption: out.caption }
         : { enabled: false },
@@ -932,11 +971,14 @@ app.post("/api/s1/pair", async (req, res) => {
     })
   }
 
+  const isKids = resolveIsKids(b)
+
   try {
     let promptFront = ""
     let promptBack = ""
 
     if (hasPairPrompts) {
+      // ✅ 클라가 front/back 따로 보내는 경우: 그대로 사용(서버는 body/outfit/view lock만 덧씌움)
       promptFront = String(b.promptFront)
       promptBack = String(b.promptBack)
 
@@ -945,23 +987,22 @@ app.post("/api/s1/pair", async (req, res) => {
         promptBack = `${promptBack}, ${BODY_LOCK_PROMPT}`
       }
     } else {
-      // ✅ minor면 adult guard 붙이지 않음
-      let base = withAdultGuardMaybe(String(b.prompt))
+      // ✅ 단일 prompt로 서버가 front/back 만들 때만 adult guard 적용 (kids는 적용 X)
+      let base = isKids ? String(b.prompt) : withAdultGuard(String(b.prompt))
       if (ENABLE_BODY_LOCK) base = `${base}, ${BODY_LOCK_PROMPT}`
 
       promptFront = withViewLock(base, "front")
       promptBack = withViewLock(base, "back")
     }
 
-    // ✅ OUTFIT lock (minor female => bodysuit)
+    // ✅ Outfit lock: adult=underwear/bikini, kids=safe full outfit
     if (ENABLE_UNDERWEAR_LOCK) {
-      const outfitLockFront = baseOutfitLockPromptFor(promptFront)
-      const outfitLockBack = baseOutfitLockPromptFor(promptBack)
-      promptFront = `${promptFront}, ${outfitLockFront}`
-      promptBack = `${promptBack}, ${outfitLockBack}`
+      const outfitLock = baseOutfitLockPrompt(isKids)
+      promptFront = `${promptFront}, ${outfitLock}`
+      promptBack = `${promptBack}, ${outfitLock}`
     }
 
-    // ✅ BACK prompt를 "앞쪽"에 강하게
+    // ✅ BACK prompt를 "앞쪽"에 강하게(Imagen은 앞쪽 영향이 큼)
     promptBack = [
       "STRICT FULL BACK VIEW ONLY",
       "REAR VIEW ONLY",
@@ -983,21 +1024,16 @@ app.post("/api/s1/pair", async (req, res) => {
       // 1) FRONT 1장
       front = await generateWithRetry(promptFront, PAIR_RETRY)
 
-      // 2) BACK 후보 N장
+      // 2) BACK 후보 N장 (병렬 + 캡션 필터)
       const n = Math.max(1, Math.min(12, BACK_CANDIDATES || 8))
       backCandidates = await generateBackCandidates(promptBack, n)
 
       // 3) CLIP pick best
       bestBack = await pickBestBackByClip(front.url, backCandidates)
-
-      // 4) min score 조건(선택)
-      if (BACK_MIN_SCORE > 0 && bestBack?.score >= 0 && bestBack.score < BACK_MIN_SCORE) {
-        // (추가 라운드는 generateBackCandidates에서 BACK_EXTRA_ROUNDS로 처리)
-      }
     } catch (e) {
       if (isSensitiveFlagError(e)) {
-        const safeFront = makeSaferPrompt(promptFront)
-        const safeBack = makeSaferPrompt(promptBack)
+        const safeFront = makeSaferPrompt(promptFront, isKids)
+        const safeBack = makeSaferPrompt(promptBack, isKids)
 
         front = await generateWithRetry(safeFront, 0)
 
@@ -1016,7 +1052,7 @@ app.post("/api/s1/pair", async (req, res) => {
       await releaseIfReserved(req, reservationId)
       return res.status(502).json({
         requestId,
-        error: "No imageUrl in output",
+        error: "No frontUrl/backUrl in output",
         frontUrl: front?.url || null,
         backUrl: bestBack?.url || null,
       })
@@ -1035,13 +1071,7 @@ app.post("/api/s1/pair", async (req, res) => {
       aspect_ratio: "3:4",
       triesFront: front.tries,
       triesBack: bestBack.tries ?? 1,
-      minor: inferIsMinorFromPrompt(promptFront) || inferIsMinorFromPrompt(promptBack),
-      gender: inferGenderFromPrompt(promptFront),
-      outfitMode:
-        (inferIsMinorFromPrompt(promptFront) || inferIsMinorFromPrompt(promptBack)) &&
-        inferGenderFromPrompt(promptFront) === "female"
-          ? "bodysuit"
-          : UNDERWEAR_STYLE,
+      isKids,
       clip: {
         model: CLIP_MODEL_VERSION,
         bestScore: bestBack.score,
@@ -1105,6 +1135,8 @@ app.post("/api/s1/pair", async (req, res) => {
         typeof (req.body || {})?.promptFront === "string" &&
         typeof (req.body || {})?.promptBack === "string",
       hasSinglePrompt: typeof (req.body || {})?.prompt === "string",
+      isKids,
+      age: req.body?.age ?? null,
     })
 
     return res.status(500).json({
