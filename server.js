@@ -1,7 +1,8 @@
-// server.js (FINAL++++++ patched - ADULT ONLY + BACK candidates filtered + CLIP best pick + PARALLEL generation + idempotent release)
+// server.js
+// ✅ S1: front + pair(front/back) 유지
+// ✅ S3: FASHN /api/dress 복원
 // ✅ Node 18+
-// ✅ Imagen-4: seed/reference not reliable on Replicate → FRONT 1 + BACK N candidates → filter(back-only) → CLIP pick best
-// ✅ Adult only: keeps underwear/bikini lock + "adult, age 25" guard
+// ✅ CORS + preflight + credits + idempotent reserve/release 유지
 
 import express from "express"
 import cors from "cors"
@@ -45,7 +46,6 @@ app.use((req, res, next) => {
 
   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
 
-  // ✅ 핵심: 브라우저가 preflight에서 요청한 헤더를 그대로 허용
   const reqHeaders = req.headers["access-control-request-headers"]
   res.setHeader(
     "Access-Control-Allow-Headers",
@@ -56,7 +56,6 @@ app.use((req, res, next) => {
   next()
 })
 
-// (보조) cors 패키지도 유지
 app.use(
   cors({
     origin: (origin, cb) => {
@@ -77,7 +76,7 @@ app.use(
 
 /**
  * ============================================================
- * ✅ 2) Body parser (req.body 비는 문제 방지)
+ * ✅ 2) Body parser
  * ============================================================
  */
 app.use(express.json({ limit: "25mb" }))
@@ -93,30 +92,32 @@ app.get("/health", (req, res) =>
   res.json({
     ok: true,
     version:
-      "2026-03-06_finalpppppp_adultOnly_pairBackCandidates_captionFilter_clipPick_parallel_BODYLOCK_UNDERWEARLOCK_viewlock_filter_429_e005_idempotentRelease",
+      "2026-03-08_merged_s1pair_s3dress_fashn_restore",
     node: process.versions.node,
     config: {
       ENABLE_BODY_LOCK: process.env.ENABLE_BODY_LOCK !== "0",
       ENABLE_UNDERWEAR_LOCK: process.env.ENABLE_UNDERWEAR_LOCK !== "0",
       ENABLE_RESULT_FILTER: process.env.ENABLE_RESULT_FILTER !== "0",
 
-      // back candidates
       BACK_CANDIDATES: Number(process.env.BACK_CANDIDATES || 8),
       BACK_CONCURRENCY: Number(process.env.BACK_CONCURRENCY || 3),
       BACK_MIN_SCORE: Number(process.env.BACK_MIN_SCORE || 0),
       BACK_EXTRA_ROUNDS: Number(process.env.BACK_EXTRA_ROUNDS || 1),
 
-      // models
       CLIP_MODEL_VERSION: process.env.CLIP_MODEL_VERSION || "openai/clip",
       CAPTION_MODEL_VERSION:
         process.env.CAPTION_MODEL_VERSION ||
         "salesforce/blip:2e1dddc8621f72155f24cf2e0adbde548458d3cab9f00c0139c1a7fe2a1b3b3f",
 
-      // outfit
       UNDERWEAR_STYLE: String(process.env.UNDERWEAR_STYLE || "underwear"),
       UNDERWEAR_COLOR: String(process.env.UNDERWEAR_COLOR || "pure white"),
 
       PAIR_DEBUG: process.env.PAIR_DEBUG || "0",
+
+      // S3
+      FASHN_MODEL_NAME: process.env.FASHN_MODEL_NAME || "tryon-v1.6",
+      HAS_FASHN_KEY: !!process.env.FASHN_API_KEY,
+      HAS_REPLICATE_KEY: !!process.env.REPLICATE_API_TOKEN,
     },
   })
 )
@@ -220,7 +221,6 @@ app.post("/api/credits/confirm", (req, res) => {
   if (!r) return res.status(404).json({ error: "Reservation not found" })
   if (r.clientId !== cid) return res.status(403).json({ error: "Forbidden" })
 
-  // ✅ idempotent confirm
   if (r.status === "confirmed") {
     const w = ensureWallet(cid)
     return res.json({
@@ -269,7 +269,6 @@ app.post("/api/credits/release", (req, res) => {
   const reservationId = String(req.body?.reservationId ?? "")
   const r = reservations.get(reservationId)
 
-  // ✅ idempotent release: 없는 reservationId도 OK
   if (!r) {
     const w = ensureWallet(cid)
     return res.json({
@@ -370,16 +369,10 @@ function safeKeys(obj) {
   }
 }
 
-/**
- * ✅ Adult guard
- */
 function withAdultGuard(prompt) {
   return `adult, age 25, ${prompt}`
 }
 
-/**
- * ✅ hair hints
- */
 function hairHintsFront() {
   return ["hair centered", "symmetrical hairstyle", "no wind", "no dramatic motion"].join(", ")
 }
@@ -387,7 +380,6 @@ function hairHintsBack() {
   return ["no wind", "no dramatic motion", "natural hair fall"].join(", ")
 }
 
-// ✅ FRONT/BACK 뷰 고정
 function withViewLock(prompt, view) {
   if (view === "back") {
     return [
@@ -466,7 +458,6 @@ function baseOutfitLockPrompt() {
   return UNDERWEAR_STYLE === "bikini" ? BIKINI_LOCK_PROMPT : UNDERWEAR_LOCK_PROMPT
 }
 
-// ✅ back에서 과장 완화
 const BACK_BUST_SAFETY_HINTS = [
   "natural back silhouette",
   "no exaggerated chest protrusion",
@@ -474,14 +465,12 @@ const BACK_BUST_SAFETY_HINTS = [
   "realistic anatomy",
 ].join(", ")
 
-// ✅ Result Filter toggle (caption-based)
 const ENABLE_RESULT_FILTER = process.env.ENABLE_RESULT_FILTER !== "0"
 
 const CAPTION_MODEL_VERSION =
   process.env.CAPTION_MODEL_VERSION ||
   "salesforce/blip:2e1dddc8621f72155f24cf2e0adbde548458d3cab9f00c0139c1a7fe2a1b3b3f"
 
-// ✅ Replicate output -> url
 function pickImageUrl(output) {
   if (Array.isArray(output)) {
     const first = output[0]
@@ -509,11 +498,6 @@ async function runImagen(prompt) {
   return pickImageUrl(output)
 }
 
-/**
- * ============================================================
- * ✅ 5-1) 429 Too Many Requests
- * ============================================================
- */
 function isRateLimitError(err) {
   const msg = String(err?.message || "")
   return (
@@ -538,11 +522,6 @@ function parseRetryAfterSeconds(err) {
   return 6
 }
 
-/**
- * ============================================================
- * ✅ 5-2) E005 sensitive-flag
- * ============================================================
- */
 function isSensitiveFlagError(err) {
   const msg = String(err?.message || "")
   return msg.includes("(E005)") || msg.toLowerCase().includes("flagged as sensitive")
@@ -561,11 +540,6 @@ function makeSaferPrompt(p) {
   )
 }
 
-/**
- * ============================================================
- * ✅ 5-3) Caption tools (best-effort)
- * ============================================================
- */
 function normalizeCaption(out) {
   if (!out) return ""
   if (typeof out === "string") return out
@@ -658,14 +632,9 @@ async function generateWithRetry(prompt, maxRetry = 1) {
   throw lastErr || new Error("Generation failed")
 }
 
-/**
- * ============================================================
- * ✅ 5-4) BACK-only caption filter
- * ============================================================
- */
 function isNotBackByCaption(caption) {
   const c = String(caption || "").toLowerCase()
-  if (!c) return false // 캡션 실패면 통과
+  if (!c) return false
 
   const bad = [
     "front view",
@@ -732,9 +701,6 @@ async function clipEmbedImage(imageUrl) {
   return emb
 }
 
-/**
- * ✅ 간단한 concurrency pool (rate limit 방지 + 속도 개선)
- */
 async function runPool(tasks, concurrency) {
   const results = new Array(tasks.length)
   let idx = 0
@@ -756,9 +722,6 @@ async function runPool(tasks, concurrency) {
   return results
 }
 
-/**
- * ✅ BACK 후보 N장 생성 + caption으로 back-only 필터
- */
 async function generateBackCandidates(promptBack, n) {
   const want = Math.max(1, Math.min(12, Number(n || 8)))
   const rounds = Math.max(0, Math.min(3, Number(BACK_EXTRA_ROUNDS || 0)))
@@ -817,7 +780,7 @@ async function pickBestBackByClip(frontUrl, backCandidates) {
  * ============================================================
  */
 
-// ✅ /api/s1 (FRONT 1장)
+// /api/s1 (FRONT 1장)
 app.post("/api/s1", async (req, res) => {
   const requestId = rid()
   const { prompt, reservationId } = req.body || {}
@@ -881,10 +844,7 @@ app.post("/api/s1", async (req, res) => {
 })
 
 /**
- * ✅ /api/s1/pair (FRONT+BACK 2장)
- * - FRONT 1장
- * - BACK 후보 N장(병렬) + caption back-only 1차 필터
- * - CLIP으로 best pick
+ * /api/s1/pair (FRONT+BACK 2장)
  */
 app.post("/api/s1/pair", async (req, res) => {
   const requestId = rid()
@@ -932,7 +892,6 @@ app.post("/api/s1/pair", async (req, res) => {
       promptBack = `${promptBack}, ${outfitLock}`
     }
 
-    // ✅ BACK prompt를 "앞쪽"에 강하게(Imagen은 앞쪽 영향이 큼)
     promptBack = [
       "STRICT FULL BACK VIEW ONLY",
       "REAR VIEW ONLY",
@@ -1068,6 +1027,159 @@ app.post("/api/s1/pair", async (req, res) => {
       error: "Generation failed",
       detail: String(e?.message ?? e),
     })
+  }
+})
+
+/**
+ * ============================================================
+ * ✅ 7) S3 Dress (FASHN)
+ * ============================================================
+ */
+const FASHN_BASE = "https://api.fashn.ai/v1"
+const FASHN_MODEL_NAME = process.env.FASHN_MODEL_NAME || "tryon-v1.6"
+
+function isDataUrl(v) {
+  return typeof v === "string" && v.startsWith("data:image/")
+}
+
+function pickGarment(view, garments) {
+  // ✅ 현재 성공했던 top 1벌 기준 유지
+  const primary = view === "back" ? "top_back" : "top_front"
+  const fallback = view === "back" ? "top_front" : "top_back"
+  return garments?.[primary] || garments?.[fallback] || ""
+}
+
+function fashnHeaders() {
+  const key = process.env.FASHN_API_KEY
+  if (!key) throw new Error("FASHN_API_KEY missing on server")
+  return {
+    "Content-Type": "application/json",
+    Authorization: `Bearer ${key}`,
+  }
+}
+
+// 안내용
+app.get("/api/dress", (req, res) => {
+  res.json({ ok: true, hint: "Use POST /api/dress or GET /api/dress/:id" })
+})
+
+// 1) 합성 시작
+app.post("/api/dress", async (req, res) => {
+  try {
+    const { view = "front", model, garments = {} } = req.body || {}
+
+    if (!isDataUrl(model)) {
+      return res.status(400).json({
+        error: "model must be a dataUrl (data:image/...)",
+      })
+    }
+
+    const garment = pickGarment(view, garments)
+    if (!isDataUrl(garment)) {
+      return res.status(400).json({
+        error: "garment missing. Need top_front/top_back (dataUrl)",
+      })
+    }
+
+    const body = {
+      model_name: FASHN_MODEL_NAME,
+      inputs: {
+        model_image: model,
+        garment_image: garment,
+      },
+    }
+
+    const r = await fetch(`${FASHN_BASE}/run`, {
+      method: "POST",
+      headers: fashnHeaders(),
+      body: JSON.stringify(body),
+    })
+
+    const text = await r.text()
+    let json = null
+    try {
+      json = JSON.parse(text)
+    } catch {}
+
+    if (!r.ok) {
+      return res.status(r.status).json({
+        error:
+          json?.error ||
+          `FASHN /run failed: HTTP ${r.status} ${text.slice(0, 500)}`,
+      })
+    }
+
+    const predictionId = json?.id
+    if (!predictionId) {
+      return res.status(502).json({
+        error: "FASHN /run returned no id",
+        raw: json,
+      })
+    }
+
+    return res.status(202).json({
+      predictionId,
+      status: json?.status || "starting",
+    })
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message ?? e) })
+  }
+})
+
+// 2) 결과 폴링
+app.get("/api/dress/:id", async (req, res) => {
+  try {
+    const id = req.params.id
+
+    const r = await fetch(`${FASHN_BASE}/status/${id}`, {
+      headers: fashnHeaders(),
+    })
+
+    const text = await r.text()
+    let json = null
+    try {
+      json = JSON.parse(text)
+    } catch {}
+
+    if (!r.ok) {
+      return res.status(r.status).json({
+        error:
+          json?.error ||
+          `FASHN /status failed: HTTP ${r.status} ${text.slice(0, 500)}`,
+      })
+    }
+
+    const status = json?.status
+
+    if (status === "completed") {
+      const output = json?.output
+      const imageUrl = Array.isArray(output)
+        ? output[0]
+        : typeof output === "string"
+          ? output
+          : output?.image || output?.image_url || output?.url
+
+      if (!imageUrl) {
+        return res.status(502).json({
+          error: "No imageUrl in output",
+          raw: json,
+        })
+      }
+
+      return res.json({ predictionId: id, status: "succeeded", imageUrl })
+    }
+
+    if (["starting", "in_queue", "processing"].includes(status)) {
+      return res.status(202).json({ predictionId: id, status })
+    }
+
+    return res.status(500).json({
+      predictionId: id,
+      status,
+      error: json?.error || "prediction failed",
+    })
+  } catch (e) {
+    return res.status(500).json({ error: String(e?.message ?? e) })
   }
 })
 
