@@ -1,6 +1,6 @@
 // server.js
 // ✅ S1: front + pair(front/back) 유지
-// ✅ S3: FASHN /api/dress 복원
+// ✅ S3: FASHN /api/dress 확장 (TOP / BOTTOM / OUTER / ONEPIECE 규칙)
 // ✅ Node 18+
 // ✅ CORS + preflight + credits + idempotent reserve/release 유지
 
@@ -91,8 +91,7 @@ app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) =>
   res.json({
     ok: true,
-    version:
-      "2026-03-08_merged_s1pair_s3dress_fashn_restore",
+    version: "2026-03-10_merged_s1pair_s3dress_rules_top_bottom_outer_onepiece",
     node: process.versions.node,
     config: {
       ENABLE_BODY_LOCK: process.env.ENABLE_BODY_LOCK !== "0",
@@ -1042,11 +1041,66 @@ function isDataUrl(v) {
   return typeof v === "string" && v.startsWith("data:image/")
 }
 
-function pickGarment(view, garments) {
-  // ✅ 현재 성공했던 top 1벌 기준 유지
-  const primary = view === "back" ? "top_back" : "top_front"
-  const fallback = view === "back" ? "top_front" : "top_back"
-  return garments?.[primary] || garments?.[fallback] || ""
+function g(view, garments, name) {
+  const key = `${name}_${view}`
+  return garments?.[key] || ""
+}
+
+function exists(v) {
+  return typeof v === "string" && v.startsWith("data:image/")
+}
+
+// ✅ 베이스 우선순위: ONEPIECE > TOP > BOTTOM > OUTER
+function pickBase(view, garments) {
+  const onepiece = g(view, garments, "onepiece")
+  const top = g(view, garments, "top")
+  const bottom = g(view, garments, "bottom")
+  const outer = g(view, garments, "outer")
+
+  if (exists(onepiece)) return { type: "onepiece", img: onepiece }
+  if (exists(top)) return { type: "top", img: top }
+  if (exists(bottom)) return { type: "bottom", img: bottom }
+  if (exists(outer)) return { type: "outer", img: outer }
+
+  return null
+}
+
+// ✅ 레이어 우선순위: OUTER > TOP > BOTTOM
+function pickLayer(view, garments, baseType) {
+  const top = g(view, garments, "top")
+  const bottom = g(view, garments, "bottom")
+  const outer = g(view, garments, "outer")
+
+  const layers = []
+
+  if (exists(outer) && baseType !== "outer") {
+    layers.push({ type: "outer", img: outer })
+  }
+  if (exists(top) && baseType !== "top") {
+    layers.push({ type: "top", img: top })
+  }
+  if (exists(bottom) && baseType !== "bottom") {
+    layers.push({ type: "bottom", img: bottom })
+  }
+
+  if (layers.length === 0) return null
+  return layers[0]
+}
+
+function resolveSteps(view, garments) {
+  const base = pickBase(view, garments)
+
+  if (!base) {
+    throw new Error("No garment uploaded")
+  }
+
+  const layer = pickLayer(view, garments, base.type)
+  const steps = [base]
+
+  if (layer) steps.push(layer)
+
+  // ✅ v1 최대 2회 합성
+  return steps.slice(0, 2)
 }
 
 function fashnHeaders() {
@@ -1056,6 +1110,90 @@ function fashnHeaders() {
     "Content-Type": "application/json",
     Authorization: `Bearer ${key}`,
   }
+}
+
+function pickOutputImageUrl(output) {
+  return Array.isArray(output)
+    ? output[0]
+    : typeof output === "string"
+      ? output
+      : output?.image || output?.image_url || output?.url
+}
+
+async function runFashnTryOn(modelImage, garmentImage) {
+  const body = {
+    model_name: FASHN_MODEL_NAME,
+    inputs: {
+      model_image: modelImage,
+      garment_image: garmentImage,
+    },
+  }
+
+  const r = await fetch(`${FASHN_BASE}/run`, {
+    method: "POST",
+    headers: fashnHeaders(),
+    body: JSON.stringify(body),
+  })
+
+  const text = await r.text()
+  let json = null
+  try {
+    json = JSON.parse(text)
+  } catch {}
+
+  if (!r.ok) {
+    throw new Error(
+      json?.error || `FASHN /run failed: HTTP ${r.status} ${text.slice(0, 500)}`
+    )
+  }
+
+  const predictionId = json?.id
+  if (!predictionId) {
+    throw new Error("FASHN /run returned no id")
+  }
+
+  return {
+    predictionId,
+    status: json?.status || "starting",
+  }
+}
+
+async function pollFashnPrediction(id) {
+  for (let i = 0; i < 120; i++) {
+    await new Promise((r) => setTimeout(r, 1500))
+
+    const rr = await fetch(`${FASHN_BASE}/status/${id}`, {
+      headers: fashnHeaders(),
+    })
+
+    const text = await rr.text()
+    let json = null
+    try {
+      json = JSON.parse(text)
+    } catch {}
+
+    if (!rr.ok) {
+      throw new Error(
+        json?.error || `FASHN /status failed: HTTP ${rr.status} ${text.slice(0, 500)}`
+      )
+    }
+
+    const status = json?.status
+
+    if (status === "completed") {
+      const imageUrl = pickOutputImageUrl(json?.output)
+      if (!imageUrl) {
+        throw new Error("No imageUrl in output")
+      }
+      return imageUrl
+    }
+
+    if (["failed", "canceled", "cancelled"].includes(String(status || "").toLowerCase())) {
+      throw new Error(json?.error || `prediction ${status}`)
+    }
+  }
+
+  throw new Error("timeout: prediction not finished")
 }
 
 // 안내용
@@ -1074,59 +1212,36 @@ app.post("/api/dress", async (req, res) => {
       })
     }
 
-    const garment = pickGarment(view, garments)
-    if (!isDataUrl(garment)) {
-      return res.status(400).json({
-        error: "garment missing. Need top_front/top_back (dataUrl)",
-      })
+    const steps = resolveSteps(view, garments)
+
+    let currentModel = model
+    const usedSteps = []
+
+    for (const step of steps) {
+      if (!isDataUrl(step.img)) {
+        return res.status(400).json({
+          error: `${step.type}_${view} missing or not dataUrl`,
+        })
+      }
+
+      const run = await runFashnTryOn(currentModel, step.img)
+      const imageUrl = await pollFashnPrediction(run.predictionId)
+
+      currentModel = imageUrl
+      usedSteps.push(step.type)
     }
 
-    const body = {
-      model_name: FASHN_MODEL_NAME,
-      inputs: {
-        model_image: model,
-        garment_image: garment,
-      },
-    }
-
-    const r = await fetch(`${FASHN_BASE}/run`, {
-      method: "POST",
-      headers: fashnHeaders(),
-      body: JSON.stringify(body),
-    })
-
-    const text = await r.text()
-    let json = null
-    try {
-      json = JSON.parse(text)
-    } catch {}
-
-    if (!r.ok) {
-      return res.status(r.status).json({
-        error:
-          json?.error ||
-          `FASHN /run failed: HTTP ${r.status} ${text.slice(0, 500)}`,
-      })
-    }
-
-    const predictionId = json?.id
-    if (!predictionId) {
-      return res.status(502).json({
-        error: "FASHN /run returned no id",
-        raw: json,
-      })
-    }
-
-    return res.status(202).json({
-      predictionId,
-      status: json?.status || "starting",
+    return res.json({
+      status: "succeeded",
+      imageUrl: currentModel,
+      steps: usedSteps,
     })
   } catch (e) {
     return res.status(500).json({ error: String(e?.message ?? e) })
   }
 })
 
-// 2) 결과 폴링
+// 2) 결과 폴링 (기존 Runner 호환용 유지)
 app.get("/api/dress/:id", async (req, res) => {
   try {
     const id = req.params.id
@@ -1152,12 +1267,7 @@ app.get("/api/dress/:id", async (req, res) => {
     const status = json?.status
 
     if (status === "completed") {
-      const output = json?.output
-      const imageUrl = Array.isArray(output)
-        ? output[0]
-        : typeof output === "string"
-          ? output
-          : output?.image || output?.image_url || output?.url
+      const imageUrl = pickOutputImageUrl(json?.output)
 
       if (!imageUrl) {
         return res.status(502).json({
