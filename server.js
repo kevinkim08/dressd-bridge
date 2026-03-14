@@ -1,6 +1,6 @@
 // server.js
 // ✅ S1: front + pair(front/back) 유지
-// ✅ S3: FASHN /api/dress 확장 (TOP / BOTTOM / OUTER / ONEPIECE 규칙)
+// ✅ S3: FASHN /api/dress 확장 (TOP / BOTTOM / OUTER / ONEPIECE + STYLE + AUTOFILL PLAN)
 // ✅ Node 18+
 // ✅ CORS + preflight + credits + idempotent reserve/release 유지
 
@@ -91,7 +91,7 @@ app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) =>
   res.json({
     ok: true,
-    version: "2026-03-10_merged_s1pair_s3dress_rules_top_bottom_outer_onepiece",
+    version: "2026-03-14_s1pair_s3dress_style_autofill_plan_server_synced",
     node: process.versions.node,
     config: {
       ENABLE_BODY_LOCK: process.env.ENABLE_BODY_LOCK !== "0",
@@ -1037,72 +1037,373 @@ app.post("/api/s1/pair", async (req, res) => {
 const FASHN_BASE = "https://api.fashn.ai/v1"
 const FASHN_MODEL_NAME = process.env.FASHN_MODEL_NAME || "tryon-v1.6"
 
+/** ---------- shared helpers ---------- */
 function isDataUrl(v) {
   return typeof v === "string" && v.startsWith("data:image/")
-}
-
-function g(view, garments, name) {
-  const key = `${name}_${view}`
-  return garments?.[key] || ""
 }
 
 function exists(v) {
   return typeof v === "string" && v.startsWith("data:image/")
 }
 
-// ✅ 베이스 우선순위: ONEPIECE > TOP > BOTTOM > OUTER
-function pickBase(view, garments) {
-  const onepiece = g(view, garments, "onepiece")
-  const top = g(view, garments, "top")
-  const bottom = g(view, garments, "bottom")
-  const outer = g(view, garments, "outer")
+function normalizeView(view) {
+  return view === "back" ? "back" : "front"
+}
 
-  if (exists(onepiece)) return { type: "onepiece", img: onepiece }
-  if (exists(top)) return { type: "top", img: top }
-  if (exists(bottom)) return { type: "bottom", img: bottom }
-  if (exists(outer)) return { type: "outer", img: outer }
+function normalizeStyle(style) {
+  const s = String(style || "").toLowerCase().trim()
+  if (s === "street" || s === "minimal" || s === "sport" || s === "casual") return s
+  return "casual"
+}
+
+function titleJoin(parts) {
+  if (!Array.isArray(parts) || parts.length === 0) return "None"
+  return parts.join(" + ")
+}
+
+const GARMENT_ORDER = ["top", "bottom", "outer", "onepiece"]
+const GARMENT_LABEL = {
+  top: "Top",
+  bottom: "Bottom",
+  outer: "Outer",
+  onepiece: "Onepiece",
+}
+const SHOE_LABEL = {
+  chunky_sneakers: "Chunky Sneakers",
+  clean_sneakers: "Clean Sneakers",
+  running_sneakers: "Running Sneakers",
+  canvas_sneakers: "Canvas Sneakers",
+  ankle_boots: "Ankle Boots",
+}
+
+function sortGarments(types) {
+  const set = new Set(Array.isArray(types) ? types : [])
+  return GARMENT_ORDER.filter((k) => set.has(k))
+}
+
+function compact(arr) {
+  return (arr || []).filter(Boolean)
+}
+
+function garmentTypesToText(types) {
+  return titleJoin((types || []).map((t) => GARMENT_LABEL[t] || t))
+}
+
+function autofillPartsToText(parts) {
+  if (!Array.isArray(parts) || parts.length === 0) return "None"
+  return titleJoin(
+    parts.map((p) => {
+      if (p === "shoes") return "Shoes"
+      return GARMENT_LABEL[p] || p
+    })
+  )
+}
+
+function shoesPresetToText(preset) {
+  if (!preset) return "None"
+  return SHOE_LABEL[preset] || String(preset)
+}
+
+function getGarmentUrl(view, garments, name) {
+  const key = `${name}_${view}`
+  return garments?.[key] || ""
+}
+
+function getUploadedPresenceForView(garments, view) {
+  return {
+    top: exists(getGarmentUrl(view, garments, "top")),
+    bottom: exists(getGarmentUrl(view, garments, "bottom")),
+    outer: exists(getGarmentUrl(view, garments, "outer")),
+    onepiece: exists(getGarmentUrl(view, garments, "onepiece")),
+  }
+}
+
+/** ---------- conflict/base/layer ---------- */
+function resolvePresenceConflicts(presence) {
+  const resolved = { ...presence }
+  const ignoredParts = []
+
+  if (resolved.onepiece) {
+    if (resolved.top) {
+      resolved.top = false
+      ignoredParts.push("top")
+    }
+    if (resolved.bottom) {
+      resolved.bottom = false
+      ignoredParts.push("bottom")
+    }
+  }
+
+  return {
+    resolved,
+    ignoredParts: sortGarments(ignoredParts),
+  }
+}
+
+function pickBaseFromResolvedPresence(presence) {
+  if (presence.onepiece) return "onepiece"
+  if (presence.top) return "top"
+  if (presence.bottom) return "bottom"
+  if (presence.outer) return "outer"
+  return null
+}
+
+function pickLayerFromResolvedPresence(presence, base) {
+  if (!base) return null
+
+  if (base !== "outer" && presence.outer) return "outer"
+  if (base !== "top" && presence.top) return "top"
+  if (base !== "bottom" && presence.bottom) return "bottom"
 
   return null
 }
 
-// ✅ 레이어 우선순위: OUTER > TOP > BOTTOM
-function pickLayer(view, garments, baseType) {
-  const top = g(view, garments, "top")
-  const bottom = g(view, garments, "bottom")
-  const outer = g(view, garments, "outer")
+function resolveAutoFillParts({ resolvedPresence, autoCompleteMissing }) {
+  const p = resolvedPresence
+  if (!autoCompleteMissing) return []
 
-  const layers = []
+  if (!p.top && !p.bottom && !p.outer && !p.onepiece) return []
 
-  if (exists(outer) && baseType !== "outer") {
-    layers.push({ type: "outer", img: outer })
-  }
-  if (exists(top) && baseType !== "top") {
-    layers.push({ type: "top", img: top })
-  }
-  if (exists(bottom) && baseType !== "bottom") {
-    layers.push({ type: "bottom", img: bottom })
-  }
+  if (p.onepiece && !p.outer) return ["shoes"]
+  if (p.onepiece && p.outer) return ["shoes"]
 
-  if (layers.length === 0) return null
-  return layers[0]
+  if (p.top && !p.bottom && !p.outer) return ["bottom", "shoes"]
+  if (!p.top && p.bottom && !p.outer) return ["top", "shoes"]
+  if (!p.top && !p.bottom && p.outer) return ["top", "bottom", "shoes"]
+  if (p.top && p.bottom && !p.outer) return ["shoes"]
+  if (p.top && !p.bottom && p.outer) return ["bottom", "shoes"]
+  if (!p.top && p.bottom && p.outer) return ["top", "shoes"]
+  if (p.top && p.bottom && p.outer) return ["shoes"]
+
+  return []
 }
 
-function resolveSteps(view, garments) {
-  const base = pickBase(view, garments)
+function pickShoesPreset({ style, usedGarments, autofillParts }) {
+  if (!(autofillParts || []).includes("shoes")) return null
 
-  if (!base) {
-    throw new Error("No garment uploaded")
+  const isOnepiece = (usedGarments || []).includes("onepiece")
+  const hasOuter = (usedGarments || []).includes("outer")
+
+  if (isOnepiece) {
+    if (style === "street") return hasOuter ? "ankle_boots" : "chunky_sneakers"
+    if (style === "minimal") return "clean_sneakers"
+    if (style === "sport") return "running_sneakers"
+    return "clean_sneakers"
   }
 
-  const layer = pickLayer(view, garments, base.type)
-  const steps = [base]
-
-  if (layer) steps.push(layer)
-
-  // ✅ v1 최대 2회 합성
-  return steps.slice(0, 2)
+  if (style === "street") return hasOuter ? "chunky_sneakers" : "canvas_sneakers"
+  if (style === "minimal") return "clean_sneakers"
+  if (style === "sport") return "running_sneakers"
+  return "canvas_sneakers"
 }
 
+/** ---------- prompt builders ---------- */
+function buildStylePrompt(style) {
+  switch (style) {
+    case "street":
+      return [
+        "style direction: streetwear",
+        "balanced layered silhouette",
+        "urban casual fashion mood",
+        "cohesive matching footwear",
+        "do not alter the uploaded garments unnecessarily",
+      ].join(", ")
+
+    case "minimal":
+      return [
+        "style direction: minimal",
+        "clean refined silhouette",
+        "simple modern outfit balance",
+        "subtle matching footwear",
+        "do not alter the uploaded garments unnecessarily",
+      ].join(", ")
+
+    case "sport":
+      return [
+        "style direction: sporty",
+        "active athletic silhouette",
+        "functional casual outfit balance",
+        "performance-inspired matching footwear",
+        "do not alter the uploaded garments unnecessarily",
+      ].join(", ")
+
+    case "casual":
+    default:
+      return [
+        "style direction: casual",
+        "everyday wearable outfit balance",
+        "natural relaxed silhouette",
+        "simple matching footwear",
+        "do not alter the uploaded garments unnecessarily",
+      ].join(", ")
+  }
+}
+
+function buildAutofillPrompt({ style, autofillParts, shoesPreset }) {
+  const fragments = []
+
+  if ((autofillParts || []).includes("top")) {
+    if (style === "street") {
+      fragments.push(
+        "complete the missing top with a basic oversized or relaxed streetwear-style upper garment"
+      )
+    } else if (style === "minimal") {
+      fragments.push("complete the missing top with a clean simple refined upper garment")
+    } else if (style === "sport") {
+      fragments.push("complete the missing top with an athletic functional upper garment")
+    } else {
+      fragments.push("complete the missing top with a natural everyday upper garment")
+    }
+  }
+
+  if ((autofillParts || []).includes("bottom")) {
+    if (style === "street") {
+      fragments.push(
+        "complete the missing bottom with wide pants, cargo pants, or relaxed streetwear-style bottoms"
+      )
+    } else if (style === "minimal") {
+      fragments.push(
+        "complete the missing bottom with straight clean trousers or simple tailored pants"
+      )
+    } else if (style === "sport") {
+      fragments.push(
+        "complete the missing bottom with jogger pants, track pants, or athletic bottoms"
+      )
+    } else {
+      fragments.push("complete the missing bottom with denim or simple everyday casual pants")
+    }
+  }
+
+  if ((autofillParts || []).includes("shoes") && shoesPreset) {
+    fragments.push(
+      `complete the missing footwear with ${String(SHOE_LABEL[shoesPreset] || shoesPreset).toLowerCase()} that naturally matches the outfit`
+    )
+  }
+
+  return fragments.join(", ")
+}
+
+function buildDressPrompt({ style, autofillParts, shoesPreset, clientPrompt }) {
+  const stylePrompt = buildStylePrompt(style)
+  const autofillPrompt = buildAutofillPrompt({ style, autofillParts, shoesPreset })
+  const parts = [stylePrompt]
+
+  if (autofillPrompt) parts.push(autofillPrompt)
+  if (typeof clientPrompt === "string" && clientPrompt.trim()) {
+    parts.push(clientPrompt.trim())
+  }
+
+  return parts.filter(Boolean).join(", ")
+}
+
+function buildPlanSummary(plan) {
+  const uploadedText = garmentTypesToText(plan.uploaded)
+  const resolvedText = garmentTypesToText(plan.uploadedResolved)
+  const ignoredText = garmentTypesToText(plan.ignoredParts)
+  const baseText = plan.base ? GARMENT_LABEL[plan.base] : "None"
+  const layerText = plan.layer ? GARMENT_LABEL[plan.layer] : "None"
+  const aiFillText = autofillPartsToText(plan.autofillParts)
+  const shoesText = shoesPresetToText(plan.shoesPreset)
+
+  return {
+    uploadedText,
+    resolvedText,
+    ignoredText,
+    baseText,
+    layerText,
+    aiFillText,
+    shoesText,
+    shortLine: [
+      `Uploaded: ${uploadedText}`,
+      `AI Fill: ${aiFillText}`,
+      `Shoes: ${shoesText}`,
+    ].join(" / "),
+  }
+}
+
+function buildOutfitPlanFromGarments({ garments, view, style, autoCompleteMissing, clientPrompt }) {
+  const normalizedView = normalizeView(view)
+  const normalizedStyle = normalizeStyle(style)
+
+  const uploadedPresence = getUploadedPresenceForView(garments, normalizedView)
+
+  const uploaded = sortGarments(
+    compact([
+      uploadedPresence.top ? "top" : null,
+      uploadedPresence.bottom ? "bottom" : null,
+      uploadedPresence.outer ? "outer" : null,
+      uploadedPresence.onepiece ? "onepiece" : null,
+    ])
+  )
+
+  const { resolved, ignoredParts } = resolvePresenceConflicts(uploadedPresence)
+
+  const uploadedResolved = sortGarments(
+    compact([
+      resolved.top ? "top" : null,
+      resolved.bottom ? "bottom" : null,
+      resolved.outer ? "outer" : null,
+      resolved.onepiece ? "onepiece" : null,
+    ])
+  )
+
+  const base = pickBaseFromResolvedPresence(resolved)
+  const layer = pickLayerFromResolvedPresence(resolved, base)
+  const steps = compact([base, layer])
+
+  const autofillParts = resolveAutoFillParts({
+    resolvedPresence: resolved,
+    autoCompleteMissing: Boolean(autoCompleteMissing),
+  })
+
+  const shoesPreset = pickShoesPreset({
+    style: normalizedStyle,
+    usedGarments: steps,
+    autofillParts,
+  })
+
+  const prompt = buildDressPrompt({
+    style: normalizedStyle,
+    autofillParts,
+    shoesPreset,
+    clientPrompt,
+  })
+
+  const plan = {
+    view: normalizedView,
+    style: normalizedStyle,
+    autoCompleteMissing: Boolean(autoCompleteMissing),
+    uploaded,
+    uploadedResolved,
+    ignoredParts,
+    base,
+    layer,
+    steps,
+    autofillParts,
+    shoesPreset,
+    prompt,
+  }
+
+  return {
+    ...plan,
+    summary: buildPlanSummary(plan),
+  }
+}
+
+function pickEffectiveGarmentUrls({ garments, view, plan }) {
+  const out = {}
+  const normalizedView = normalizeView(view)
+
+  for (const type of plan.steps || []) {
+    const key = `${type}_${normalizedView}`
+    const url = garments?.[key]
+    if (exists(url)) out[key] = url
+  }
+
+  return out
+}
+
+/** ---------- FASHN ---------- */
 function fashnHeaders() {
   const key = process.env.FASHN_API_KEY
   if (!key) throw new Error("FASHN_API_KEY missing on server")
@@ -1120,12 +1421,13 @@ function pickOutputImageUrl(output) {
       : output?.image || output?.image_url || output?.url
 }
 
-async function runFashnTryOn(modelImage, garmentImage) {
+async function runFashnTryOn(modelImage, productImage, prompt) {
   const body = {
     model_name: FASHN_MODEL_NAME,
     inputs: {
       model_image: modelImage,
-      garment_image: garmentImage,
+      product_image: productImage,
+      ...(prompt ? { prompt } : {}),
     },
   }
 
@@ -1204,7 +1506,13 @@ app.get("/api/dress", (req, res) => {
 // 1) 합성 시작
 app.post("/api/dress", async (req, res) => {
   try {
-    const { view = "front", model, garments = {} } = req.body || {}
+    const b = req.body || {}
+    const view = normalizeView(b.view || "front")
+    const model = b.model
+    const garments = b.garments || {}
+    const style = normalizeStyle(b.style || "casual")
+    const autoCompleteMissing = Boolean(b.autoCompleteMissing ?? true)
+    const clientPrompt = typeof b.prompt === "string" ? b.prompt : ""
 
     if (!isDataUrl(model)) {
       return res.status(400).json({
@@ -1212,29 +1520,72 @@ app.post("/api/dress", async (req, res) => {
       })
     }
 
-    const steps = resolveSteps(view, garments)
+    const serverPlan = buildOutfitPlanFromGarments({
+      garments,
+      view,
+      style,
+      autoCompleteMissing,
+      clientPrompt,
+    })
+
+    const effectiveGarments = pickEffectiveGarmentUrls({
+      garments,
+      view,
+      plan: serverPlan,
+    })
+
+    if (!serverPlan.base) {
+      return res.status(400).json({
+        error: `No usable garment uploaded for ${view}`,
+        plan: serverPlan,
+      })
+    }
+
+    if (Object.keys(effectiveGarments).length === 0) {
+      return res.status(400).json({
+        error: `No effective garments found for ${view}`,
+        plan: serverPlan,
+      })
+    }
 
     let currentModel = model
     const usedSteps = []
 
-    for (const step of steps) {
-      if (!isDataUrl(step.img)) {
+    for (let i = 0; i < serverPlan.steps.length; i++) {
+      const stepType = serverPlan.steps[i]
+      const stepKey = `${stepType}_${view}`
+      const productImage = effectiveGarments[stepKey]
+
+      if (!isDataUrl(productImage)) {
         return res.status(400).json({
-          error: `${step.type}_${view} missing or not dataUrl`,
+          error: `${stepKey} missing or not dataUrl`,
+          plan: serverPlan,
         })
       }
 
-      const run = await runFashnTryOn(currentModel, step.img)
+      // ✅ step별 prompt는 전체 prompt를 쓰되, layer 단계에서만 조금 더 강하게 전달
+      const stepPrompt =
+        i === 0
+          ? serverPlan.prompt
+          : [serverPlan.prompt, "preserve previous garment fit and layering consistency"]
+              .filter(Boolean)
+              .join(", ")
+
+      const run = await runFashnTryOn(currentModel, productImage, stepPrompt)
       const imageUrl = await pollFashnPrediction(run.predictionId)
 
       currentModel = imageUrl
-      usedSteps.push(step.type)
+      usedSteps.push(stepType)
     }
 
     return res.json({
       status: "succeeded",
       imageUrl: currentModel,
       steps: usedSteps,
+      plan: {
+        ...serverPlan,
+        steps: usedSteps,
+      },
     })
   } catch (e) {
     return res.status(500).json({ error: String(e?.message ?? e) })
