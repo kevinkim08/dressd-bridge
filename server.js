@@ -1032,6 +1032,7 @@ app.post("/api/s1/pair", async (req, res) => {
 })
 
 /**
+/**
  * ============================================================
  * ✅ 7) S3 Dress (FASHN)
  * ============================================================
@@ -1061,6 +1062,10 @@ function normalizeStyle(style) {
 function titleJoin(parts) {
   if (!Array.isArray(parts) || parts.length === 0) return "None"
   return parts.join(" + ")
+}
+
+function safeSlice(v, max = 300) {
+  return String(v || "").replace(/\s+/g, " ").slice(0, max)
 }
 
 const GARMENT_ORDER = ["top", "bottom", "outer", "onepiece"]
@@ -1125,7 +1130,6 @@ function resolvePresenceConflicts(presence) {
   const resolved = { ...presence }
   const ignoredParts = []
 
-  // ✅ onepiece가 있으면 top/bottom보다 우선
   if (resolved.onepiece) {
     if (resolved.top) {
       resolved.top = false
@@ -1378,7 +1382,13 @@ function buildPlanSummary(plan) {
   }
 }
 
-function buildOutfitPlanFromGarments({ garments, view, style, autoCompleteMissing, clientPrompt }) {
+function buildOutfitPlanFromGarments({
+  garments,
+  view,
+  style,
+  autoCompleteMissing,
+  clientPrompt,
+}) {
   const normalizedView = normalizeView(view)
   const normalizedStyle = normalizeStyle(style)
 
@@ -1691,6 +1701,11 @@ app.post("/api/dress", async (req, res) => {
           requestId,
           error: `${stepKey} missing or not dataUrl`,
           plan: serverPlan,
+          debug: {
+            failedStepIndex: i,
+            failedStepType: stepType,
+            failedStepKey: stepKey,
+          },
         })
       }
 
@@ -1711,27 +1726,69 @@ app.post("/api/dress", async (req, res) => {
         productPreview: `dataUrl(${String(productImage).length})`,
       })
 
-      const run = await runFashnTryOn({
-        requestId,
-        stepIndex: i,
-        stepType,
-        modelImage: currentModel,
-        productImage,
-        prompt: stepPrompt,
-      })
+      try {
+        const run = await runFashnTryOn({
+          requestId,
+          stepIndex: i,
+          stepType,
+          modelImage: currentModel,
+          productImage,
+          prompt: stepPrompt,
+        })
 
-      const imageUrl = await pollFashnPrediction(run.predictionId, requestId, stepType)
+        const imageUrl = await pollFashnPrediction(run.predictionId, requestId, stepType)
 
-      currentModel = imageUrl
-      usedSteps.push(stepType)
+        currentModel = imageUrl
+        usedSteps.push(stepType)
 
-      stepDebug.push({
-        stepIndex: i,
-        stepType,
-        predictionId: run.predictionId,
-        outputImageUrl: imageUrl,
-        promptPreview: safeSlice(stepPrompt, 240),
-      })
+        stepDebug.push({
+          stepIndex: i,
+          stepType,
+          stepKey,
+          predictionId: run.predictionId,
+          outputImageUrl: imageUrl,
+          promptPreview: safeSlice(stepPrompt, 240),
+          modelLen: typeof currentModel === "string" ? currentModel.length : 0,
+          productLen: typeof productImage === "string" ? productImage.length : 0,
+        })
+      } catch (stepErr) {
+        console.error(`[${requestId}] /api/dress STEP ERROR`, {
+          stepIndex: i,
+          stepType,
+          stepKey,
+          message: stepErr?.message ?? String(stepErr),
+          promptPreview: safeSlice(stepPrompt, 300),
+          modelPreview: isDataUrl(currentModel)
+            ? `dataUrl(${String(currentModel).length})`
+            : safeSlice(currentModel, 120),
+          productPreview: isDataUrl(productImage)
+            ? `dataUrl(${String(productImage).length})`
+            : safeSlice(productImage, 120),
+        })
+
+        return res.status(500).json({
+          requestId,
+          error: String(stepErr?.message ?? stepErr),
+          plan: {
+            ...serverPlan,
+            steps: usedSteps,
+          },
+          debug: {
+            failedStepIndex: i,
+            failedStepType: stepType,
+            failedStepKey: stepKey,
+            usedSteps,
+            promptPreview: safeSlice(stepPrompt, 300),
+            modelPreview: isDataUrl(currentModel)
+              ? `dataUrl(${String(currentModel).length})`
+              : safeSlice(currentModel, 120),
+            productPreview: isDataUrl(productImage)
+              ? `dataUrl(${String(productImage).length})`
+              : safeSlice(productImage, 120),
+            stepDebug,
+          },
+        })
+      }
     }
 
     return res.json({
@@ -1766,6 +1823,9 @@ app.post("/api/dress", async (req, res) => {
     return res.status(500).json({
       requestId,
       error: String(e?.message ?? e),
+      debug: {
+        bodyKeys: safeKeys(req.body || {}),
+      },
     })
   }
 })
@@ -1819,11 +1879,3 @@ app.get("/api/dress/:id", async (req, res) => {
     return res.status(500).json({ error: String(e?.message ?? e) })
   }
 })
-
-/**
- * ============================================================
- * ✅ Start
- * ============================================================
- */
-const PORT = process.env.PORT || 3000
-app.listen(PORT, () => console.log("Server running on", PORT))
