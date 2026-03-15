@@ -1503,7 +1503,7 @@ async function runFashnTryOn({
     model_name: FASHN_MODEL_NAME,
     inputs: {
       model_image: modelImage,
-      product_image: productImage,
+      garment_image: productImage,
       ...(prompt ? { prompt } : {}),
     },
   }
