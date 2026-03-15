@@ -1,6 +1,6 @@
 // server.js
 // ✅ S1: front + pair(front/back) 유지
-// ✅ S3: FASHN /api/dress 확장 (TOP / BOTTOM / OUTER / ONEPIECE + STYLE + AUTOFILL PLAN)
+// ✅ S3: FASHN /api/dress 확장 (3-layer steps[] + distortion lock + debug 강화)
 // ✅ Node 18+
 // ✅ CORS + preflight + credits + idempotent reserve/release 유지
 
@@ -91,7 +91,7 @@ app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) =>
   res.json({
     ok: true,
-    version: "2026-03-15_s1pair_s3dress_3layer_bottom_top_outer",
+    version: "2026-03-15_s1pair_s3dress_3layer_steps_distortionlock_debug_v2",
     node: process.versions.node,
     config: {
       ENABLE_BODY_LOCK: process.env.ENABLE_BODY_LOCK !== "0",
@@ -366,6 +366,10 @@ function safeKeys(obj) {
   } catch {
     return []
   }
+}
+
+function safeSlice(v, n = 300) {
+  return String(v || "").replace(/\s+/g, " ").slice(0, n)
 }
 
 function withAdultGuard(prompt) {
@@ -742,9 +746,7 @@ async function generateBackCandidates(promptBack, n) {
 
     const out = await runPool(tasks, BACK_CONCURRENCY)
 
-    const ok = out
-      .map((x) => (x && x.__error ? null : x))
-      .filter(Boolean)
+    const ok = out.map((x) => (x && x.__error ? null : x)).filter(Boolean)
 
     collected = collected.concat(ok)
 
@@ -1141,7 +1143,7 @@ function resolvePresenceConflicts(presence) {
   }
 }
 
-// ✅ 왜곡 최소화 기준 3-layer
+// ✅ 3-layer 핵심 규칙
 // - outer는 항상 마지막
 // - onepiece는 top/bottom보다 우선
 // - 일반 조합은 bottom -> top -> outer
@@ -1285,6 +1287,14 @@ function buildAutofillPrompt({ style, autofillParts, shoesPreset }) {
   return fragments.join(", ")
 }
 
+function sanitizeDressPrompt(prompt) {
+  return String(prompt || "")
+    .replace(/\s+/g, " ")
+    .replace(/\s*,\s*/g, ", ")
+    .trim()
+    .slice(0, 1800)
+}
+
 function buildDressPrompt({ style, autofillParts, shoesPreset, clientPrompt }) {
   const stylePrompt = buildStylePrompt(style)
   const autofillPrompt = buildAutofillPrompt({ style, autofillParts, shoesPreset })
@@ -1295,7 +1305,51 @@ function buildDressPrompt({ style, autofillParts, shoesPreset, clientPrompt }) {
     parts.push(clientPrompt.trim())
   }
 
-  return parts.filter(Boolean).join(", ")
+  return sanitizeDressPrompt(parts.filter(Boolean).join(", "))
+}
+
+function buildPreservePrompt(stepType, index, totalSteps) {
+  const common = [
+    "preserve garment shape",
+    "do not alter clothing silhouette",
+    "maintain original garment structure",
+    "maintain realistic layering order",
+    "keep proportions natural",
+    "avoid melting, merging, duplication, or distortion",
+    "preserve previous garment fit and layering consistency",
+  ]
+
+  if (index > 0) {
+    common.push("keep previously applied garments intact")
+    common.push("do not rewrite already worn garments")
+  }
+
+  if (stepType === "outer") {
+    common.push("outerwear must remain the topmost visible layer")
+    common.push("preserve the inner garments under the outerwear")
+  }
+
+  if (stepType === "top") {
+    common.push("preserve lower-body garment silhouette")
+  }
+
+  if (stepType === "bottom") {
+    common.push("preserve upper-body body proportions")
+  }
+
+  if (stepType === "onepiece") {
+    common.push("preserve one-piece garment continuity")
+  }
+
+  common.push(`current step garment type: ${stepType}`)
+  common.push(`layer step ${index + 1} of ${totalSteps}`)
+
+  return sanitizeDressPrompt(common.join(", "))
+}
+
+function makeStepPrompt({ basePrompt, stepType, stepIndex, totalSteps }) {
+  const preserve = buildPreservePrompt(stepType, stepIndex, totalSteps)
+  return sanitizeDressPrompt([basePrompt, preserve].filter(Boolean).join(", "))
 }
 
 function buildPlanSummary(plan) {
@@ -1310,12 +1364,13 @@ function buildPlanSummary(plan) {
     uploadedText,
     resolvedText,
     ignoredText,
-    baseText: stepsText,
-    layerText: stepsText,
+    stepsText,
     aiFillText,
     shoesText,
     shortLine: [
       `Uploaded: ${uploadedText}`,
+      `Resolved: ${resolvedText}`,
+      `Ignored: ${ignoredText}`,
       `Steps: ${stepsText}`,
       `AI Fill: ${aiFillText}`,
       `Shoes: ${shoesText}`,
@@ -1401,6 +1456,19 @@ function pickEffectiveGarmentUrls({ garments, view, plan }) {
   return out
 }
 
+function summarizeEffectiveGarments(effectiveGarments) {
+  const keys = Object.keys(effectiveGarments || {})
+  return {
+    count: keys.length,
+    keys,
+    preview: keys.reduce((acc, k) => {
+      const v = effectiveGarments[k]
+      acc[k] = isDataUrl(v) ? `dataUrl(${String(v).length})` : safeSlice(v, 120)
+      return acc
+    }, {}),
+  }
+}
+
 /** ---------- FASHN ---------- */
 function fashnHeaders() {
   const key = process.env.FASHN_API_KEY
@@ -1419,7 +1487,14 @@ function pickOutputImageUrl(output) {
       : output?.image || output?.image_url || output?.url
 }
 
-async function runFashnTryOn(modelImage, productImage, prompt) {
+async function runFashnTryOn({
+  requestId,
+  stepIndex,
+  stepType,
+  modelImage,
+  productImage,
+  prompt,
+}) {
   const body = {
     model_name: FASHN_MODEL_NAME,
     inputs: {
@@ -1442,13 +1517,35 @@ async function runFashnTryOn(modelImage, productImage, prompt) {
   } catch {}
 
   if (!r.ok) {
+    console.error(`[${requestId}] FASHN /run failed`, {
+      stepIndex,
+      stepType,
+      status: r.status,
+      statusText: r.statusText,
+      promptLen: String(prompt || "").length,
+      promptPreview: safeSlice(prompt, 400),
+      modelPreview: isDataUrl(modelImage)
+        ? `dataUrl(${String(modelImage).length})`
+        : safeSlice(modelImage, 120),
+      productPreview: isDataUrl(productImage)
+        ? `dataUrl(${String(productImage).length})`
+        : safeSlice(productImage, 120),
+      responsePreview: safeSlice(text, 500),
+    })
+
     throw new Error(
-      json?.error || `FASHN /run failed: HTTP ${r.status} ${text.slice(0, 500)}`
+      json?.error ||
+        `FASHN /run failed: step=${stepType} HTTP ${r.status} ${text.slice(0, 500)}`
     )
   }
 
   const predictionId = json?.id
   if (!predictionId) {
+    console.error(`[${requestId}] FASHN /run no id`, {
+      stepIndex,
+      stepType,
+      responsePreview: safeSlice(text, 500),
+    })
     throw new Error("FASHN /run returned no id")
   }
 
@@ -1458,7 +1555,7 @@ async function runFashnTryOn(modelImage, productImage, prompt) {
   }
 }
 
-async function pollFashnPrediction(id) {
+async function pollFashnPrediction(id, requestId, stepType) {
   for (let i = 0; i < 120; i++) {
     await new Promise((r) => setTimeout(r, 1500))
 
@@ -1473,6 +1570,14 @@ async function pollFashnPrediction(id) {
     } catch {}
 
     if (!rr.ok) {
+      console.error(`[${requestId}] FASHN /status failed`, {
+        predictionId: id,
+        stepType,
+        status: rr.status,
+        statusText: rr.statusText,
+        responsePreview: safeSlice(text, 500),
+      })
+
       throw new Error(
         json?.error || `FASHN /status failed: HTTP ${rr.status} ${text.slice(0, 500)}`
       )
@@ -1483,12 +1588,23 @@ async function pollFashnPrediction(id) {
     if (status === "completed") {
       const imageUrl = pickOutputImageUrl(json?.output)
       if (!imageUrl) {
+        console.error(`[${requestId}] FASHN completed but no image`, {
+          predictionId: id,
+          stepType,
+          raw: json,
+        })
         throw new Error("No imageUrl in output")
       }
       return imageUrl
     }
 
     if (["failed", "canceled", "cancelled"].includes(String(status || "").toLowerCase())) {
+      console.error(`[${requestId}] FASHN prediction failed`, {
+        predictionId: id,
+        stepType,
+        status,
+        raw: json,
+      })
       throw new Error(json?.error || `prediction ${status}`)
     }
   }
@@ -1503,6 +1619,8 @@ app.get("/api/dress", (req, res) => {
 
 // 1) 합성 시작
 app.post("/api/dress", async (req, res) => {
+  const requestId = rid()
+
   try {
     const b = req.body || {}
     const view = normalizeView(b.view || "front")
@@ -1514,6 +1632,7 @@ app.post("/api/dress", async (req, res) => {
 
     if (!isDataUrl(model)) {
       return res.status(400).json({
+        requestId,
         error: "model must be a dataUrl (data:image/...)",
       })
     }
@@ -1534,6 +1653,7 @@ app.post("/api/dress", async (req, res) => {
 
     if (!Array.isArray(serverPlan.steps) || serverPlan.steps.length === 0) {
       return res.status(400).json({
+        requestId,
         error: `No usable garment uploaded for ${view}`,
         plan: serverPlan,
       })
@@ -1541,13 +1661,25 @@ app.post("/api/dress", async (req, res) => {
 
     if (Object.keys(effectiveGarments).length === 0) {
       return res.status(400).json({
+        requestId,
         error: `No effective garments found for ${view}`,
         plan: serverPlan,
       })
     }
 
+    console.log(`[${requestId}] /api/dress start`, {
+      view,
+      style,
+      autoCompleteMissing,
+      modelLen: String(model || "").length,
+      planSteps: serverPlan.steps,
+      effectiveGarments: summarizeEffectiveGarments(effectiveGarments),
+      planSummary: serverPlan.summary?.shortLine,
+    })
+
     let currentModel = model
     const usedSteps = []
+    const stepDebug = []
 
     for (let i = 0; i < serverPlan.steps.length; i++) {
       const stepType = serverPlan.steps[i]
@@ -1556,28 +1688,54 @@ app.post("/api/dress", async (req, res) => {
 
       if (!isDataUrl(productImage)) {
         return res.status(400).json({
+          requestId,
           error: `${stepKey} missing or not dataUrl`,
           plan: serverPlan,
         })
       }
 
-      // ✅ 첫 step은 기본 prompt
-      // ✅ 뒤 step은 이전 단계 왜곡 방지
-      const stepPrompt =
-        i === 0
-          ? serverPlan.prompt
-          : [serverPlan.prompt, "preserve previous garment fit and layering consistency"]
-              .filter(Boolean)
-              .join(", ")
+      const stepPrompt = makeStepPrompt({
+        basePrompt: serverPlan.prompt,
+        stepType,
+        stepIndex: i,
+        totalSteps: serverPlan.steps.length,
+      })
 
-      const run = await runFashnTryOn(currentModel, productImage, stepPrompt)
-      const imageUrl = await pollFashnPrediction(run.predictionId)
+      console.log(`[${requestId}] /api/dress step`, {
+        stepIndex: i,
+        stepType,
+        promptLen: stepPrompt.length,
+        modelPreview: isDataUrl(currentModel)
+          ? `dataUrl(${String(currentModel).length})`
+          : safeSlice(currentModel, 120),
+        productPreview: `dataUrl(${String(productImage).length})`,
+      })
+
+      const run = await runFashnTryOn({
+        requestId,
+        stepIndex: i,
+        stepType,
+        modelImage: currentModel,
+        productImage,
+        prompt: stepPrompt,
+      })
+
+      const imageUrl = await pollFashnPrediction(run.predictionId, requestId, stepType)
 
       currentModel = imageUrl
       usedSteps.push(stepType)
+
+      stepDebug.push({
+        stepIndex: i,
+        stepType,
+        predictionId: run.predictionId,
+        outputImageUrl: imageUrl,
+        promptPreview: safeSlice(stepPrompt, 240),
+      })
     }
 
     return res.json({
+      requestId,
       status: "succeeded",
       imageUrl: currentModel,
       steps: usedSteps,
@@ -1585,9 +1743,30 @@ app.post("/api/dress", async (req, res) => {
         ...serverPlan,
         steps: usedSteps,
       },
+      debug: {
+        engine: {
+          view,
+          style,
+          autoCompleteMissing,
+          model: "dataUrl",
+          modelLen: String(model || "").length,
+          garments: Object.keys(effectiveGarments).length,
+          steps: usedSteps.join(" -> "),
+        },
+        steps: stepDebug,
+      },
     })
   } catch (e) {
-    return res.status(500).json({ error: String(e?.message ?? e) })
+    console.error(`[${requestId}] /api/dress ERROR`, {
+      message: e?.message ?? String(e),
+      stack: e?.stack,
+      bodyKeys: safeKeys(req.body || {}),
+    })
+
+    return res.status(500).json({
+      requestId,
+      error: String(e?.message ?? e),
+    })
   }
 })
 
@@ -1608,9 +1787,7 @@ app.get("/api/dress/:id", async (req, res) => {
 
     if (!r.ok) {
       return res.status(r.status).json({
-        error:
-          json?.error ||
-          `FASHN /status failed: HTTP ${r.status} ${text.slice(0, 500)}`,
+        error: json?.error || `FASHN /status failed: HTTP ${r.status} ${text.slice(0, 500)}`,
       })
     }
 
