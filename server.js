@@ -91,7 +91,7 @@ app.get("/", (req, res) => res.send("DRESSD server running"))
 app.get("/health", (req, res) =>
   res.json({
     ok: true,
-    version: "2026-03-14_s1pair_s3dress_style_autofill_plan_server_synced",
+    version: "2026-03-15_s1pair_s3dress_3layer_bottom_top_outer",
     node: process.versions.node,
     config: {
       ENABLE_BODY_LOCK: process.env.ENABLE_BODY_LOCK !== "0",
@@ -1118,11 +1118,12 @@ function getUploadedPresenceForView(garments, view) {
   }
 }
 
-/** ---------- conflict/base/layer ---------- */
+/** ---------- conflict / steps ---------- */
 function resolvePresenceConflicts(presence) {
   const resolved = { ...presence }
   const ignoredParts = []
 
+  // ✅ onepiece가 있으면 top/bottom보다 우선
   if (resolved.onepiece) {
     if (resolved.top) {
       resolved.top = false
@@ -1140,22 +1141,23 @@ function resolvePresenceConflicts(presence) {
   }
 }
 
-function pickBaseFromResolvedPresence(presence) {
-  if (presence.onepiece) return "onepiece"
-  if (presence.top) return "top"
-  if (presence.bottom) return "bottom"
-  if (presence.outer) return "outer"
-  return null
-}
+// ✅ 왜곡 최소화 기준 3-layer
+// - outer는 항상 마지막
+// - onepiece는 top/bottom보다 우선
+// - 일반 조합은 bottom -> top -> outer
+function buildLayerStepsFromResolvedPresence(presence) {
+  const steps = []
 
-function pickLayerFromResolvedPresence(presence, base) {
-  if (!base) return null
+  if (presence.onepiece) {
+    steps.push("onepiece")
+  } else {
+    if (presence.bottom) steps.push("bottom")
+    if (presence.top) steps.push("top")
+  }
 
-  if (base !== "outer" && presence.outer) return "outer"
-  if (base !== "top" && presence.top) return "top"
-  if (base !== "bottom" && presence.bottom) return "bottom"
+  if (presence.outer) steps.push("outer")
 
-  return null
+  return steps
 }
 
 function resolveAutoFillParts({ resolvedPresence, autoCompleteMissing }) {
@@ -1300,21 +1302,21 @@ function buildPlanSummary(plan) {
   const uploadedText = garmentTypesToText(plan.uploaded)
   const resolvedText = garmentTypesToText(plan.uploadedResolved)
   const ignoredText = garmentTypesToText(plan.ignoredParts)
-  const baseText = plan.base ? GARMENT_LABEL[plan.base] : "None"
-  const layerText = plan.layer ? GARMENT_LABEL[plan.layer] : "None"
   const aiFillText = autofillPartsToText(plan.autofillParts)
   const shoesText = shoesPresetToText(plan.shoesPreset)
+  const stepsText = garmentTypesToText(plan.steps)
 
   return {
     uploadedText,
     resolvedText,
     ignoredText,
-    baseText,
-    layerText,
+    baseText: stepsText,
+    layerText: stepsText,
     aiFillText,
     shoesText,
     shortLine: [
       `Uploaded: ${uploadedText}`,
+      `Steps: ${stepsText}`,
       `AI Fill: ${aiFillText}`,
       `Shoes: ${shoesText}`,
     ].join(" / "),
@@ -1347,9 +1349,7 @@ function buildOutfitPlanFromGarments({ garments, view, style, autoCompleteMissin
     ])
   )
 
-  const base = pickBaseFromResolvedPresence(resolved)
-  const layer = pickLayerFromResolvedPresence(resolved, base)
-  const steps = compact([base, layer])
+  const steps = buildLayerStepsFromResolvedPresence(resolved)
 
   const autofillParts = resolveAutoFillParts({
     resolvedPresence: resolved,
@@ -1376,8 +1376,6 @@ function buildOutfitPlanFromGarments({ garments, view, style, autoCompleteMissin
     uploaded,
     uploadedResolved,
     ignoredParts,
-    base,
-    layer,
     steps,
     autofillParts,
     shoesPreset,
@@ -1534,7 +1532,7 @@ app.post("/api/dress", async (req, res) => {
       plan: serverPlan,
     })
 
-    if (!serverPlan.base) {
+    if (!Array.isArray(serverPlan.steps) || serverPlan.steps.length === 0) {
       return res.status(400).json({
         error: `No usable garment uploaded for ${view}`,
         plan: serverPlan,
@@ -1563,7 +1561,8 @@ app.post("/api/dress", async (req, res) => {
         })
       }
 
-      // ✅ step별 prompt는 전체 prompt를 쓰되, layer 단계에서만 조금 더 강하게 전달
+      // ✅ 첫 step은 기본 prompt
+      // ✅ 뒤 step은 이전 단계 왜곡 방지
       const stepPrompt =
         i === 0
           ? serverPlan.prompt
