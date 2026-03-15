@@ -1241,44 +1241,99 @@ function buildStylePrompt(style) {
 function buildAutofillPrompt({ style, autofillParts, shoesPreset }) {
   const fragments = []
 
-  if ((autofillParts || []).includes("top")) {
+  const needsTop = (autofillParts || []).includes("top")
+  const needsBottom = (autofillParts || []).includes("bottom")
+  const needsShoes = (autofillParts || []).includes("shoes")
+
+  // ✅ 1) 특수 규칙: TOP만 업로드된 경우
+  // 하의+신발을 한 세트처럼 강하게 고정
+  if (needsBottom && needsShoes) {
+    if (style === "minimal") {
+      fragments.push(
+        "complete the outfit with full-length straight trousers, tailored slacks, or wide-leg pants and visible clean sneakers"
+      )
+      fragments.push(
+        "no skirt, no mini skirt, no shorts, no bare feet"
+      )
+    } else if (style === "street") {
+      fragments.push(
+        "complete the outfit with relaxed straight pants, cargo pants, or wide-leg streetwear pants and visible sneakers"
+      )
+      fragments.push(
+        "no skirt, no mini skirt, no shorts, no bare feet"
+      )
+    } else if (style === "sport") {
+      fragments.push(
+        "complete the outfit with full-length athletic pants, track pants, or clean jogger pants and visible running sneakers"
+      )
+      fragments.push(
+        "no skirt, no mini skirt, no shorts, no bare feet"
+      )
+    } else {
+      fragments.push(
+        "complete the outfit with full-length everyday pants, straight trousers, or relaxed casual pants and visible sneakers"
+      )
+      fragments.push(
+        "no mini skirt, no shorts, no bare feet"
+      )
+    }
+  }
+
+  // ✅ 2) top만 따로 필요한 경우
+  if (needsTop && !needsBottom) {
     if (style === "street") {
       fragments.push(
         "complete the missing top with a basic oversized or relaxed streetwear-style upper garment"
       )
     } else if (style === "minimal") {
-      fragments.push("complete the missing top with a clean simple refined upper garment")
+      fragments.push(
+        "complete the missing top with a clean simple refined upper garment"
+      )
     } else if (style === "sport") {
-      fragments.push("complete the missing top with an athletic functional upper garment")
+      fragments.push(
+        "complete the missing top with an athletic functional upper garment"
+      )
     } else {
-      fragments.push("complete the missing top with a natural everyday upper garment")
+      fragments.push(
+        "complete the missing top with a natural everyday upper garment"
+      )
     }
   }
 
-  if ((autofillParts || []).includes("bottom")) {
+  // ✅ 3) bottom만 따로 필요한 경우
+  if (needsBottom && !needsShoes) {
     if (style === "street") {
       fragments.push(
-        "complete the missing bottom with wide pants, cargo pants, or relaxed streetwear-style bottoms"
+        "complete the missing bottom with relaxed straight pants, cargo pants, or wide-leg streetwear pants"
       )
+      fragments.push("no skirt, no mini skirt, no shorts")
     } else if (style === "minimal") {
       fragments.push(
-        "complete the missing bottom with straight clean trousers or simple tailored pants"
+        "complete the missing bottom with full-length straight trousers, tailored slacks, or wide-leg pants"
       )
+      fragments.push("no skirt, no mini skirt, no shorts")
     } else if (style === "sport") {
       fragments.push(
-        "complete the missing bottom with jogger pants, track pants, or athletic bottoms"
+        "complete the missing bottom with full-length athletic pants, track pants, or clean jogger pants"
       )
+      fragments.push("no skirt, no mini skirt")
     } else {
-      fragments.push("complete the missing bottom with denim or simple everyday casual pants")
+      fragments.push(
+        "complete the missing bottom with full-length everyday pants, straight trousers, or relaxed casual pants"
+      )
+      fragments.push("no mini skirt, no shorts")
     }
   }
 
-  if ((autofillParts || []).includes("shoes") && shoesPreset) {
+  // ✅ 4) shoes 생성 강화
+  if (needsShoes && shoesPreset) {
     fragments.push(
-      `complete the missing footwear with ${String(
+      `complete the missing footwear with visible ${String(
         SHOE_LABEL[shoesPreset] || shoesPreset
       ).toLowerCase()} that naturally matches the outfit`
     )
+    fragments.push("no bare feet")
+    fragments.push("feet must be fully covered by shoes")
   }
 
   return fragments.join(", ")
