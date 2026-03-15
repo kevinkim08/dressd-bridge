@@ -1284,7 +1284,9 @@ function buildAutofillPrompt({ style, autofillParts, shoesPreset }) {
 
   if ((autofillParts || []).includes("shoes") && shoesPreset) {
     fragments.push(
-      `complete the missing footwear with ${String(SHOE_LABEL[shoesPreset] || shoesPreset).toLowerCase()} that naturally matches the outfit`
+      `complete the missing footwear with ${String(
+        SHOE_LABEL[shoesPreset] || shoesPreset
+      ).toLowerCase()} that naturally matches the outfit`
     )
   }
 
@@ -1705,6 +1707,7 @@ app.post("/api/dress", async (req, res) => {
             failedStepIndex: i,
             failedStepType: stepType,
             failedStepKey: stepKey,
+            usedSteps,
           },
         })
       }
@@ -1719,11 +1722,14 @@ app.post("/api/dress", async (req, res) => {
       console.log(`[${requestId}] /api/dress step`, {
         stepIndex: i,
         stepType,
+        stepKey,
         promptLen: stepPrompt.length,
         modelPreview: isDataUrl(currentModel)
           ? `dataUrl(${String(currentModel).length})`
-          : safeSlice(currentModel, 120),
-        productPreview: `dataUrl(${String(productImage).length})`,
+          : String(currentModel || "").slice(0, 120),
+        productPreview: isDataUrl(productImage)
+          ? `dataUrl(${String(productImage).length})`
+          : String(productImage || "").slice(0, 120),
       })
 
       try {
@@ -1736,7 +1742,11 @@ app.post("/api/dress", async (req, res) => {
           prompt: stepPrompt,
         })
 
-        const imageUrl = await pollFashnPrediction(run.predictionId, requestId, stepType)
+        const imageUrl = await pollFashnPrediction(
+          run.predictionId,
+          requestId,
+          stepType
+        )
 
         currentModel = imageUrl
         usedSteps.push(stepType)
@@ -1747,28 +1757,30 @@ app.post("/api/dress", async (req, res) => {
           stepKey,
           predictionId: run.predictionId,
           outputImageUrl: imageUrl,
-          promptPreview: safeSlice(stepPrompt, 240),
+          promptPreview: String(stepPrompt || "").slice(0, 240),
           modelLen: typeof currentModel === "string" ? currentModel.length : 0,
           productLen: typeof productImage === "string" ? productImage.length : 0,
         })
       } catch (stepErr) {
+        const stepMessage = String(stepErr?.message ?? stepErr)
+
         console.error(`[${requestId}] /api/dress STEP ERROR`, {
           stepIndex: i,
           stepType,
           stepKey,
-          message: stepErr?.message ?? String(stepErr),
-          promptPreview: safeSlice(stepPrompt, 300),
+          message: stepMessage,
+          promptPreview: String(stepPrompt || "").slice(0, 300),
           modelPreview: isDataUrl(currentModel)
             ? `dataUrl(${String(currentModel).length})`
-            : safeSlice(currentModel, 120),
+            : String(currentModel || "").slice(0, 120),
           productPreview: isDataUrl(productImage)
             ? `dataUrl(${String(productImage).length})`
-            : safeSlice(productImage, 120),
+            : String(productImage || "").slice(0, 120),
         })
 
         return res.status(500).json({
           requestId,
-          error: String(stepErr?.message ?? stepErr),
+          error: stepMessage,
           plan: {
             ...serverPlan,
             steps: usedSteps,
@@ -1778,13 +1790,13 @@ app.post("/api/dress", async (req, res) => {
             failedStepType: stepType,
             failedStepKey: stepKey,
             usedSteps,
-            promptPreview: safeSlice(stepPrompt, 300),
+            promptPreview: String(stepPrompt || "").slice(0, 300),
             modelPreview: isDataUrl(currentModel)
               ? `dataUrl(${String(currentModel).length})`
-              : safeSlice(currentModel, 120),
+              : String(currentModel || "").slice(0, 120),
             productPreview: isDataUrl(productImage)
               ? `dataUrl(${String(productImage).length})`
-              : safeSlice(productImage, 120),
+              : String(productImage || "").slice(0, 120),
             stepDebug,
           },
         })
