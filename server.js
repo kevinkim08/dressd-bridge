@@ -1345,8 +1345,9 @@ function buildPreservePrompt(stepType, index, totalSteps) {
 }
 
 function makeStepPrompt({ basePrompt, stepType, stepIndex, totalSteps }) {
-  const preserve = buildPreservePrompt(stepType, stepIndex, totalSteps)
-  return sanitizeDressPrompt([basePrompt, preserve].filter(Boolean).join(", "))
+  // ✅ 1차 테스트: FASHN BadRequest 원인 분리용
+  // prompt를 거의 비워서 보내봄
+  return ""
 }
 
 function buildPlanSummary(plan) {
@@ -1631,7 +1632,7 @@ app.post("/api/dress", async (req, res) => {
     const garments = b.garments || {}
     const style = normalizeStyle(b.style || "casual")
     const autoCompleteMissing = Boolean(b.autoCompleteMissing ?? true)
-    const clientPrompt = typeof b.prompt === "string" ? b.prompt : ""
+    const clientPrompt = ""
 
     if (!isDataUrl(model)) {
       return res.status(400).json({
