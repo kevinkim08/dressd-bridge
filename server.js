@@ -1032,7 +1032,6 @@ app.post("/api/s1/pair", async (req, res) => {
 })
 
 /**
-/**
  * ============================================================
  * ✅ 7) S3 Dress (FASHN)
  * ============================================================
@@ -1062,10 +1061,6 @@ function normalizeStyle(style) {
 function titleJoin(parts) {
   if (!Array.isArray(parts) || parts.length === 0) return "None"
   return parts.join(" + ")
-}
-
-function safeSlice(v, max = 300) {
-  return String(v || "").replace(/\s+/g, " ").slice(0, max)
 }
 
 const GARMENT_ORDER = ["top", "bottom", "outer", "onepiece"]
@@ -1147,10 +1142,6 @@ function resolvePresenceConflicts(presence) {
   }
 }
 
-// ✅ 3-layer 핵심 규칙
-// - outer는 항상 마지막
-// - onepiece는 top/bottom보다 우선
-// - 일반 조합은 bottom -> top -> outer
 function buildLayerStepsFromResolvedPresence(presence) {
   const steps = []
 
@@ -1891,3 +1882,11 @@ app.get("/api/dress/:id", async (req, res) => {
     return res.status(500).json({ error: String(e?.message ?? e) })
   }
 })
+
+/**
+ * ============================================================
+ * ✅ Start
+ * ============================================================
+ */
+const PORT = process.env.PORT || 3000
+app.listen(PORT, () => console.log("Server running on", PORT))
