@@ -1277,11 +1277,13 @@ async function runFashnTryOn({
   stepType,
   modelImage,
   productImage,
+  prompt,
 }) {
   const body = {
     // 1차 최소 payload 테스트
     model_image: modelImage,
     garment_image: productImage,
+    prompt: prompt, // ✅ 추가
   }
 
   console.log("🔥 FASHN REQUEST BODY:", {
@@ -1512,6 +1514,7 @@ app.post("/api/dress", async (req, res) => {
           stepType,
           modelImage: currentModel,
           productImage,
+          prompt: stepPrompt, // ✅ 핵심
       })
 
         const imageUrl = await pollFashnPrediction(
