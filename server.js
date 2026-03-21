@@ -1282,8 +1282,8 @@ async function runFashnTryOn({
 }) {
   const body = {
     model_name: FASHN_MODEL_NAME,
-    model: modelImage,
-    garment: productImage,
+    model_image: modelImage,
+    garment_image: productImage,
     ...(prompt ? { prompt } : {}),
     ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
   }
