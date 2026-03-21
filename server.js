@@ -1033,7 +1033,7 @@ app.post("/api/s1/pair", async (req, res) => {
 
 /**
  * ============================================================
- * ✅ 7) S3 Dress (FASHN)
+ * ✅ 7) S3 Dress (FASHN) - preserve only
  * ============================================================
  */
 const FASHN_BASE = "https://api.fashn.ai/v1"
@@ -1049,13 +1049,7 @@ function exists(v) {
 }
 
 function normalizeView(view) {
-  return view === "back" ? "back" : "front"
-}
-
-function normalizeStyle(style) {
-  const s = String(style || "").toLowerCase().trim()
-  if (s === "street" || s === "minimal" || s === "sport" || s === "casual") return s
-  return "casual"
+  return String(view || "").toLowerCase() === "back" ? "back" : "front"
 }
 
 function titleJoin(parts) {
@@ -1063,19 +1057,12 @@ function titleJoin(parts) {
   return parts.join(" + ")
 }
 
-const GARMENT_ORDER = ["top", "bottom", "outer", "onepiece"]
+const GARMENT_ORDER = ["bottom", "top", "dress", "outer"]
 const GARMENT_LABEL = {
   top: "Top",
   bottom: "Bottom",
   outer: "Outer",
-  onepiece: "Onepiece",
-}
-const SHOE_LABEL = {
-  chunky_sneakers: "Chunky Sneakers",
-  clean_sneakers: "Clean Sneakers",
-  running_sneakers: "Running Sneakers",
-  canvas_sneakers: "Canvas Sneakers",
-  ankle_boots: "Ankle Boots",
+  dress: "Dress",
 }
 
 function sortGarments(types) {
@@ -1091,32 +1078,21 @@ function garmentTypesToText(types) {
   return titleJoin((types || []).map((t) => GARMENT_LABEL[t] || t))
 }
 
-function autofillPartsToText(parts) {
-  if (!Array.isArray(parts) || parts.length === 0) return "None"
-  return titleJoin(
-    parts.map((p) => {
-      if (p === "shoes") return "Shoes"
-      return GARMENT_LABEL[p] || p
-    })
-  )
-}
-
-function shoesPresetToText(preset) {
-  if (!preset) return "None"
-  return SHOE_LABEL[preset] || String(preset)
-}
-
 function getGarmentUrl(view, garments, name) {
   const key = `${name}_${view}`
   return garments?.[key] || ""
 }
 
 function getUploadedPresenceForView(garments, view) {
+  const dressUrl =
+    getGarmentUrl(view, garments, "dress") ||
+    getGarmentUrl(view, garments, "onepiece")
+
   return {
     top: exists(getGarmentUrl(view, garments, "top")),
     bottom: exists(getGarmentUrl(view, garments, "bottom")),
     outer: exists(getGarmentUrl(view, garments, "outer")),
-    onepiece: exists(getGarmentUrl(view, garments, "onepiece")),
+    dress: exists(dressUrl),
   }
 }
 
@@ -1125,7 +1101,7 @@ function resolvePresenceConflicts(presence) {
   const resolved = { ...presence }
   const ignoredParts = []
 
-  if (resolved.onepiece) {
+  if (resolved.dress) {
     if (resolved.top) {
       resolved.top = false
       ignoredParts.push("top")
@@ -1145,8 +1121,8 @@ function resolvePresenceConflicts(presence) {
 function buildLayerStepsFromResolvedPresence(presence) {
   const steps = []
 
-  if (presence.onepiece) {
-    steps.push("onepiece")
+  if (presence.dress) {
+    steps.push("dress")
   } else {
     if (presence.bottom) steps.push("bottom")
     if (presence.top) steps.push("top")
@@ -1157,260 +1133,10 @@ function buildLayerStepsFromResolvedPresence(presence) {
   return steps
 }
 
-function resolveAutoFillParts({ resolvedPresence, autoCompleteMissing }) {
-  const p = resolvedPresence
-  if (!autoCompleteMissing) return []
-
-  if (!p.top && !p.bottom && !p.outer && !p.onepiece) return []
-
-  if (p.onepiece && !p.outer) return ["shoes"]
-  if (p.onepiece && p.outer) return ["shoes"]
-
-  if (p.top && !p.bottom && !p.outer) return ["bottom", "shoes"]
-  if (!p.top && p.bottom && !p.outer) return ["top", "shoes"]
-  if (!p.top && !p.bottom && p.outer) return ["top", "bottom", "shoes"]
-  if (p.top && p.bottom && !p.outer) return ["shoes"]
-  if (p.top && !p.bottom && p.outer) return ["bottom", "shoes"]
-  if (!p.top && p.bottom && p.outer) return ["top", "shoes"]
-  if (p.top && p.bottom && p.outer) return ["shoes"]
-
-  return []
-}
-
-function pickShoesPreset({ style, usedGarments, autofillParts }) {
-  if (!(autofillParts || []).includes("shoes")) return null
-
-  const isOnepiece = (usedGarments || []).includes("onepiece")
-  const hasOuter = (usedGarments || []).includes("outer")
-
-  if (isOnepiece) {
-    if (style === "street") return hasOuter ? "ankle_boots" : "chunky_sneakers"
-    if (style === "minimal") return "clean_sneakers"
-    if (style === "sport") return "running_sneakers"
-    return "clean_sneakers"
-  }
-
-  if (style === "street") return hasOuter ? "chunky_sneakers" : "canvas_sneakers"
-  if (style === "minimal") return "clean_sneakers"
-  if (style === "sport") return "running_sneakers"
-  return "canvas_sneakers"
-}
-
-/** ---------- prompt builders ---------- */
-function buildStylePrompt(style) {
-  switch (style) {
-    case "street":
-      return [
-        "style direction: streetwear",
-        "balanced layered silhouette",
-        "urban casual fashion mood",
-        "cohesive matching footwear",
-        "do not alter the uploaded garments unnecessarily",
-      ].join(", ")
-
-    case "minimal":
-      return [
-        "style direction: minimal",
-        "clean refined silhouette",
-        "simple modern outfit balance",
-        "subtle matching footwear",
-        "do not alter the uploaded garments unnecessarily",
-      ].join(", ")
-
-    case "sport":
-      return [
-        "style direction: sporty",
-        "active athletic silhouette",
-        "functional casual outfit balance",
-        "performance-inspired matching footwear",
-        "do not alter the uploaded garments unnecessarily",
-      ].join(", ")
-
-    case "casual":
-    default:
-      return [
-        "style direction: casual",
-        "everyday wearable outfit balance",
-        "natural relaxed silhouette",
-        "simple matching footwear",
-        "do not alter the uploaded garments unnecessarily",
-      ].join(", ")
-  }
-}
-
-function buildAutofillPrompt({ style, autofillParts, shoesPreset }) {
-  const fragments = []
-
-  const needsTop = (autofillParts || []).includes("top")
-  const needsBottom = (autofillParts || []).includes("bottom")
-  const needsShoes = (autofillParts || []).includes("shoes")
-
-  // ✅ 1) 특수 규칙: TOP만 업로드된 경우
-  // 하의+신발을 한 세트처럼 강하게 고정
-  if (needsBottom && needsShoes) {
-    if (style === "minimal") {
-      fragments.push(
-        "complete the outfit with full-length straight trousers, tailored slacks, or wide-leg pants and visible clean sneakers"
-      )
-      fragments.push(
-        "no skirt, no mini skirt, no shorts, no bare feet"
-      )
-    } else if (style === "street") {
-      fragments.push(
-        "complete the outfit with relaxed straight pants, cargo pants, or wide-leg streetwear pants and visible sneakers"
-      )
-      fragments.push(
-        "no skirt, no mini skirt, no shorts, no bare feet"
-      )
-    } else if (style === "sport") {
-      fragments.push(
-        "complete the outfit with full-length athletic pants, track pants, or clean jogger pants and visible running sneakers"
-      )
-      fragments.push(
-        "no skirt, no mini skirt, no shorts, no bare feet"
-      )
-    } else {
-      fragments.push(
-        "complete the outfit with full-length everyday pants, straight trousers, or relaxed casual pants and visible sneakers"
-      )
-      fragments.push(
-        "no mini skirt, no shorts, no bare feet"
-      )
-    }
-  }
-
-  // ✅ 2) top만 따로 필요한 경우
-  if (needsTop && !needsBottom) {
-    if (style === "street") {
-      fragments.push(
-        "complete the missing top with a basic oversized or relaxed streetwear-style upper garment"
-      )
-    } else if (style === "minimal") {
-      fragments.push(
-        "complete the missing top with a clean simple refined upper garment"
-      )
-    } else if (style === "sport") {
-      fragments.push(
-        "complete the missing top with an athletic functional upper garment"
-      )
-    } else {
-      fragments.push(
-        "complete the missing top with a natural everyday upper garment"
-      )
-    }
-  }
-
-  // ✅ 3) bottom만 따로 필요한 경우
-  if (needsBottom && !needsShoes) {
-    if (style === "street") {
-      fragments.push(
-        "complete the missing bottom with relaxed straight pants, cargo pants, or wide-leg streetwear pants"
-      )
-      fragments.push("no skirt, no mini skirt, no shorts")
-    } else if (style === "minimal") {
-      fragments.push(
-        "complete the missing bottom with full-length straight trousers, tailored slacks, or wide-leg pants"
-      )
-      fragments.push("no skirt, no mini skirt, no shorts")
-    } else if (style === "sport") {
-      fragments.push(
-        "complete the missing bottom with full-length athletic pants, track pants, or clean jogger pants"
-      )
-      fragments.push("no skirt, no mini skirt")
-    } else {
-      fragments.push(
-        "complete the missing bottom with full-length everyday pants, straight trousers, or relaxed casual pants"
-      )
-      fragments.push("no mini skirt, no shorts")
-    }
-  }
-
-  // ✅ 4) shoes 생성 강화
-  if (needsShoes && shoesPreset) {
-    fragments.push(
-      `complete the missing footwear with visible ${String(
-        SHOE_LABEL[shoesPreset] || shoesPreset
-      ).toLowerCase()} that naturally matches the outfit`
-    )
-    fragments.push("no bare feet")
-    fragments.push("feet must be fully covered by shoes")
-  }
-
-  return fragments.join(", ")
-}
-
-function sanitizeDressPrompt(prompt) {
-  return String(prompt || "")
-    .replace(/\s+/g, " ")
-    .replace(/\s*,\s*/g, ", ")
-    .trim()
-    .slice(0, 1800)
-}
-
-function buildDressPrompt({ style, autofillParts, shoesPreset, clientPrompt }) {
-  const stylePrompt = buildStylePrompt(style)
-  const autofillPrompt = buildAutofillPrompt({ style, autofillParts, shoesPreset })
-  const parts = [stylePrompt]
-
-  if (autofillPrompt) parts.push(autofillPrompt)
-  if (typeof clientPrompt === "string" && clientPrompt.trim()) {
-    parts.push(clientPrompt.trim())
-  }
-
-  return sanitizeDressPrompt(parts.filter(Boolean).join(", "))
-}
-
-function buildPreservePrompt(stepType, index, totalSteps) {
-  const common = [
-    "preserve garment shape",
-    "do not alter clothing silhouette",
-    "maintain original garment structure",
-    "maintain realistic layering order",
-    "keep proportions natural",
-    "avoid melting, merging, duplication, or distortion",
-    "preserve previous garment fit and layering consistency",
-  ]
-
-  if (index > 0) {
-    common.push("keep previously applied garments intact")
-    common.push("do not rewrite already worn garments")
-  }
-
-  if (stepType === "outer") {
-    common.push("outerwear must remain the topmost visible layer")
-    common.push("preserve the inner garments under the outerwear")
-  }
-
-  if (stepType === "top") {
-    common.push("preserve lower-body garment silhouette")
-  }
-
-  if (stepType === "bottom") {
-    common.push("preserve upper-body body proportions")
-  }
-
-  if (stepType === "onepiece") {
-    common.push("preserve one-piece garment continuity")
-  }
-
-  common.push(`current step garment type: ${stepType}`)
-  common.push(`layer step ${index + 1} of ${totalSteps}`)
-
-  return sanitizeDressPrompt(common.join(", "))
-}
-
-function makeStepPrompt({ basePrompt, stepType, stepIndex, totalSteps }) {
-  // ✅ 1차 테스트: FASHN BadRequest 원인 분리용
-  // prompt를 거의 비워서 보내봄
-  return ""
-}
-
 function buildPlanSummary(plan) {
   const uploadedText = garmentTypesToText(plan.uploaded)
   const resolvedText = garmentTypesToText(plan.uploadedResolved)
   const ignoredText = garmentTypesToText(plan.ignoredParts)
-  const aiFillText = autofillPartsToText(plan.autofillParts)
-  const shoesText = shoesPresetToText(plan.shoesPreset)
   const stepsText = garmentTypesToText(plan.steps)
 
   return {
@@ -1418,37 +1144,25 @@ function buildPlanSummary(plan) {
     resolvedText,
     ignoredText,
     stepsText,
-    aiFillText,
-    shoesText,
     shortLine: [
       `Uploaded: ${uploadedText}`,
       `Resolved: ${resolvedText}`,
       `Ignored: ${ignoredText}`,
       `Steps: ${stepsText}`,
-      `AI Fill: ${aiFillText}`,
-      `Shoes: ${shoesText}`,
     ].join(" / "),
   }
 }
 
-function buildOutfitPlanFromGarments({
-  garments,
-  view,
-  style,
-  autoCompleteMissing,
-  clientPrompt,
-}) {
+function buildOutfitPlanFromGarments({ garments, view }) {
   const normalizedView = normalizeView(view)
-  const normalizedStyle = normalizeStyle(style)
-
   const uploadedPresence = getUploadedPresenceForView(garments, normalizedView)
 
   const uploaded = sortGarments(
     compact([
-      uploadedPresence.top ? "top" : null,
       uploadedPresence.bottom ? "bottom" : null,
+      uploadedPresence.top ? "top" : null,
+      uploadedPresence.dress ? "dress" : null,
       uploadedPresence.outer ? "outer" : null,
-      uploadedPresence.onepiece ? "onepiece" : null,
     ])
   )
 
@@ -1456,44 +1170,21 @@ function buildOutfitPlanFromGarments({
 
   const uploadedResolved = sortGarments(
     compact([
-      resolved.top ? "top" : null,
       resolved.bottom ? "bottom" : null,
+      resolved.top ? "top" : null,
+      resolved.dress ? "dress" : null,
       resolved.outer ? "outer" : null,
-      resolved.onepiece ? "onepiece" : null,
     ])
   )
 
   const steps = buildLayerStepsFromResolvedPresence(resolved)
 
-  const autofillParts = resolveAutoFillParts({
-    resolvedPresence: resolved,
-    autoCompleteMissing: Boolean(autoCompleteMissing),
-  })
-
-  const shoesPreset = pickShoesPreset({
-    style: normalizedStyle,
-    usedGarments: steps,
-    autofillParts,
-  })
-
-  const prompt = buildDressPrompt({
-    style: normalizedStyle,
-    autofillParts,
-    shoesPreset,
-    clientPrompt,
-  })
-
   const plan = {
     view: normalizedView,
-    style: normalizedStyle,
-    autoCompleteMissing: Boolean(autoCompleteMissing),
     uploaded,
     uploadedResolved,
     ignoredParts,
     steps,
-    autofillParts,
-    shoesPreset,
-    prompt,
   }
 
   return {
@@ -1508,6 +1199,15 @@ function pickEffectiveGarmentUrls({ garments, view, plan }) {
 
   for (const type of plan.steps || []) {
     const key = `${type}_${normalizedView}`
+
+    if (type === "dress") {
+      const url =
+        garments?.[`dress_${normalizedView}`] ||
+        garments?.[`onepiece_${normalizedView}`]
+      if (exists(url)) out[key] = url
+      continue
+    }
+
     const url = garments?.[key]
     if (exists(url)) out[key] = url
   }
@@ -1526,6 +1226,31 @@ function summarizeEffectiveGarments(effectiveGarments) {
       return acc
     }, {}),
   }
+}
+
+/** ---------- prompt ---------- */
+function sanitizeDressPrompt(prompt) {
+  return String(prompt || "")
+    .replace(/\s+/g, " ")
+    .replace(/\s*,\s*/g, ", ")
+    .replace(/^,\s*|\s*,$/g, "")
+    .trim()
+    .slice(0, 2000)
+}
+
+function makeStepPrompt({ basePrompt, stepType, stepIndex, totalSteps }) {
+  const stepHints = []
+
+  if (stepType === "top") stepHints.push("upper-body garment fitting")
+  if (stepType === "bottom") stepHints.push("lower-body garment fitting")
+  if (stepType === "dress") stepHints.push("one-piece garment fitting")
+  if (stepType === "outer") stepHints.push("outer layer fitting")
+
+  stepHints.push(`step ${stepIndex + 1} of ${totalSteps}`)
+
+  return sanitizeDressPrompt(
+    [basePrompt, stepHints.join(", ")].filter(Boolean).join(", ")
+  )
 }
 
 /** ---------- FASHN ---------- */
@@ -1553,6 +1278,7 @@ async function runFashnTryOn({
   modelImage,
   productImage,
   prompt,
+  negativePrompt,
 }) {
   const body = {
     model_name: FASHN_MODEL_NAME,
@@ -1560,6 +1286,7 @@ async function runFashnTryOn({
       model_image: modelImage,
       garment_image: productImage,
       ...(prompt ? { prompt } : {}),
+      ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
     },
   }
 
@@ -1582,7 +1309,9 @@ async function runFashnTryOn({
       status: r.status,
       statusText: r.statusText,
       promptLen: String(prompt || "").length,
+      negativeLen: String(negativePrompt || "").length,
       promptPreview: safeSlice(prompt, 400),
+      negativePreview: safeSlice(negativePrompt, 300),
       modelPreview: isDataUrl(modelImage)
         ? `dataUrl(${String(modelImage).length})`
         : safeSlice(modelImage, 120),
@@ -1685,9 +1414,8 @@ app.post("/api/dress", async (req, res) => {
     const view = normalizeView(b.view || "front")
     const model = b.model
     const garments = b.garments || {}
-    const style = normalizeStyle(b.style || "casual")
-    const autoCompleteMissing = Boolean(b.autoCompleteMissing ?? true)
-    const clientPrompt = ""
+    const clientPrompt = String(b.prompt || "")
+    const clientNegativePrompt = String(b.negativePrompt || "")
 
     if (!isDataUrl(model)) {
       return res.status(400).json({
@@ -1699,9 +1427,6 @@ app.post("/api/dress", async (req, res) => {
     const serverPlan = buildOutfitPlanFromGarments({
       garments,
       view,
-      style,
-      autoCompleteMissing,
-      clientPrompt,
     })
 
     const effectiveGarments = pickEffectiveGarmentUrls({
@@ -1728,12 +1453,12 @@ app.post("/api/dress", async (req, res) => {
 
     console.log(`[${requestId}] /api/dress start`, {
       view,
-      style,
-      autoCompleteMissing,
       modelLen: String(model || "").length,
       planSteps: serverPlan.steps,
       effectiveGarments: summarizeEffectiveGarments(effectiveGarments),
       planSummary: serverPlan.summary?.shortLine,
+      promptLen: clientPrompt.length,
+      negativeLen: clientNegativePrompt.length,
     })
 
     let currentModel = model
@@ -1760,7 +1485,7 @@ app.post("/api/dress", async (req, res) => {
       }
 
       const stepPrompt = makeStepPrompt({
-        basePrompt: serverPlan.prompt,
+        basePrompt: clientPrompt,
         stepType,
         stepIndex: i,
         totalSteps: serverPlan.steps.length,
@@ -1771,12 +1496,7 @@ app.post("/api/dress", async (req, res) => {
         stepType,
         stepKey,
         promptLen: stepPrompt.length,
-        modelPreview: isDataUrl(currentModel)
-          ? `dataUrl(${String(currentModel).length})`
-          : String(currentModel || "").slice(0, 120),
-        productPreview: isDataUrl(productImage)
-          ? `dataUrl(${String(productImage).length})`
-          : String(productImage || "").slice(0, 120),
+        negativeLen: clientNegativePrompt.length,
       })
 
       try {
@@ -1787,6 +1507,7 @@ app.post("/api/dress", async (req, res) => {
           modelImage: currentModel,
           productImage,
           prompt: stepPrompt,
+          negativePrompt: clientNegativePrompt,
         })
 
         const imageUrl = await pollFashnPrediction(
@@ -1805,8 +1526,7 @@ app.post("/api/dress", async (req, res) => {
           predictionId: run.predictionId,
           outputImageUrl: imageUrl,
           promptPreview: String(stepPrompt || "").slice(0, 240),
-          modelLen: typeof currentModel === "string" ? currentModel.length : 0,
-          productLen: typeof productImage === "string" ? productImage.length : 0,
+          negativePreview: String(clientNegativePrompt || "").slice(0, 180),
         })
       } catch (stepErr) {
         const stepMessage = String(stepErr?.message ?? stepErr)
@@ -1817,12 +1537,6 @@ app.post("/api/dress", async (req, res) => {
           stepKey,
           message: stepMessage,
           promptPreview: String(stepPrompt || "").slice(0, 300),
-          modelPreview: isDataUrl(currentModel)
-            ? `dataUrl(${String(currentModel).length})`
-            : String(currentModel || "").slice(0, 120),
-          productPreview: isDataUrl(productImage)
-            ? `dataUrl(${String(productImage).length})`
-            : String(productImage || "").slice(0, 120),
         })
 
         return res.status(500).json({
@@ -1838,12 +1552,6 @@ app.post("/api/dress", async (req, res) => {
             failedStepKey: stepKey,
             usedSteps,
             promptPreview: String(stepPrompt || "").slice(0, 300),
-            modelPreview: isDataUrl(currentModel)
-              ? `dataUrl(${String(currentModel).length})`
-              : String(currentModel || "").slice(0, 120),
-            productPreview: isDataUrl(productImage)
-              ? `dataUrl(${String(productImage).length})`
-              : String(productImage || "").slice(0, 120),
             stepDebug,
           },
         })
@@ -1862,8 +1570,6 @@ app.post("/api/dress", async (req, res) => {
       debug: {
         engine: {
           view,
-          style,
-          autoCompleteMissing,
           model: "dataUrl",
           modelLen: String(model || "").length,
           garments: Object.keys(effectiveGarments).length,
