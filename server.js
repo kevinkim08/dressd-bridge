@@ -1282,12 +1282,13 @@ async function runFashnTryOn({
 }) {
   const body = {
     model_name: FASHN_MODEL_NAME,
-    inputs: {
-      model_image: modelImage,
-      garment_image: productImage,
-      ...(prompt ? { prompt } : {}),
-      ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
-    },
+
+    // ✅ FASHN payload: top-level fields
+    model_image: modelImage,
+    garment_image: productImage,
+
+    ...(prompt ? { prompt } : {}),
+    ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
   }
 
   const r = await fetch(`${FASHN_BASE}/run`, {
@@ -1318,12 +1319,20 @@ async function runFashnTryOn({
       productPreview: isDataUrl(productImage)
         ? `dataUrl(${String(productImage).length})`
         : safeSlice(productImage, 120),
-      responsePreview: safeSlice(text, 500),
+      responsePreview: safeSlice(text, 1200),
+      requestBodyPreview: {
+        model_name: body.model_name,
+        hasModelImage: !!body.model_image,
+        hasGarmentImage: !!body.garment_image,
+        hasPrompt: !!body.prompt,
+        hasNegativePrompt: !!body.negative_prompt,
+      },
     })
 
     throw new Error(
       json?.error ||
-        `FASHN /run failed: step=${stepType} HTTP ${r.status} ${text.slice(0, 500)}`
+        text ||
+        `FASHN /run failed: step=${stepType} HTTP ${r.status}`
     )
   }
 
@@ -1333,6 +1342,7 @@ async function runFashnTryOn({
       stepIndex,
       stepType,
       responsePreview: safeSlice(text, 500),
+      raw: json,
     })
     throw new Error("FASHN /run returned no id")
   }
@@ -1386,7 +1396,11 @@ async function pollFashnPrediction(id, requestId, stepType) {
       return imageUrl
     }
 
-    if (["failed", "canceled", "cancelled"].includes(String(status || "").toLowerCase())) {
+    if (
+      ["failed", "canceled", "cancelled"].includes(
+        String(status || "").toLowerCase()
+      )
+    ) {
       console.error(`[${requestId}] FASHN prediction failed`, {
         predictionId: id,
         stepType,
@@ -1612,7 +1626,9 @@ app.get("/api/dress/:id", async (req, res) => {
 
     if (!r.ok) {
       return res.status(r.status).json({
-        error: json?.error || `FASHN /status failed: HTTP ${r.status} ${text.slice(0, 500)}`,
+        error:
+          json?.error ||
+          `FASHN /status failed: HTTP ${r.status} ${text.slice(0, 500)}`,
       })
     }
 
