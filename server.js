@@ -1272,6 +1272,9 @@ function pickOutputImageUrl(output) {
 }
 
 async function runFashnTryOn({
+console.log("🔥 FASHN REQUEST BODY:", body)
+console.log("🔥 FASHN RAW RESPONSE:", text)
+  
   requestId,
   stepIndex,
   stepType,
