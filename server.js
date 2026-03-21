@@ -1277,18 +1277,25 @@ async function runFashnTryOn({
   stepType,
   modelImage,
   productImage,
-  prompt,
-  negativePrompt,
 }) {
   const body = {
-    model_name: FASHN_MODEL_NAME,
+    // 1차 최소 payload 테스트
     model_image: modelImage,
     garment_image: productImage,
-    ...(prompt ? { prompt } : {}),
-    ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
   }
 
-  console.log("🔥 FASHN REQUEST BODY:", body)
+  console.log("🔥 FASHN REQUEST BODY:", {
+    stepIndex,
+    stepType,
+    hasModelImage: !!body.model_image,
+    hasGarmentImage: !!body.garment_image,
+    modelImagePreview: isDataUrl(modelImage)
+      ? `dataUrl(${String(modelImage).length})`
+      : String(modelImage).slice(0, 120),
+    garmentImagePreview: isDataUrl(productImage)
+      ? `dataUrl(${String(productImage).length})`
+      : String(productImage).slice(0, 120),
+  })
 
   const r = await fetch(`${FASHN_BASE}/run`, {
     method: "POST",
@@ -1311,18 +1318,24 @@ async function runFashnTryOn({
       status: r.status,
       statusText: r.statusText,
       responsePreview: text,
-      requestBody: body,
+      requestBodyPreview: body,
     })
 
     throw new Error(
       json?.error ||
-      text ||
-      `FASHN /run failed: step=${stepType} HTTP ${r.status}`
+        text ||
+        `FASHN /run failed: step=${stepType} HTTP ${r.status}`
     )
   }
 
   const predictionId = json?.id
   if (!predictionId) {
+    console.error(`[${requestId}] FASHN /run no id`, {
+      stepIndex,
+      stepType,
+      responsePreview: text,
+      raw: json,
+    })
     throw new Error("FASHN /run returned no id")
   }
 
@@ -1499,9 +1512,7 @@ app.post("/api/dress", async (req, res) => {
           stepType,
           modelImage: currentModel,
           productImage,
-          prompt: stepPrompt,
-          negativePrompt: clientNegativePrompt,
-        })
+      })
 
         const imageUrl = await pollFashnPrediction(
           run.predictionId,
