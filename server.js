@@ -1272,9 +1272,6 @@ function pickOutputImageUrl(output) {
 }
 
 async function runFashnTryOn({
-console.log("🔥 FASHN REQUEST BODY:", body)
-console.log("🔥 FASHN RAW RESPONSE:", text)
-  
   requestId,
   stepIndex,
   stepType,
@@ -1285,14 +1282,13 @@ console.log("🔥 FASHN RAW RESPONSE:", text)
 }) {
   const body = {
     model_name: FASHN_MODEL_NAME,
-
-    // ✅ FASHN payload: top-level fields
     model_image: modelImage,
     garment_image: productImage,
-
     ...(prompt ? { prompt } : {}),
     ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
   }
+
+  console.log("🔥 FASHN REQUEST BODY:", body)
 
   const r = await fetch(`${FASHN_BASE}/run`, {
     method: "POST",
@@ -1301,6 +1297,8 @@ console.log("🔥 FASHN RAW RESPONSE:", text)
   })
 
   const text = await r.text()
+  console.log("🔥 FASHN RAW RESPONSE:", text)
+
   let json = null
   try {
     json = JSON.parse(text)
@@ -1312,41 +1310,19 @@ console.log("🔥 FASHN RAW RESPONSE:", text)
       stepType,
       status: r.status,
       statusText: r.statusText,
-      promptLen: String(prompt || "").length,
-      negativeLen: String(negativePrompt || "").length,
-      promptPreview: safeSlice(prompt, 400),
-      negativePreview: safeSlice(negativePrompt, 300),
-      modelPreview: isDataUrl(modelImage)
-        ? `dataUrl(${String(modelImage).length})`
-        : safeSlice(modelImage, 120),
-      productPreview: isDataUrl(productImage)
-        ? `dataUrl(${String(productImage).length})`
-        : safeSlice(productImage, 120),
-      responsePreview: safeSlice(text, 1200),
-      requestBodyPreview: {
-        model_name: body.model_name,
-        hasModelImage: !!body.model_image,
-        hasGarmentImage: !!body.garment_image,
-        hasPrompt: !!body.prompt,
-        hasNegativePrompt: !!body.negative_prompt,
-      },
+      responsePreview: text,
+      requestBody: body,
     })
 
     throw new Error(
       json?.error ||
-        text ||
-        `FASHN /run failed: step=${stepType} HTTP ${r.status}`
+      text ||
+      `FASHN /run failed: step=${stepType} HTTP ${r.status}`
     )
   }
 
   const predictionId = json?.id
   if (!predictionId) {
-    console.error(`[${requestId}] FASHN /run no id`, {
-      stepIndex,
-      stepType,
-      responsePreview: safeSlice(text, 500),
-      raw: json,
-    })
     throw new Error("FASHN /run returned no id")
   }
 
