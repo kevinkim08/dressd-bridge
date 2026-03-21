@@ -1277,27 +1277,11 @@ async function runFashnTryOn({
   stepType,
   modelImage,
   productImage,
-  prompt,
 }) {
   const body = {
-    // 1차 최소 payload 테스트
     model_image: modelImage,
     garment_image: productImage,
-    prompt: prompt, // ✅ 추가
   }
-
-  console.log("🔥 FASHN REQUEST BODY:", {
-    stepIndex,
-    stepType,
-    hasModelImage: !!body.model_image,
-    hasGarmentImage: !!body.garment_image,
-    modelImagePreview: isDataUrl(modelImage)
-      ? `dataUrl(${String(modelImage).length})`
-      : String(modelImage).slice(0, 120),
-    garmentImagePreview: isDataUrl(productImage)
-      ? `dataUrl(${String(productImage).length})`
-      : String(productImage).slice(0, 120),
-  })
 
   const r = await fetch(`${FASHN_BASE}/run`, {
     method: "POST",
@@ -1306,8 +1290,6 @@ async function runFashnTryOn({
   })
 
   const text = await r.text()
-  console.log("🔥 FASHN RAW RESPONSE:", text)
-
   let json = null
   try {
     json = JSON.parse(text)
@@ -1332,12 +1314,6 @@ async function runFashnTryOn({
 
   const predictionId = json?.id
   if (!predictionId) {
-    console.error(`[${requestId}] FASHN /run no id`, {
-      stepIndex,
-      stepType,
-      responsePreview: text,
-      raw: json,
-    })
     throw new Error("FASHN /run returned no id")
   }
 
@@ -1514,7 +1490,7 @@ app.post("/api/dress", async (req, res) => {
           stepType,
           modelImage: currentModel,
           productImage,
-          prompt: stepPrompt, // ✅ 핵심
+         
       })
 
         const imageUrl = await pollFashnPrediction(
