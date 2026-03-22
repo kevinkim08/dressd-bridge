@@ -1033,112 +1033,39 @@ app.post("/api/s1/pair", async (req, res) => {
 
 /**
  * ============================================================
- * ✅ 7) S3 Dress (FASHN) - preserve only
+ * ✅ 7) S3 Dress (FASHN) - Try-On Max preserve only
  * ============================================================
  */
-// server.js
-// DRESSD S3 - Try-On Max Orchestrator
-// Node 18+
-// ENV:
-//   FASHN_API_KEY=your_key
-//   PORT=3000
-//
-// POST /api/dress-max
-// body example:
-// {
-//   "model_front": "<url or dataUrl>",
-//   "model_back": "<url or dataUrl>",
-//   "top_front": "<url or dataUrl>",
-//   "top_back": "<url or dataUrl>",
-//   "bottom_front": "<url or dataUrl>",
-//   "bottom_back": "<url or dataUrl>",
-//   "outer_front": "<url or dataUrl>",
-//   "outer_back": "<url or dataUrl>",
-//   "dress_front": "<url or dataUrl>",
-//   "dress_back": "<url or dataUrl>",
-//   "debug": true,
-//   "seed": 42,
-//   "prompt_mode": "empty" // "empty" | "short"
-// }
-
-import express from "express"
-import cors from "cors"
-import sharp from "sharp"
-
-const app = express()
-
-const nodeMajor = Number(String(process.versions.node || "0").split(".")[0] || 0)
-if (nodeMajor < 18) {
-  console.error(`[BOOT] Node ${process.versions.node} detected. Node 18+ is required.`)
-  process.exit(1)
-}
-
-const PORT = Number(process.env.PORT || 3000)
-const FASHN_API_KEY = process.env.FASHN_API_KEY || ""
-
-if (!FASHN_API_KEY) {
-  console.warn("[BOOT] Missing FASHN_API_KEY")
-}
-
-app.use((req, res, next) => {
-  const origin = req.headers.origin
-  const ok =
-    !origin ||
-    origin.includes("framer.app") ||
-    origin.includes("framer.com") ||
-    origin.includes("framercanvas.com") ||
-    origin.includes("localhost") ||
-    origin.includes("127.0.0.1")
-
-  if (ok && origin) {
-    res.header("Access-Control-Allow-Origin", origin)
-    res.header("Vary", "Origin")
-  }
-
-  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
-  res.header(
-    "Access-Control-Allow-Headers",
-    req.headers["access-control-request-headers"] ||
-      "Content-Type, Authorization, X-Requested-With"
-  )
-  res.header("Access-Control-Allow-Credentials", "true")
-
-  if (req.method === "OPTIONS") return res.sendStatus(204)
-  next()
-})
-
-app.use(cors())
-app.use(express.json({ limit: "50mb" }))
 
 const FASHN_RUN_URL = "https://api.fashn.ai/v1/run"
 const FASHN_STATUS_URL = (id) => `https://api.fashn.ai/v1/status/${id}`
 
-const SLOT_ORDER = ["bottom", "top", "outer"]
-const VIEWS = ["front", "back"]
+const S3_SLOT_ORDER = ["bottom", "top", "outer"]
+const S3_VIEWS = ["front", "back"]
 
-const DEFAULT_LONG_EDGE = 1600
-const DEFAULT_JPEG_QUALITY = 92
-const DEFAULT_POLL_INTERVAL_MS = 2500
-const DEFAULT_POLL_TIMEOUT_MS = 1000 * 60 * 6
-const DEFAULT_RETRY_COUNT = 1
+const S3_DEFAULT_LONG_EDGE = 1600
+const S3_DEFAULT_JPEG_QUALITY = 92
+const S3_DEFAULT_POLL_INTERVAL_MS = 2500
+const S3_DEFAULT_POLL_TIMEOUT_MS = 1000 * 60 * 6
+const S3_DEFAULT_RETRY_COUNT = 1
 
-function isHttpUrl(v) {
+function s3IsHttpUrl(v) {
   return typeof v === "string" && /^https?:\/\//i.test(v)
 }
 
-function isDataUrl(v) {
+function s3IsDataUrl(v) {
   return typeof v === "string" && /^data:image\/[a-zA-Z0-9.+-]+;base64,/.test(v)
 }
 
-function sleep(ms) {
+function s3Sleep(ms) {
   return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function nowIso() {
+function s3NowIso() {
   return new Date().toISOString()
 }
 
-function pick(obj, keys) {
+function s3Pick(obj, keys) {
   const out = {}
   for (const k of keys) {
     if (obj[k] !== undefined) out[k] = obj[k]
@@ -1146,11 +1073,11 @@ function pick(obj, keys) {
   return out
 }
 
-function clamp(n, min, max) {
+function s3Clamp(n, min, max) {
   return Math.max(min, Math.min(max, n))
 }
 
-function safeErrMessage(err) {
+function s3SafeErrMessage(err) {
   if (!err) return "Unknown error"
   if (typeof err === "string") return err
   if (err.message) return err.message
@@ -1161,15 +1088,15 @@ function safeErrMessage(err) {
   }
 }
 
-function toDataUrl(buffer, mime = "image/jpeg") {
+function s3ToDataUrl(buffer, mime = "image/jpeg") {
   return `data:${mime};base64,${buffer.toString("base64")}`
 }
 
-function normalizePromptMode(v) {
+function s3NormalizePromptMode(v) {
   return v === "short" ? "short" : "empty"
 }
 
-function shortPromptForSlot(slot) {
+function s3ShortPromptForSlot(slot) {
   if (slot === "bottom") return "put on the pants"
   if (slot === "top") return "put on the top"
   if (slot === "outer") return "put on the outerwear"
@@ -1177,15 +1104,15 @@ function shortPromptForSlot(slot) {
   return ""
 }
 
-function buildPlanForView(garmentsByView, view) {
+function s3BuildPlanForView(garmentsByView, view) {
   const hasDress = !!garmentsByView[view]?.dress
   if (hasDress) return ["dress"]
-  return SLOT_ORDER.filter((slot) => !!garmentsByView[view]?.[slot])
+  return S3_SLOT_ORDER.filter((slot) => !!garmentsByView[view]?.[slot])
 }
 
-function getRequestDebugMeta(body) {
+function s3GetRequestDebugMeta(body) {
   return {
-    receivedAt: nowIso(),
+    receivedAt: s3NowIso(),
     hasModelFront: !!body.model_front,
     hasModelBack: !!body.model_back,
     hasTopFront: !!body.top_front,
@@ -1198,11 +1125,11 @@ function getRequestDebugMeta(body) {
     hasDressBack: !!body.dress_back,
     debug: !!body.debug,
     seed: typeof body.seed === "number" ? body.seed : null,
-    prompt_mode: normalizePromptMode(body.prompt_mode),
+    prompt_mode: s3NormalizePromptMode(body.prompt_mode),
   }
 }
 
-function normalizeInputs(body) {
+function s3NormalizeInputs(body) {
   const models = {
     front: body.model_front || "",
     back: body.model_back || "",
@@ -1228,26 +1155,26 @@ function normalizeInputs(body) {
     garmentsByView,
     debug: !!body.debug,
     seed: Number.isFinite(body.seed) ? Math.floor(body.seed) : 42,
-    promptMode: normalizePromptMode(body.prompt_mode),
+    promptMode: s3NormalizePromptMode(body.prompt_mode),
   }
 }
 
-function validateInputs(norm) {
+function s3ValidateInputs(norm) {
   const errors = []
 
   if (!norm.models.front && !norm.models.back) {
     errors.push("At least one model image is required: model_front or model_back")
   }
 
-  for (const view of VIEWS) {
+  for (const view of S3_VIEWS) {
     const m = norm.models[view]
-    if (m && !isHttpUrl(m) && !isDataUrl(m)) {
+    if (m && !s3IsHttpUrl(m) && !s3IsDataUrl(m)) {
       errors.push(`model_${view} must be a public URL or data URL`)
     }
 
     for (const slot of ["top", "bottom", "outer", "dress"]) {
       const g = norm.garmentsByView[view][slot]
-      if (g && !isHttpUrl(g) && !isDataUrl(g)) {
+      if (g && !s3IsHttpUrl(g) && !s3IsDataUrl(g)) {
         errors.push(`${slot}_${view} must be a public URL or data URL`)
       }
     }
@@ -1256,15 +1183,23 @@ function validateInputs(norm) {
   return errors
 }
 
-async function normalizeImageInput(input, options = {}) {
-  const longEdge = clamp(Number(options.longEdge || DEFAULT_LONG_EDGE), 512, 4096)
-  const quality = clamp(Number(options.quality || DEFAULT_JPEG_QUALITY), 60, 95)
+async function s3NormalizeImageInput(input, options = {}) {
+  const longEdge = s3Clamp(
+    Number(options.longEdge || S3_DEFAULT_LONG_EDGE),
+    512,
+    4096
+  )
+  const quality = s3Clamp(
+    Number(options.quality || S3_DEFAULT_JPEG_QUALITY),
+    60,
+    95
+  )
 
   if (!input) return ""
 
-  if (isHttpUrl(input)) return input
+  if (s3IsHttpUrl(input)) return input
 
-  if (!isDataUrl(input)) {
+  if (!s3IsDataUrl(input)) {
     throw new Error("Unsupported image input. Only public URL or data URL is allowed.")
   }
 
@@ -1279,7 +1214,7 @@ async function normalizeImageInput(input, options = {}) {
 
   if (!width || !height) {
     const out = await image.jpeg({ quality, mozjpeg: true }).toBuffer()
-    return toDataUrl(out, "image/jpeg")
+    return s3ToDataUrl(out, "image/jpeg")
   }
 
   const currentLong = Math.max(width, height)
@@ -1301,10 +1236,10 @@ async function normalizeImageInput(input, options = {}) {
     .jpeg({ quality, mozjpeg: true })
     .toBuffer()
 
-  return toDataUrl(out, "image/jpeg")
+  return s3ToDataUrl(out, "image/jpeg")
 }
 
-async function preprocessAll(norm) {
+async function s3PreprocessAll(norm) {
   const prepared = {
     models: { front: "", back: "" },
     garmentsByView: {
@@ -1313,14 +1248,14 @@ async function preprocessAll(norm) {
     },
   }
 
-  for (const view of VIEWS) {
-    prepared.models[view] = await normalizeImageInput(norm.models[view], {
+  for (const view of S3_VIEWS) {
+    prepared.models[view] = await s3NormalizeImageInput(norm.models[view], {
       longEdge: 1600,
       quality: 92,
     })
 
     for (const slot of ["top", "bottom", "outer", "dress"]) {
-      prepared.garmentsByView[view][slot] = await normalizeImageInput(
+      prepared.garmentsByView[view][slot] = await s3NormalizeImageInput(
         norm.garmentsByView[view][slot],
         {
           longEdge: 1600,
@@ -1333,7 +1268,7 @@ async function preprocessAll(norm) {
   return prepared
 }
 
-async function fashnRunTryOnMax({
+async function s3FashnRunTryOnMax({
   modelImage,
   productImage,
   prompt = "",
@@ -1359,7 +1294,7 @@ async function fashnRunTryOnMax({
     method: "POST",
     headers: {
       "Content-Type": "application/json",
-      Authorization: `Bearer ${FASHN_API_KEY}`,
+      Authorization: `Bearer ${process.env.FASHN_API_KEY || ""}`,
     },
     body: JSON.stringify(payload),
   })
@@ -1399,16 +1334,16 @@ async function fashnRunTryOnMax({
   }
 }
 
-async function fashnPollPrediction(id, opts = {}) {
-  const intervalMs = Number(opts.intervalMs || DEFAULT_POLL_INTERVAL_MS)
-  const timeoutMs = Number(opts.timeoutMs || DEFAULT_POLL_TIMEOUT_MS)
+async function s3FashnPollPrediction(id, opts = {}) {
+  const intervalMs = Number(opts.intervalMs || S3_DEFAULT_POLL_INTERVAL_MS)
+  const timeoutMs = Number(opts.timeoutMs || S3_DEFAULT_POLL_TIMEOUT_MS)
   const started = Date.now()
 
   for (;;) {
     const res = await fetch(FASHN_STATUS_URL(id), {
       method: "GET",
       headers: {
-        Authorization: `Bearer ${FASHN_API_KEY}`,
+        Authorization: `Bearer ${process.env.FASHN_API_KEY || ""}`,
       },
     })
 
@@ -1469,11 +1404,11 @@ async function fashnPollPrediction(id, opts = {}) {
       throw new Error(`Prediction ${id} timed out`)
     }
 
-    await sleep(intervalMs)
+    await s3Sleep(intervalMs)
   }
 }
 
-async function runTryOnStep({
+async function s3RunTryOnStep({
   slot,
   inputModel,
   garment,
@@ -1481,9 +1416,9 @@ async function runTryOnStep({
   promptMode,
   debug = false,
 }) {
-  const prompt = promptMode === "short" ? shortPromptForSlot(slot) : ""
+  const prompt = promptMode === "short" ? s3ShortPromptForSlot(slot) : ""
 
-  const run = await fashnRunTryOnMax({
+  const run = await s3FashnRunTryOnMax({
     modelImage: inputModel,
     productImage: garment,
     prompt,
@@ -1493,7 +1428,7 @@ async function runTryOnStep({
     returnBase64: false,
   })
 
-  const done = await fashnPollPrediction(run.id)
+  const done = await s3FashnPollPrediction(run.id)
 
   return {
     slot,
@@ -1507,14 +1442,14 @@ async function runTryOnStep({
   }
 }
 
-async function runTryOnStepWithRetry(args, retryCount = DEFAULT_RETRY_COUNT) {
+async function s3RunTryOnStepWithRetry(args, retryCount = S3_DEFAULT_RETRY_COUNT) {
   let lastErr = null
 
   for (let attempt = 0; attempt <= retryCount; attempt++) {
     const seed = (args.seed || 42) + attempt
 
     try {
-      const out = await runTryOnStep({
+      const out = await s3RunTryOnStep({
         ...args,
         seed,
       })
@@ -1531,12 +1466,12 @@ async function runTryOnStepWithRetry(args, retryCount = DEFAULT_RETRY_COUNT) {
 
   return {
     ok: false,
-    error: safeErrMessage(lastErr),
+    error: s3SafeErrMessage(lastErr),
     attempts: retryCount + 1,
   }
 }
 
-async function runSequentialView({
+async function s3RunSequentialView({
   view,
   modelImage,
   garments,
@@ -1544,7 +1479,7 @@ async function runSequentialView({
   promptMode,
   debug,
 }) {
-  const plan = buildPlanForView({ [view]: garments }, view)
+  const plan = s3BuildPlanForView({ [view]: garments }, view)
 
   if (!modelImage) {
     return {
@@ -1577,7 +1512,7 @@ async function runSequentialView({
 
     if (!garment) continue
 
-    const result = await runTryOnStepWithRetry(
+    const result = await s3RunTryOnStepWithRetry(
       {
         slot,
         inputModel: currentModel,
@@ -1586,7 +1521,7 @@ async function runSequentialView({
         promptMode,
         debug,
       },
-      DEFAULT_RETRY_COUNT
+      S3_DEFAULT_RETRY_COUNT
     )
 
     if (!result.ok) {
@@ -1629,29 +1564,20 @@ async function runSequentialView({
   }
 }
 
-app.get("/health", (_req, res) => {
-  res.json({
-    ok: true,
-    service: "dressd-s3-tryon-max",
-    time: nowIso(),
-    hasApiKey: !!FASHN_API_KEY,
-  })
-})
-
 app.post("/api/dress-max", async (req, res) => {
   const startedAt = Date.now()
-  const requestMeta = getRequestDebugMeta(req.body)
+  const requestMeta = s3GetRequestDebugMeta(req.body)
 
   try {
-    if (!FASHN_API_KEY) {
+    if (!process.env.FASHN_API_KEY) {
       return res.status(500).json({
         ok: false,
         error: "Server is missing FASHN_API_KEY",
       })
     }
 
-    const norm = normalizeInputs(req.body)
-    const errors = validateInputs(norm)
+    const norm = s3NormalizeInputs(req.body)
+    const errors = s3ValidateInputs(norm)
 
     if (errors.length) {
       return res.status(400).json({
@@ -1661,9 +1587,9 @@ app.post("/api/dress-max", async (req, res) => {
       })
     }
 
-    const prepared = await preprocessAll(norm)
+    const prepared = await s3PreprocessAll(norm)
 
-    const frontPromise = runSequentialView({
+    const frontPromise = s3RunSequentialView({
       view: "front",
       modelImage: prepared.models.front,
       garments: prepared.garmentsByView.front,
@@ -1672,7 +1598,7 @@ app.post("/api/dress-max", async (req, res) => {
       debug: norm.debug,
     })
 
-    const backPromise = runSequentialView({
+    const backPromise = s3RunSequentialView({
       view: "back",
       modelImage: prepared.models.back,
       garments: prepared.garmentsByView.back,
@@ -1698,8 +1624,8 @@ app.post("/api/dress-max", async (req, res) => {
                 back: prepared.models.back ? "prepared" : "",
               },
               garments: {
-                front: pick(prepared.garmentsByView.front, ["top", "bottom", "outer", "dress"]),
-                back: pick(prepared.garmentsByView.back, ["top", "bottom", "outer", "dress"]),
+                front: s3Pick(prepared.garmentsByView.front, ["top", "bottom", "outer", "dress"]),
+                back: s3Pick(prepared.garmentsByView.back, ["top", "bottom", "outer", "dress"]),
               },
             }
           : undefined,
@@ -1709,15 +1635,11 @@ app.post("/api/dress-max", async (req, res) => {
     console.error("[/api/dress-max] ERROR:", err)
     return res.status(500).json({
       ok: false,
-      error: safeErrMessage(err),
+      error: s3SafeErrMessage(err),
       meta: {
         request: requestMeta,
         elapsedMs: Date.now() - startedAt,
       },
     })
   }
-})
-
-app.listen(PORT, () => {
-  console.log(`[BOOT] DRESSD S3 Try-On Max listening on :${PORT}`)
 })
