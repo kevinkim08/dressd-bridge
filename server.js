@@ -1643,3 +1643,6 @@ app.post("/api/dress-max", async (req, res) => {
     })
   }
 })
+app.listen(PORT, () => {
+  console.log(`[BOOT] Server listening on :${PORT}`)
+})
