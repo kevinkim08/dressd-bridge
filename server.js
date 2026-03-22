@@ -1924,3 +1924,10 @@ app.post("/api/dress-v16-test", async (req, res) => {
     })
   }
 })
+})
+ 
+const PORT = Number(process.env.PORT || 3000)
+
+app.listen(PORT, () => {
+  console.log(`[BOOT] Server listening on :${PORT}`)
+})
