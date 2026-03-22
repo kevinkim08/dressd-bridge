@@ -1930,3 +1930,46 @@ const PORT = Number(process.env.PORT || 3000)
 app.listen(PORT, () => {
   console.log(`[BOOT] Server listening on :${PORT}`)
 })
+app.get("/api/cf-check", async (_req, res) => {
+  try {
+    const accountId = process.env.CLOUDFLARE_ACCOUNT_ID || ""
+    const token = process.env.CLOUDFLARE_IMAGES_TOKEN || ""
+
+    if (!accountId || !token) {
+      return res.status(500).json({
+        ok: false,
+        error: "Missing CLOUDFLARE_ACCOUNT_ID or CLOUDFLARE_IMAGES_TOKEN",
+      })
+    }
+
+    const r = await fetch(
+      `https://api.cloudflare.com/client/v4/accounts/${accountId}/images/v1`,
+      {
+        method: "GET",
+        headers: {
+          Authorization: `Bearer ${token}`,
+        },
+      }
+    )
+
+    const text = await r.text()
+    let json = null
+    try {
+      json = text ? JSON.parse(text) : null
+    } catch {
+      json = { raw: text }
+    }
+
+    return res.status(r.status).json({
+      ok: r.ok,
+      status: r.status,
+      accountId,
+      response: json,
+    })
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: String(err?.message || err),
+    })
+  }
+})
