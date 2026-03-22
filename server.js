@@ -1569,6 +1569,203 @@ app.post("/api/dress-max", async (req, res) => {
   const startedAt = Date.now()
   const requestMeta = s3GetRequestDebugMeta(req.body)
 
+  /**
+ * ============================================================
+ * ✅ S3 TEST - FASHN tryon-v1.6 category forced
+ * ============================================================
+ */
+
+async function s3FashnRunTryOnV16({
+  modelImage,
+  garmentImage,
+  category = "auto", // "tops" | "bottoms" | "one-pieces" | "auto"
+  garmentPhotoType = "auto", // "auto" | "flat-lay" | "model"
+  mode = "quality", // "performance" | "balanced" | "quality"
+  seed = 42,
+  numSamples = 1,
+  outputFormat = "png",
+  returnBase64 = false,
+}) {
+  const payload = {
+    model_name: "tryon-v1.6",
+    inputs: {
+      model_image: modelImage,
+      garment_image: garmentImage,
+      category,
+      garment_photo_type: garmentPhotoType,
+      mode,
+      seed,
+      num_samples: numSamples,
+      output_format: outputFormat,
+      return_base64: returnBase64,
+    },
+  }
+
+  const res = await fetch(FASHN_RUN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.FASHN_API_KEY || ""}`,
+    },
+    body: JSON.stringify(payload),
+  })
+
+  const text = await res.text()
+  let json = null
+  try {
+    json = text ? JSON.parse(text) : null
+  } catch {
+    json = { raw: text }
+  }
+
+  if (!res.ok) {
+    const msg =
+      json?.error?.message ||
+      json?.message ||
+      json?.error ||
+      `FASHN v1.6 run failed with ${res.status}`
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
+  }
+
+  const predictionId =
+    json?.id ||
+    json?.prediction_id ||
+    json?.data?.id ||
+    json?.result?.id ||
+    ""
+
+  if (!predictionId) {
+    throw new Error("FASHN v1.6 response did not include prediction id")
+  }
+
+  return {
+    id: predictionId,
+    raw: json,
+    payload,
+  }
+}
+
+app.post("/api/dress-v16-test", async (req, res) => {
+  const startedAt = Date.now()
+
+  try {
+    if (!process.env.FASHN_API_KEY) {
+      return res.status(500).json({
+        ok: false,
+        error: "Server is missing FASHN_API_KEY",
+      })
+    }
+
+    const {
+      model_front,
+      top_front,
+      bottom_front,
+      dress_front,
+      seed = 42,
+      garment_photo_type = "auto",
+      mode = "quality",
+      debug = true,
+    } = req.body || {}
+
+    const modelImage = model_front || ""
+    const topImage = top_front || ""
+    const bottomImage = bottom_front || ""
+    const dressImage = dress_front || ""
+
+    if (!modelImage || (!topImage && !bottomImage && !dressImage)) {
+      return res.status(400).json({
+        ok: false,
+        error: "model_front and one garment(top_front/bottom_front/dress_front) are required",
+      })
+    }
+
+    if (!s3IsHttpUrl(modelImage) && !s3IsDataUrl(modelImage)) {
+      return res.status(400).json({
+        ok: false,
+        error: "model_front must be a public URL or data URL",
+      })
+    }
+
+    let garmentImage = ""
+    let category = "auto"
+    let slot = ""
+
+    if (s3IsDataUrl(topImage) || s3IsHttpUrl(topImage)) {
+      garmentImage = topImage
+      category = "tops"
+      slot = "top"
+    } else if (s3IsDataUrl(bottomImage) || s3IsHttpUrl(bottomImage)) {
+      garmentImage = bottomImage
+      category = "bottoms"
+      slot = "bottom"
+    } else if (s3IsDataUrl(dressImage) || s3IsHttpUrl(dressImage)) {
+      garmentImage = dressImage
+      category = "one-pieces"
+      slot = "dress"
+    } else {
+      return res.status(400).json({
+        ok: false,
+        error: "No valid garment image found",
+      })
+    }
+
+    const preparedModel = await s3NormalizeImageInput(modelImage, {
+      longEdge: 1600,
+      quality: 92,
+    })
+
+    const preparedGarment = await s3NormalizeImageInput(garmentImage, {
+      longEdge: 1600,
+      quality: 92,
+    })
+
+    const run = await s3FashnRunTryOnV16({
+      modelImage: preparedModel,
+      garmentImage: preparedGarment,
+      category,
+      garmentPhotoType: garment_photo_type,
+      mode,
+      seed,
+      numSamples: 1,
+      outputFormat: "png",
+      returnBase64: false,
+    })
+
+    const done = await s3FashnPollPrediction(run.id)
+
+    return res.json({
+      ok: true,
+      mode: "tryon-v1.6",
+      slot,
+      category,
+      finalUrl: done.finalImage || null,
+      predictionId: run.id,
+      meta: {
+        elapsedMs: Date.now() - startedAt,
+        garment_photo_type,
+        requestMode: mode,
+        debug: !!debug,
+      },
+      ...(debug
+        ? {
+            debugPayload: run.payload,
+            debugRunRaw: run.raw,
+            debugStatusRaw: done.raw,
+          }
+        : {}),
+    })
+  } catch (err) {
+    console.error("[/api/dress-v16-test] ERROR:", err)
+    return res.status(500).json({
+      ok: false,
+      error: s3SafeErrMessage(err),
+      meta: {
+        elapsedMs: Date.now() - startedAt,
+      },
+    })
+  }
+})
+
   try {
     if (!process.env.FASHN_API_KEY) {
       return res.status(500).json({
