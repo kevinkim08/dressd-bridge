@@ -1643,6 +1643,8 @@ app.post("/api/dress-max", async (req, res) => {
     })
   }
 })
+const PORT = Number(process.env.PORT || 3000)
+
 app.listen(PORT, () => {
   console.log(`[BOOT] Server listening on :${PORT}`)
 })
