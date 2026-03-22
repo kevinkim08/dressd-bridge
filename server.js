@@ -1084,6 +1084,7 @@ function getGarmentUrl(view, garments, name) {
 }
 
 function getUploadedPresenceForView(garments, view) {
+  /** 내부 표준은 dress, onepiece는 legacy fallback만 유지 */
   const dressUrl =
     getGarmentUrl(view, garments, "dress") ||
     getGarmentUrl(view, garments, "onepiece")
@@ -1101,6 +1102,7 @@ function resolvePresenceConflicts(presence) {
   const resolved = { ...presence }
   const ignoredParts = []
 
+  /** dress가 있으면 top/bottom은 무시 */
   if (resolved.dress) {
     if (resolved.top) {
       resolved.top = false
@@ -1228,7 +1230,35 @@ function summarizeEffectiveGarments(effectiveGarments) {
   }
 }
 
-/** ---------- prompt ---------- */
+/** ---------- prompt ----------
+ * 긴 prompt 전체를 그대로 넣지 않고,
+ * 허용된 짧은 length/sleeve hint만 추출해서 사용
+ */
+const ALLOWED_DRESS_HINTS = [
+  "top: sleeveless",
+  "top: short sleeve",
+  "top: long sleeve",
+
+  "top: cropped length",
+  "top: regular length",
+  "top: long length",
+
+  "bottom: short length",
+  "bottom: knee length",
+  "bottom: calf length",
+  "bottom: full length",
+
+  "outer: cropped length",
+  "outer: hip length",
+  "outer: knee length",
+  "outer: long length",
+
+  "dress: mini length",
+  "dress: knee length",
+  "dress: midi length",
+  "dress: maxi length",
+]
+
 function sanitizeDressPrompt(prompt) {
   return String(prompt || "")
     .replace(/\s+/g, " ")
@@ -1238,9 +1268,17 @@ function sanitizeDressPrompt(prompt) {
     .slice(0, 2000)
 }
 
-function makeStepPrompt({ basePrompt, stepType, stepIndex, totalSteps }) {
-  const stepHints = []
+function extractAllowedDressHints(prompt) {
+  const text = sanitizeDressPrompt(prompt).toLowerCase()
+  return ALLOWED_DRESS_HINTS.filter((hint) =>
+    text.includes(hint.toLowerCase())
+  )
+}
 
+function makeStepPrompt({ basePrompt, stepType, stepIndex, totalSteps }) {
+  const extractedHints = extractAllowedDressHints(basePrompt)
+
+  const stepHints = []
   if (stepType === "top") stepHints.push("upper-body garment fitting")
   if (stepType === "bottom") stepHints.push("lower-body garment fitting")
   if (stepType === "dress") stepHints.push("one-piece garment fitting")
@@ -1249,7 +1287,7 @@ function makeStepPrompt({ basePrompt, stepType, stepIndex, totalSteps }) {
   stepHints.push(`step ${stepIndex + 1} of ${totalSteps}`)
 
   return sanitizeDressPrompt(
-    [basePrompt, stepHints.join(", ")].filter(Boolean).join(", ")
+    [...extractedHints, ...stepHints].filter(Boolean).join(", ")
   )
 }
 
@@ -1277,10 +1315,16 @@ async function runFashnTryOn({
   stepType,
   modelImage,
   productImage,
+  stepPrompt,
+  negativePrompt,
 }) {
+  /** preserve-only 최소 payload */
   const body = {
+    model_name: FASHN_MODEL_NAME,
     model_image: modelImage,
     garment_image: productImage,
+    ...(stepPrompt ? { prompt: stepPrompt } : {}),
+    ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
   }
 
   const r = await fetch(`${FASHN_BASE}/run`, {
@@ -1302,7 +1346,15 @@ async function runFashnTryOn({
       status: r.status,
       statusText: r.statusText,
       responsePreview: text,
-      requestBodyPreview: body,
+      requestBodyPreview: {
+        ...body,
+        model_image: isDataUrl(body.model_image)
+          ? `dataUrl(${String(body.model_image).length})`
+          : safeSlice(body.model_image, 120),
+        garment_image: isDataUrl(body.garment_image)
+          ? `dataUrl(${String(body.garment_image).length})`
+          : safeSlice(body.garment_image, 120),
+      },
     })
 
     throw new Error(
@@ -1347,7 +1399,8 @@ async function pollFashnPrediction(id, requestId, stepType) {
       })
 
       throw new Error(
-        json?.error || `FASHN /status failed: HTTP ${rr.status} ${text.slice(0, 500)}`
+        json?.error ||
+          `FASHN /status failed: HTTP ${rr.status} ${text.slice(0, 500)}`
       )
     }
 
@@ -1443,6 +1496,7 @@ app.post("/api/dress", async (req, res) => {
       planSummary: serverPlan.summary?.shortLine,
       promptLen: clientPrompt.length,
       negativeLen: clientNegativePrompt.length,
+      extractedHints: extractAllowedDressHints(clientPrompt),
     })
 
     let currentModel = model
@@ -1481,6 +1535,7 @@ app.post("/api/dress", async (req, res) => {
         stepKey,
         promptLen: stepPrompt.length,
         negativeLen: clientNegativePrompt.length,
+        promptPreview: stepPrompt.slice(0, 220),
       })
 
       try {
@@ -1490,8 +1545,9 @@ app.post("/api/dress", async (req, res) => {
           stepType,
           modelImage: currentModel,
           productImage,
-         
-      })
+          stepPrompt,
+          negativePrompt: sanitizeDressPrompt(clientNegativePrompt),
+        })
 
         const imageUrl = await pollFashnPrediction(
           run.predictionId,
