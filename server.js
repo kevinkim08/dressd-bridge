@@ -7,6 +7,7 @@
 import express from "express"
 import cors from "cors"
 import Replicate from "replicate"
+import sharp from "sharp"
 
 const app = express()
 
