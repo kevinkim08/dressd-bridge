@@ -1036,660 +1036,731 @@ app.post("/api/s1/pair", async (req, res) => {
  * ✅ 7) S3 Dress (FASHN) - preserve only
  * ============================================================
  */
-const FASHN_BASE = "https://api.fashn.ai/v1"
-const FASHN_MODEL_NAME = process.env.FASHN_MODEL_NAME || "tryon-v1.6"
+// server.js
+// DRESSD S3 - Try-On Max Orchestrator
+// Node 18+
+// ENV:
+//   FASHN_API_KEY=your_key
+//   PORT=3000
+//
+// POST /api/dress-max
+// body example:
+// {
+//   "model_front": "<url or dataUrl>",
+//   "model_back": "<url or dataUrl>",
+//   "top_front": "<url or dataUrl>",
+//   "top_back": "<url or dataUrl>",
+//   "bottom_front": "<url or dataUrl>",
+//   "bottom_back": "<url or dataUrl>",
+//   "outer_front": "<url or dataUrl>",
+//   "outer_back": "<url or dataUrl>",
+//   "dress_front": "<url or dataUrl>",
+//   "dress_back": "<url or dataUrl>",
+//   "debug": true,
+//   "seed": 42,
+//   "prompt_mode": "empty" // "empty" | "short"
+// }
 
-/** ---------- shared helpers ---------- */
+import express from "express"
+import cors from "cors"
+import sharp from "sharp"
+
+const app = express()
+
+/* =========================================================
+ * 0) Basic checks
+ * ======================================================= */
+const nodeMajor = Number(String(process.versions.node || "0").split(".")[0] || 0)
+if (nodeMajor < 18) {
+  console.error(`[BOOT] Node ${process.versions.node} detected. Node 18+ is required.`)
+  process.exit(1)
+}
+
+const PORT = Number(process.env.PORT || 3000)
+const FASHN_API_KEY = process.env.FASHN_API_KEY || ""
+
+if (!FASHN_API_KEY) {
+  console.warn("[BOOT] Missing FASHN_API_KEY")
+}
+
+/* =========================================================
+ * 1) Middleware
+ * ======================================================= */
+app.use((req, res, next) => {
+  const origin = req.headers.origin
+  const ok =
+    !origin ||
+    origin.includes("framer.app") ||
+    origin.includes("framer.com") ||
+    origin.includes("framercanvas.com") ||
+    origin.includes("localhost") ||
+    origin.includes("127.0.0.1")
+
+  if (ok && origin) {
+    res.header("Access-Control-Allow-Origin", origin)
+    res.header("Vary", "Origin")
+  }
+
+  res.header("Access-Control-Allow-Methods", "GET,POST,OPTIONS")
+  res.header(
+    "Access-Control-Allow-Headers",
+    req.headers["access-control-request-headers"] ||
+      "Content-Type, Authorization, X-Requested-With"
+  )
+  res.header("Access-Control-Allow-Credentials", "true")
+
+  if (req.method === "OPTIONS") return res.sendStatus(204)
+  next()
+})
+
+app.use(cors())
+app.use(express.json({ limit: "50mb" }))
+
+/* =========================================================
+ * 2) Constants
+ * ======================================================= */
+const FASHN_RUN_URL = "https://api.fashn.ai/v1/run"
+const FASHN_STATUS_URL = (id) => `https://api.fashn.ai/v1/status/${id}`
+
+const SLOT_ORDER = ["bottom", "top", "outer"]
+const VIEWS = ["front", "back"]
+
+const DEFAULT_LONG_EDGE = 1600
+const DEFAULT_JPEG_QUALITY = 92
+const DEFAULT_POLL_INTERVAL_MS = 2500
+const DEFAULT_POLL_TIMEOUT_MS = 1000 * 60 * 6
+const DEFAULT_RETRY_COUNT = 1
+
+/* =========================================================
+ * 3) Helpers
+ * ======================================================= */
+function isHttpUrl(v) {
+  return typeof v === "string" && /^https?:\/\//i.test(v)
+}
+
 function isDataUrl(v) {
-  return typeof v === "string" && v.startsWith("data:image/")
+  return typeof v === "string" && /^data:image\/[a-zA-Z0-9.+-]+;base64,/.test(v)
 }
 
-function exists(v) {
-  return typeof v === "string" && v.startsWith("data:image/")
+function sleep(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms))
 }
 
-function normalizeView(view) {
-  return String(view || "").toLowerCase() === "back" ? "back" : "front"
+function nowIso() {
+  return new Date().toISOString()
 }
 
-function titleJoin(parts) {
-  if (!Array.isArray(parts) || parts.length === 0) return "None"
-  return parts.join(" + ")
-}
-
-const GARMENT_ORDER = ["bottom", "top", "dress", "outer"]
-const GARMENT_LABEL = {
-  top: "Top",
-  bottom: "Bottom",
-  outer: "Outer",
-  dress: "Dress",
-}
-
-function sortGarments(types) {
-  const set = new Set(Array.isArray(types) ? types : [])
-  return GARMENT_ORDER.filter((k) => set.has(k))
-}
-
-function compact(arr) {
-  return (arr || []).filter(Boolean)
-}
-
-function garmentTypesToText(types) {
-  return titleJoin((types || []).map((t) => GARMENT_LABEL[t] || t))
-}
-
-function getGarmentUrl(view, garments, name) {
-  const key = `${name}_${view}`
-  return garments?.[key] || ""
-}
-
-function getUploadedPresenceForView(garments, view) {
-  /** 내부 표준은 dress, onepiece는 legacy fallback만 유지 */
-  const dressUrl =
-    getGarmentUrl(view, garments, "dress") ||
-    getGarmentUrl(view, garments, "onepiece")
-
-  return {
-    top: exists(getGarmentUrl(view, garments, "top")),
-    bottom: exists(getGarmentUrl(view, garments, "bottom")),
-    outer: exists(getGarmentUrl(view, garments, "outer")),
-    dress: exists(dressUrl),
-  }
-}
-
-/** ---------- conflict / steps ---------- */
-function resolvePresenceConflicts(presence) {
-  const resolved = { ...presence }
-  const ignoredParts = []
-
-  /** dress가 있으면 top/bottom은 무시 */
-  if (resolved.dress) {
-    if (resolved.top) {
-      resolved.top = false
-      ignoredParts.push("top")
-    }
-    if (resolved.bottom) {
-      resolved.bottom = false
-      ignoredParts.push("bottom")
-    }
-  }
-
-  return {
-    resolved,
-    ignoredParts: sortGarments(ignoredParts),
-  }
-}
-
-function buildLayerStepsFromResolvedPresence(presence) {
-  const steps = []
-
-  if (presence.dress) {
-    steps.push("dress")
-  } else {
-    if (presence.bottom) steps.push("bottom")
-    if (presence.top) steps.push("top")
-  }
-
-  if (presence.outer) steps.push("outer")
-
-  return steps
-}
-
-function buildPlanSummary(plan) {
-  const uploadedText = garmentTypesToText(plan.uploaded)
-  const resolvedText = garmentTypesToText(plan.uploadedResolved)
-  const ignoredText = garmentTypesToText(plan.ignoredParts)
-  const stepsText = garmentTypesToText(plan.steps)
-
-  return {
-    uploadedText,
-    resolvedText,
-    ignoredText,
-    stepsText,
-    shortLine: [
-      `Uploaded: ${uploadedText}`,
-      `Resolved: ${resolvedText}`,
-      `Ignored: ${ignoredText}`,
-      `Steps: ${stepsText}`,
-    ].join(" / "),
-  }
-}
-
-function buildOutfitPlanFromGarments({ garments, view }) {
-  const normalizedView = normalizeView(view)
-  const uploadedPresence = getUploadedPresenceForView(garments, normalizedView)
-
-  const uploaded = sortGarments(
-    compact([
-      uploadedPresence.bottom ? "bottom" : null,
-      uploadedPresence.top ? "top" : null,
-      uploadedPresence.dress ? "dress" : null,
-      uploadedPresence.outer ? "outer" : null,
-    ])
-  )
-
-  const { resolved, ignoredParts } = resolvePresenceConflicts(uploadedPresence)
-
-  const uploadedResolved = sortGarments(
-    compact([
-      resolved.bottom ? "bottom" : null,
-      resolved.top ? "top" : null,
-      resolved.dress ? "dress" : null,
-      resolved.outer ? "outer" : null,
-    ])
-  )
-
-  const steps = buildLayerStepsFromResolvedPresence(resolved)
-
-  const plan = {
-    view: normalizedView,
-    uploaded,
-    uploadedResolved,
-    ignoredParts,
-    steps,
-  }
-
-  return {
-    ...plan,
-    summary: buildPlanSummary(plan),
-  }
-}
-
-function pickEffectiveGarmentUrls({ garments, view, plan }) {
+function pick(obj, keys) {
   const out = {}
-  const normalizedView = normalizeView(view)
-
-  for (const type of plan.steps || []) {
-    const key = `${type}_${normalizedView}`
-
-    if (type === "dress") {
-      const url =
-        garments?.[`dress_${normalizedView}`] ||
-        garments?.[`onepiece_${normalizedView}`]
-      if (exists(url)) out[key] = url
-      continue
-    }
-
-    const url = garments?.[key]
-    if (exists(url)) out[key] = url
+  for (const k of keys) {
+    if (obj[k] !== undefined) out[k] = obj[k]
   }
-
   return out
 }
 
-function summarizeEffectiveGarments(effectiveGarments) {
-  const keys = Object.keys(effectiveGarments || {})
-  return {
-    count: keys.length,
-    keys,
-    preview: keys.reduce((acc, k) => {
-      const v = effectiveGarments[k]
-      acc[k] = isDataUrl(v) ? `dataUrl(${String(v).length})` : safeSlice(v, 120)
-      return acc
-    }, {}),
+function clamp(n, min, max) {
+  return Math.max(min, Math.min(max, n))
+}
+
+function safeErrMessage(err) {
+  if (!err) return "Unknown error"
+  if (typeof err === "string") return err
+  if (err.message) return err.message
+  try {
+    return JSON.stringify(err)
+  } catch {
+    return "Unknown error"
   }
 }
 
-/** ---------- prompt ----------
- * 긴 prompt 전체를 그대로 넣지 않고,
- * 허용된 짧은 length/sleeve hint만 추출해서 사용
- */
-const ALLOWED_DRESS_HINTS = [
-  "top: sleeveless",
-  "top: short sleeve",
-  "top: long sleeve",
-
-  "top: cropped length",
-  "top: regular length",
-  "top: long length",
-
-  "bottom: short length",
-  "bottom: knee length",
-  "bottom: calf length",
-  "bottom: full length",
-
-  "outer: cropped length",
-  "outer: hip length",
-  "outer: knee length",
-  "outer: long length",
-
-  "dress: mini length",
-  "dress: knee length",
-  "dress: midi length",
-  "dress: maxi length",
-]
-
-function sanitizeDressPrompt(prompt) {
-  return String(prompt || "")
-    .replace(/\s+/g, " ")
-    .replace(/\s*,\s*/g, ", ")
-    .replace(/^,\s*|\s*,$/g, "")
-    .trim()
-    .slice(0, 2000)
+function toDataUrl(buffer, mime = "image/jpeg") {
+  return `data:${mime};base64,${buffer.toString("base64")}`
 }
 
-function extractAllowedDressHints(prompt) {
-  const text = sanitizeDressPrompt(prompt).toLowerCase()
-  return ALLOWED_DRESS_HINTS.filter((hint) =>
-    text.includes(hint.toLowerCase())
-  )
+function normalizePromptMode(v) {
+  return v === "short" ? "short" : "empty"
 }
 
-function makeStepPrompt({ basePrompt, stepType, stepIndex, totalSteps }) {
-  const extractedHints = extractAllowedDressHints(basePrompt)
-
-  const stepHints = []
-  if (stepType === "top") stepHints.push("upper-body garment fitting")
-  if (stepType === "bottom") stepHints.push("lower-body garment fitting")
-  if (stepType === "dress") stepHints.push("one-piece garment fitting")
-  if (stepType === "outer") stepHints.push("outer layer fitting")
-
-  stepHints.push(`step ${stepIndex + 1} of ${totalSteps}`)
-
-  return sanitizeDressPrompt(
-    [...extractedHints, ...stepHints].filter(Boolean).join(", ")
-  )
+function shortPromptForSlot(slot) {
+  if (slot === "bottom") return "put on the pants"
+  if (slot === "top") return "put on the top"
+  if (slot === "outer") return "put on the outerwear"
+  if (slot === "dress") return "put on the dress"
+  return ""
 }
 
-/** ---------- FASHN ---------- */
-function fashnHeaders() {
-  const key = process.env.FASHN_API_KEY
-  if (!key) throw new Error("FASHN_API_KEY missing on server")
+function buildPlanForView(garmentsByView, view) {
+  const hasDress = !!garmentsByView[view]?.dress
+  if (hasDress) return ["dress"]
+  return SLOT_ORDER.filter((slot) => !!garmentsByView[view]?.[slot])
+}
+
+function getRequestDebugMeta(body) {
   return {
-    "Content-Type": "application/json",
-    Authorization: `Bearer ${key}`,
+    receivedAt: nowIso(),
+    hasModelFront: !!body.model_front,
+    hasModelBack: !!body.model_back,
+    hasTopFront: !!body.top_front,
+    hasTopBack: !!body.top_back,
+    hasBottomFront: !!body.bottom_front,
+    hasBottomBack: !!body.bottom_back,
+    hasOuterFront: !!body.outer_front,
+    hasOuterBack: !!body.outer_back,
+    hasDressFront: !!body.dress_front,
+    hasDressBack: !!body.dress_back,
+    debug: !!body.debug,
+    seed: typeof body.seed === "number" ? body.seed : null,
+    prompt_mode: normalizePromptMode(body.prompt_mode),
   }
 }
 
-function pickOutputImageUrl(output) {
-  return Array.isArray(output)
-    ? output[0]
-    : typeof output === "string"
-      ? output
-      : output?.image || output?.image_url || output?.url
+/* =========================================================
+ * 4) Input normalization
+ * ======================================================= */
+function normalizeInputs(body) {
+  const models = {
+    front: body.model_front || "",
+    back: body.model_back || "",
+  }
+
+  const garmentsByView = {
+    front: {
+      top: body.top_front || "",
+      bottom: body.bottom_front || "",
+      outer: body.outer_front || "",
+      dress: body.dress_front || "",
+    },
+    back: {
+      top: body.top_back || "",
+      bottom: body.bottom_back || "",
+      outer: body.outer_back || "",
+      dress: body.dress_back || "",
+    },
+  }
+
+  return {
+    models,
+    garmentsByView,
+    debug: !!body.debug,
+    seed: Number.isFinite(body.seed) ? Math.floor(body.seed) : 42,
+    promptMode: normalizePromptMode(body.prompt_mode),
+  }
 }
 
-async function runFashnTryOn({
-  requestId,
-  stepIndex,
-  stepType,
+function validateInputs(norm) {
+  const errors = []
+
+  if (!norm.models.front && !norm.models.back) {
+    errors.push("At least one model image is required: model_front or model_back")
+  }
+
+  for (const view of VIEWS) {
+    const m = norm.models[view]
+    if (m && !isHttpUrl(m) && !isDataUrl(m)) {
+      errors.push(`model_${view} must be a public URL or data URL`)
+    }
+
+    for (const slot of ["top", "bottom", "outer", "dress"]) {
+      const g = norm.garmentsByView[view][slot]
+      if (g && !isHttpUrl(g) && !isDataUrl(g)) {
+        errors.push(`${slot}_${view} must be a public URL or data URL`)
+      }
+    }
+  }
+
+  return errors
+}
+
+/* =========================================================
+ * 5) Image normalization
+ * - Keeps URLs as-is
+ * - Converts data URLs -> resized/compressed JPEG data URL
+ * ======================================================= */
+async function normalizeImageInput(input, options = {}) {
+  const longEdge = clamp(Number(options.longEdge || DEFAULT_LONG_EDGE), 512, 4096)
+  const quality = clamp(Number(options.quality || DEFAULT_JPEG_QUALITY), 60, 95)
+
+  if (!input) return ""
+
+  if (isHttpUrl(input)) {
+    return input
+  }
+
+  if (!isDataUrl(input)) {
+    throw new Error("Unsupported image input. Only public URL or data URL is allowed.")
+  }
+
+  const base64 = input.split(",")[1] || ""
+  const src = Buffer.from(base64, "base64")
+
+  const image = sharp(src, { failOn: "none" })
+  const meta = await image.metadata()
+
+  let width = meta.width || null
+  let height = meta.height || null
+
+  if (!width || !height) {
+    const out = await image.jpeg({ quality, mozjpeg: true }).toBuffer()
+    return toDataUrl(out, "image/jpeg")
+  }
+
+  const currentLong = Math.max(width, height)
+  let targetWidth = width
+  let targetHeight = height
+
+  if (currentLong > longEdge) {
+    const ratio = longEdge / currentLong
+    targetWidth = Math.max(1, Math.round(width * ratio))
+    targetHeight = Math.max(1, Math.round(height * ratio))
+  }
+
+  const out = await image
+    .rotate()
+    .resize(targetWidth, targetHeight, {
+      fit: "inside",
+      withoutEnlargement: true,
+    })
+    .jpeg({ quality, mozjpeg: true })
+    .toBuffer()
+
+  return toDataUrl(out, "image/jpeg")
+}
+
+async function preprocessAll(norm) {
+  const prepared = {
+    models: { front: "", back: "" },
+    garmentsByView: {
+      front: { top: "", bottom: "", outer: "", dress: "" },
+      back: { top: "", bottom: "", outer: "", dress: "" },
+    },
+  }
+
+  for (const view of VIEWS) {
+    prepared.models[view] = await normalizeImageInput(norm.models[view], {
+      longEdge: 1600,
+      quality: 92,
+    })
+
+    for (const slot of ["top", "bottom", "outer", "dress"]) {
+      prepared.garmentsByView[view][slot] = await normalizeImageInput(
+        norm.garmentsByView[view][slot],
+        {
+          longEdge: 1600,
+          quality: 92,
+        }
+      )
+    }
+  }
+
+  return prepared
+}
+
+/* =========================================================
+ * 6) FASHN API
+ * ======================================================= */
+async function fashnRunTryOnMax({
   modelImage,
   productImage,
-  stepPrompt,
-  negativePrompt,
+  prompt = "",
+  seed = 42,
+  numImages = 1,
+  outputFormat = "png",
+  returnBase64 = false,
 }) {
-  /** preserve-only 최소 payload */
-  const body = {
-    model_name: FASHN_MODEL_NAME,
-    model_image: modelImage,
-    garment_image: productImage,
-    ...(stepPrompt ? { prompt: stepPrompt } : {}),
-    ...(negativePrompt ? { negative_prompt: negativePrompt } : {}),
+  const payload = {
+    model_name: "tryon-max",
+    inputs: {
+      model_image: modelImage,
+      product_image: productImage,
+      prompt,
+      seed,
+      num_images: numImages,
+      output_format: outputFormat,
+      return_base64: returnBase64,
+    },
   }
 
-  const r = await fetch(`${FASHN_BASE}/run`, {
+  const res = await fetch(FASHN_RUN_URL, {
     method: "POST",
-    headers: fashnHeaders(),
-    body: JSON.stringify(body),
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${FASHN_API_KEY}`,
+    },
+    body: JSON.stringify(payload),
   })
 
-  const text = await r.text()
+  const text = await res.text()
   let json = null
   try {
-    json = JSON.parse(text)
-  } catch {}
-
-  if (!r.ok) {
-    console.error(`[${requestId}] FASHN /run failed`, {
-      stepIndex,
-      stepType,
-      status: r.status,
-      statusText: r.statusText,
-      responsePreview: text,
-      requestBodyPreview: {
-        ...body,
-        model_image: isDataUrl(body.model_image)
-          ? `dataUrl(${String(body.model_image).length})`
-          : safeSlice(body.model_image, 120),
-        garment_image: isDataUrl(body.garment_image)
-          ? `dataUrl(${String(body.garment_image).length})`
-          : safeSlice(body.garment_image, 120),
-      },
-    })
-
-    throw new Error(
-      json?.error ||
-        text ||
-        `FASHN /run failed: step=${stepType} HTTP ${r.status}`
-    )
+    json = text ? JSON.parse(text) : null
+  } catch {
+    json = { raw: text }
   }
 
-  const predictionId = json?.id
+  if (!res.ok) {
+    const msg =
+      json?.error?.message ||
+      json?.message ||
+      json?.error ||
+      `FASHN run failed with ${res.status}`
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
+  }
+
+  const predictionId =
+    json?.id ||
+    json?.prediction_id ||
+    json?.data?.id ||
+    json?.result?.id ||
+    ""
+
   if (!predictionId) {
-    throw new Error("FASHN /run returned no id")
+    throw new Error("FASHN response did not include prediction id")
   }
 
   return {
-    predictionId,
-    status: json?.status || "starting",
+    id: predictionId,
+    raw: json,
+    payload,
   }
 }
 
-async function pollFashnPrediction(id, requestId, stepType) {
-  for (let i = 0; i < 120; i++) {
-    await new Promise((r) => setTimeout(r, 1500))
+async function fashnPollPrediction(id, opts = {}) {
+  const intervalMs = Number(opts.intervalMs || DEFAULT_POLL_INTERVAL_MS)
+  const timeoutMs = Number(opts.timeoutMs || DEFAULT_POLL_TIMEOUT_MS)
+  const started = Date.now()
 
-    const rr = await fetch(`${FASHN_BASE}/status/${id}`, {
-      headers: fashnHeaders(),
+  for (;;) {
+    const res = await fetch(FASHN_STATUS_URL(id), {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${FASHN_API_KEY}`,
+      },
     })
 
-    const text = await rr.text()
+    const text = await res.text()
     let json = null
     try {
-      json = JSON.parse(text)
-    } catch {}
+      json = text ? JSON.parse(text) : null
+    } catch {
+      json = { raw: text }
+    }
 
-    if (!rr.ok) {
-      console.error(`[${requestId}] FASHN /status failed`, {
-        predictionId: id,
-        stepType,
-        status: rr.status,
-        statusText: rr.statusText,
-        responsePreview: safeSlice(text, 500),
-      })
-
-      throw new Error(
+    if (!res.ok) {
+      const msg =
+        json?.error?.message ||
+        json?.message ||
         json?.error ||
-          `FASHN /status failed: HTTP ${rr.status} ${text.slice(0, 500)}`
-      )
+        `FASHN status failed with ${res.status}`
+      throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
     }
 
-    const status = json?.status
+    const status =
+      json?.status ||
+      json?.data?.status ||
+      json?.result?.status ||
+      "unknown"
 
-    if (status === "completed") {
-      const imageUrl = pickOutputImageUrl(json?.output)
-      if (!imageUrl) {
-        console.error(`[${requestId}] FASHN completed but no image`, {
-          predictionId: id,
-          stepType,
-          raw: json,
-        })
-        throw new Error("No imageUrl in output")
+    if (status === "completed" || status === "succeeded" || status === "success") {
+      const outputs =
+        json?.output ||
+        json?.outputs ||
+        json?.result?.output ||
+        json?.data?.output ||
+        null
+
+      const finalImage =
+        outputs?.images?.[0] ||
+        outputs?.image ||
+        outputs?.url ||
+        json?.output_image ||
+        json?.image ||
+        json?.result?.image ||
+        json?.result?.url ||
+        null
+
+      if (!finalImage) {
+        return { status, raw: json, finalImage: null }
       }
-      return imageUrl
+
+      return { status, raw: json, finalImage }
     }
 
-    if (
-      ["failed", "canceled", "cancelled"].includes(
-        String(status || "").toLowerCase()
-      )
-    ) {
-      console.error(`[${requestId}] FASHN prediction failed`, {
-        predictionId: id,
-        stepType,
-        status,
-        raw: json,
+    if (status === "failed" || status === "error" || status === "cancelled") {
+      const msg =
+        json?.error?.message ||
+        json?.message ||
+        json?.error ||
+        `Prediction ${id} failed`
+      throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
+    }
+
+    if (Date.now() - started > timeoutMs) {
+      throw new Error(`Prediction ${id} timed out`)
+    }
+
+    await sleep(intervalMs)
+  }
+}
+
+/* =========================================================
+ * 7) Step execution
+ * ======================================================= */
+async function runTryOnStep({
+  slot,
+  inputModel,
+  garment,
+  seed,
+  promptMode,
+  debug = false,
+}) {
+  const prompt = promptMode === "short" ? shortPromptForSlot(slot) : ""
+
+  const run = await fashnRunTryOnMax({
+    modelImage: inputModel,
+    productImage: garment,
+    prompt,
+    seed,
+    numImages: 1,
+    outputFormat: "png",
+    returnBase64: false,
+  })
+
+  const done = await fashnPollPrediction(run.id)
+
+  return {
+    slot,
+    prompt,
+    predictionId: run.id,
+    inputModel,
+    garment,
+    output: done.finalImage,
+    debugRunRaw: debug ? run.raw : undefined,
+    debugStatusRaw: debug ? done.raw : undefined,
+  }
+}
+
+async function runTryOnStepWithRetry(args, retryCount = DEFAULT_RETRY_COUNT) {
+  let lastErr = null
+
+  for (let attempt = 0; attempt <= retryCount; attempt++) {
+    const seed = (args.seed || 42) + attempt
+
+    try {
+      const out = await runTryOnStep({
+        ...args,
+        seed,
       })
-      throw new Error(json?.error || `prediction ${status}`)
+      return {
+        ok: true,
+        step: out,
+        attempts: attempt + 1,
+      }
+    } catch (err) {
+      lastErr = err
+      if (attempt >= retryCount) break
     }
   }
 
-  throw new Error("timeout: prediction not finished")
+  return {
+    ok: false,
+    error: safeErrMessage(lastErr),
+    attempts: retryCount + 1,
+  }
 }
 
-// 안내용
-app.get("/api/dress", (req, res) => {
-  res.json({ ok: true, hint: "Use POST /api/dress or GET /api/dress/:id" })
+/* =========================================================
+ * 8) Sequential view pipeline
+ * ======================================================= */
+async function runSequentialView({
+  view,
+  modelImage,
+  garments,
+  seed,
+  promptMode,
+  debug,
+}) {
+  const plan = buildPlanForView({ [view]: garments }, view)
+
+  if (!modelImage) {
+    return {
+      ok: false,
+      view,
+      error: `model_${view} is missing`,
+      plan,
+      finalUrl: "",
+      steps: [],
+    }
+  }
+
+  if (plan.length === 0) {
+    return {
+      ok: true,
+      view,
+      plan,
+      finalUrl: modelImage,
+      steps: [],
+      warning: `No garments uploaded for ${view}`,
+    }
+  }
+
+  let currentModel = modelImage
+  const steps = []
+
+  for (let i = 0; i < plan.length; i++) {
+    const slot = plan[i]
+    const garment = garments[slot]
+
+    if (!garment) continue
+
+    const result = await runTryOnStepWithRetry(
+      {
+        slot,
+        inputModel: currentModel,
+        garment,
+        seed: seed + i,
+        promptMode,
+        debug,
+      },
+      DEFAULT_RETRY_COUNT
+    )
+
+    if (!result.ok) {
+      return {
+        ok: false,
+        view,
+        plan,
+        finalUrl: currentModel,
+        steps,
+        failedStep: slot,
+        error: result.error || `Failed on ${slot}`,
+      }
+    }
+
+    steps.push({
+      slot,
+      attempts: result.attempts,
+      inputModel: result.step.inputModel,
+      garment: result.step.garment,
+      output: result.step.output,
+      prompt: result.step.prompt,
+      predictionId: result.step.predictionId,
+      ...(debug
+        ? {
+            debugRunRaw: result.step.debugRunRaw,
+            debugStatusRaw: result.step.debugStatusRaw,
+          }
+        : {}),
+    })
+
+    currentModel = result.step.output || currentModel
+  }
+
+  return {
+    ok: true,
+    view,
+    plan,
+    finalUrl: currentModel,
+    steps,
+  }
+}
+
+/* =========================================================
+ * 9) Main route
+ * ======================================================= */
+app.get("/health", (_req, res) => {
+  res.json({
+    ok: true,
+    service: "dressd-s3-tryon-max",
+    time: nowIso(),
+    hasApiKey: !!FASHN_API_KEY,
+  })
 })
 
-// 1) 합성 시작
-app.post("/api/dress", async (req, res) => {
-  const requestId = rid()
+app.post("/api/dress-max", async (req, res) => {
+  const startedAt = Date.now()
+  const requestMeta = getRequestDebugMeta(req.body)
 
   try {
-    const b = req.body || {}
-    const view = normalizeView(b.view || "front")
-    const model = b.model
-    const garments = b.garments || {}
-    const clientPrompt = String(b.prompt || "")
-    const clientNegativePrompt = String(b.negativePrompt || "")
-
-    if (!isDataUrl(model)) {
-      return res.status(400).json({
-        requestId,
-        error: "model must be a dataUrl (data:image/...)",
+    if (!FASHN_API_KEY) {
+      return res.status(500).json({
+        ok: false,
+        error: "Server is missing FASHN_API_KEY",
       })
     }
 
-    const serverPlan = buildOutfitPlanFromGarments({
-      garments,
-      view,
+    const norm = normalizeInputs(req.body)
+    const errors = validateInputs(norm)
+
+    if (errors.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid request",
+        details: errors,
+      })
+    }
+
+    const prepared = await preprocessAll(norm)
+
+    const frontPromise = runSequentialView({
+      view: "front",
+      modelImage: prepared.models.front,
+      garments: prepared.garmentsByView.front,
+      seed: norm.seed,
+      promptMode: norm.promptMode,
+      debug: norm.debug,
     })
 
-    const effectiveGarments = pickEffectiveGarmentUrls({
-      garments,
-      view,
-      plan: serverPlan,
+    const backPromise = runSequentialView({
+      view: "back",
+      modelImage: prepared.models.back,
+      garments: prepared.garmentsByView.back,
+      seed: norm.seed + 1000,
+      promptMode: norm.promptMode,
+      debug: norm.debug,
     })
 
-    if (!Array.isArray(serverPlan.steps) || serverPlan.steps.length === 0) {
-      return res.status(400).json({
-        requestId,
-        error: `No usable garment uploaded for ${view}`,
-        plan: serverPlan,
-      })
-    }
+    const [front, back] = await Promise.all([frontPromise, backPromise])
 
-    if (Object.keys(effectiveGarments).length === 0) {
-      return res.status(400).json({
-        requestId,
-        error: `No effective garments found for ${view}`,
-        plan: serverPlan,
-      })
-    }
-
-    console.log(`[${requestId}] /api/dress start`, {
-      view,
-      modelLen: String(model || "").length,
-      planSteps: serverPlan.steps,
-      effectiveGarments: summarizeEffectiveGarments(effectiveGarments),
-      planSummary: serverPlan.summary?.shortLine,
-      promptLen: clientPrompt.length,
-      negativeLen: clientNegativePrompt.length,
-      extractedHints: extractAllowedDressHints(clientPrompt),
-    })
-
-    let currentModel = model
-    const usedSteps = []
-    const stepDebug = []
-
-    for (let i = 0; i < serverPlan.steps.length; i++) {
-      const stepType = serverPlan.steps[i]
-      const stepKey = `${stepType}_${view}`
-      const productImage = effectiveGarments[stepKey]
-
-      if (!isDataUrl(productImage)) {
-        return res.status(400).json({
-          requestId,
-          error: `${stepKey} missing or not dataUrl`,
-          plan: serverPlan,
-          debug: {
-            failedStepIndex: i,
-            failedStepType: stepType,
-            failedStepKey: stepKey,
-            usedSteps,
-          },
-        })
-      }
-
-      const stepPrompt = makeStepPrompt({
-        basePrompt: clientPrompt,
-        stepType,
-        stepIndex: i,
-        totalSteps: serverPlan.steps.length,
-      })
-
-      console.log(`[${requestId}] /api/dress step`, {
-        stepIndex: i,
-        stepType,
-        stepKey,
-        promptLen: stepPrompt.length,
-        negativeLen: clientNegativePrompt.length,
-        promptPreview: stepPrompt.slice(0, 220),
-      })
-
-      try {
-        const run = await runFashnTryOn({
-          requestId,
-          stepIndex: i,
-          stepType,
-          modelImage: currentModel,
-          productImage,
-          stepPrompt,
-          negativePrompt: sanitizeDressPrompt(clientNegativePrompt),
-        })
-
-        const imageUrl = await pollFashnPrediction(
-          run.predictionId,
-          requestId,
-          stepType
-        )
-
-        currentModel = imageUrl
-        usedSteps.push(stepType)
-
-        stepDebug.push({
-          stepIndex: i,
-          stepType,
-          stepKey,
-          predictionId: run.predictionId,
-          outputImageUrl: imageUrl,
-          promptPreview: String(stepPrompt || "").slice(0, 240),
-          negativePreview: String(clientNegativePrompt || "").slice(0, 180),
-        })
-      } catch (stepErr) {
-        const stepMessage = String(stepErr?.message ?? stepErr)
-
-        console.error(`[${requestId}] /api/dress STEP ERROR`, {
-          stepIndex: i,
-          stepType,
-          stepKey,
-          message: stepMessage,
-          promptPreview: String(stepPrompt || "").slice(0, 300),
-        })
-
-        return res.status(500).json({
-          requestId,
-          error: stepMessage,
-          plan: {
-            ...serverPlan,
-            steps: usedSteps,
-          },
-          debug: {
-            failedStepIndex: i,
-            failedStepType: stepType,
-            failedStepKey: stepKey,
-            usedSteps,
-            promptPreview: String(stepPrompt || "").slice(0, 300),
-            stepDebug,
-          },
-        })
-      }
-    }
+    const ok = !!front.ok || !!back.ok
 
     return res.json({
-      requestId,
-      status: "succeeded",
-      imageUrl: currentModel,
-      steps: usedSteps,
-      plan: {
-        ...serverPlan,
-        steps: usedSteps,
-      },
-      debug: {
-        engine: {
-          view,
-          model: "dataUrl",
-          modelLen: String(model || "").length,
-          garments: Object.keys(effectiveGarments).length,
-          steps: usedSteps.join(" -> "),
-        },
-        steps: stepDebug,
+      ok,
+      mode: "tryon-max",
+      front,
+      back,
+      meta: {
+        request: requestMeta,
+        elapsedMs: Date.now() - startedAt,
+        prepared: norm.debug
+          ? {
+              models: {
+                front: prepared.models.front ? "prepared" : "",
+                back: prepared.models.back ? "prepared" : "",
+              },
+              garments: {
+                front: pick(prepared.garmentsByView.front, ["top", "bottom", "outer", "dress"]),
+                back: pick(prepared.garmentsByView.back, ["top", "bottom", "outer", "dress"]),
+              },
+            }
+          : undefined,
       },
     })
-  } catch (e) {
-    console.error(`[${requestId}] /api/dress ERROR`, {
-      message: e?.message ?? String(e),
-      stack: e?.stack,
-      bodyKeys: safeKeys(req.body || {}),
-    })
-
+  } catch (err) {
+    console.error("[/api/dress-max] ERROR:", err)
     return res.status(500).json({
-      requestId,
-      error: String(e?.message ?? e),
-      debug: {
-        bodyKeys: safeKeys(req.body || {}),
+      ok: false,
+      error: safeErrMessage(err),
+      meta: {
+        request: requestMeta,
+        elapsedMs: Date.now() - startedAt,
       },
     })
   }
 })
 
-// 2) 결과 폴링 (기존 Runner 호환용 유지)
-app.get("/api/dress/:id", async (req, res) => {
-  try {
-    const id = req.params.id
-
-    const r = await fetch(`${FASHN_BASE}/status/${id}`, {
-      headers: fashnHeaders(),
-    })
-
-    const text = await r.text()
-    let json = null
-    try {
-      json = JSON.parse(text)
-    } catch {}
-
-    if (!r.ok) {
-      return res.status(r.status).json({
-        error:
-          json?.error ||
-          `FASHN /status failed: HTTP ${r.status} ${text.slice(0, 500)}`,
-      })
-    }
-
-    const status = json?.status
-
-    if (status === "completed") {
-      const imageUrl = pickOutputImageUrl(json?.output)
-
-      if (!imageUrl) {
-        return res.status(502).json({
-          error: "No imageUrl in output",
-          raw: json,
-        })
-      }
-
-      return res.json({ predictionId: id, status: "succeeded", imageUrl })
-    }
-
-    if (["starting", "in_queue", "processing"].includes(status)) {
-      return res.status(202).json({ predictionId: id, status })
-    }
-
-    return res.status(500).json({
-      predictionId: id,
-      status,
-      error: json?.error || "prediction failed",
-    })
-  } catch (e) {
-    return res.status(500).json({ error: String(e?.message ?? e) })
-  }
+/* =========================================================
+ * 10) Start
+ * ======================================================= */
+app.listen(PORT, () => {
+  console.log(`[BOOT] DRESSD S3 Try-On Max listening on :${PORT}`)
 })
-
-/**
- * ============================================================
- * ✅ Start
- * ============================================================
- */
-const PORT = process.env.PORT || 3000
-app.listen(PORT, () => console.log("Server running on", PORT))
