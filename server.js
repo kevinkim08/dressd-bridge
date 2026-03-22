@@ -1035,6 +1035,7 @@ app.post("/api/s1/pair", async (req, res) => {
 /**
  * ============================================================
  * ✅ 7) S3 Dress (FASHN) - Try-On Max preserve only
+ * ✅ CDN URL flow via Cloudflare Images
  * ============================================================
  */
 
@@ -1049,6 +1050,9 @@ const S3_DEFAULT_JPEG_QUALITY = 92
 const S3_DEFAULT_POLL_INTERVAL_MS = 2500
 const S3_DEFAULT_POLL_TIMEOUT_MS = 1000 * 60 * 6
 const S3_DEFAULT_RETRY_COUNT = 1
+
+const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || ""
+const CF_IMAGES_TOKEN = process.env.CLOUDFLARE_IMAGES_TOKEN || ""
 
 function s3IsHttpUrl(v) {
   return typeof v === "string" && /^https?:\/\//i.test(v)
@@ -1087,10 +1091,6 @@ function s3SafeErrMessage(err) {
   } catch {
     return "Unknown error"
   }
-}
-
-function s3ToDataUrl(buffer, mime = "image/jpeg") {
-  return `data:${mime};base64,${buffer.toString("base64")}`
 }
 
 function s3NormalizePromptMode(v) {
@@ -1184,6 +1184,63 @@ function s3ValidateInputs(norm) {
   return errors
 }
 
+/**
+ * ============================================================
+ * ✅ Cloudflare Images upload helpers
+ * ============================================================
+ */
+
+async function s3UploadBufferToCloudflareImages(buffer, filename = "upload.jpg", mime = "image/jpeg") {
+  if (!CF_ACCOUNT_ID || !CF_IMAGES_TOKEN) {
+    throw new Error("Cloudflare Images env is missing")
+  }
+
+  const form = new FormData()
+  form.append("file", new Blob([buffer], { type: mime }), filename)
+
+  const res = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/images/v1`,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${CF_IMAGES_TOKEN}`,
+      },
+      body: form,
+    }
+  )
+
+  const text = await res.text()
+  let json = null
+  try {
+    json = text ? JSON.parse(text) : null
+  } catch {
+    json = { raw: text }
+  }
+
+  if (!res.ok || !json?.success) {
+    const msg =
+      json?.errors?.[0]?.message ||
+      json?.result?.message ||
+      json?.message ||
+      "Cloudflare Images upload failed"
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
+  }
+
+  const variants = json?.result?.variants || []
+  const url = variants[0] || ""
+
+  if (!url) {
+    throw new Error("Cloudflare Images did not return a public variant URL")
+  }
+
+  return {
+    id: json?.result?.id || "",
+    filename: json?.result?.filename || filename,
+    uploaded: json,
+    url,
+  }
+}
+
 async function s3NormalizeImageInput(input, options = {}) {
   const longEdge = s3Clamp(
     Number(options.longEdge || S3_DEFAULT_LONG_EDGE),
@@ -1198,7 +1255,9 @@ async function s3NormalizeImageInput(input, options = {}) {
 
   if (!input) return ""
 
-  if (s3IsHttpUrl(input)) return input
+  if (s3IsHttpUrl(input)) {
+    return input
+  }
 
   if (!s3IsDataUrl(input)) {
     throw new Error("Unsupported image input. Only public URL or data URL is allowed.")
@@ -1215,7 +1274,8 @@ async function s3NormalizeImageInput(input, options = {}) {
 
   if (!width || !height) {
     const out = await image.jpeg({ quality, mozjpeg: true }).toBuffer()
-    return s3ToDataUrl(out, "image/jpeg")
+    const uploaded = await s3UploadBufferToCloudflareImages(out, "upload.jpg", "image/jpeg")
+    return uploaded.url
   }
 
   const currentLong = Math.max(width, height)
@@ -1237,7 +1297,8 @@ async function s3NormalizeImageInput(input, options = {}) {
     .jpeg({ quality, mozjpeg: true })
     .toBuffer()
 
-  return s3ToDataUrl(out, "image/jpeg")
+  const uploaded = await s3UploadBufferToCloudflareImages(out, "upload.jpg", "image/jpeg")
+  return uploaded.url
 }
 
 async function s3PreprocessAll(norm) {
@@ -1268,6 +1329,12 @@ async function s3PreprocessAll(norm) {
 
   return prepared
 }
+
+/**
+ * ============================================================
+ * ✅ FASHN helpers
+ * ============================================================
+ */
 
 async function s3FashnRunTryOnMax({
   modelImage,
@@ -1326,6 +1393,76 @@ async function s3FashnRunTryOnMax({
 
   if (!predictionId) {
     throw new Error("FASHN response did not include prediction id")
+  }
+
+  return {
+    id: predictionId,
+    raw: json,
+    payload,
+  }
+}
+
+async function s3FashnRunTryOnV16({
+  modelImage,
+  garmentImage,
+  category = "auto",
+  garmentPhotoType = "auto",
+  mode = "quality",
+  seed = 42,
+  numSamples = 1,
+  outputFormat = "png",
+  returnBase64 = false,
+}) {
+  const payload = {
+    model_name: "tryon-v1.6",
+    inputs: {
+      model_image: modelImage,
+      garment_image: garmentImage,
+      category,
+      garment_photo_type: garmentPhotoType,
+      mode,
+      seed,
+      num_samples: numSamples,
+      output_format: outputFormat,
+      return_base64: returnBase64,
+    },
+  }
+
+  const res = await fetch(FASHN_RUN_URL, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      Authorization: `Bearer ${process.env.FASHN_API_KEY || ""}`,
+    },
+    body: JSON.stringify(payload),
+  })
+
+  const text = await res.text()
+  let json = null
+  try {
+    json = text ? JSON.parse(text) : null
+  } catch {
+    json = { raw: text }
+  }
+
+  if (!res.ok) {
+    const msg =
+      json?.error?.message ||
+      json?.message ||
+      json?.error ||
+      `FASHN v1.6 run failed with ${res.status}`
+    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
+  }
+
+  const predictionId =
+    json?.id ||
+    json?.prediction_id ||
+    json?.data?.id ||
+    json?.result?.id ||
+    ""
+
+  if (!predictionId) {
+    throw new Error("FASHN v1.6 response did not include prediction id")
   }
 
   return {
@@ -1565,85 +1702,98 @@ async function s3RunSequentialView({
   }
 }
 
+/**
+ * ============================================================
+ * ✅ Routes
+ * ============================================================
+ */
+
 app.post("/api/dress-max", async (req, res) => {
   const startedAt = Date.now()
   const requestMeta = s3GetRequestDebugMeta(req.body)
 
-  /**
- * ============================================================
- * ✅ S3 TEST - FASHN tryon-v1.6 category forced
- * ============================================================
- */
-
-async function s3FashnRunTryOnV16({
-  modelImage,
-  garmentImage,
-  category = "auto", // "tops" | "bottoms" | "one-pieces" | "auto"
-  garmentPhotoType = "auto", // "auto" | "flat-lay" | "model"
-  mode = "quality", // "performance" | "balanced" | "quality"
-  seed = 42,
-  numSamples = 1,
-  outputFormat = "png",
-  returnBase64 = false,
-}) {
-  const payload = {
-    model_name: "tryon-v1.6",
-    inputs: {
-      model_image: modelImage,
-      garment_image: garmentImage,
-      category,
-      garment_photo_type: garmentPhotoType,
-      mode,
-      seed,
-      num_samples: numSamples,
-      output_format: outputFormat,
-      return_base64: returnBase64,
-    },
-  }
-
-  const res = await fetch(FASHN_RUN_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.FASHN_API_KEY || ""}`,
-    },
-    body: JSON.stringify(payload),
-  })
-
-  const text = await res.text()
-  let json = null
   try {
-    json = text ? JSON.parse(text) : null
-  } catch {
-    json = { raw: text }
-  }
+    if (!process.env.FASHN_API_KEY) {
+      return res.status(500).json({
+        ok: false,
+        error: "Server is missing FASHN_API_KEY",
+      })
+    }
 
-  if (!res.ok) {
-    const msg =
-      json?.error?.message ||
-      json?.message ||
-      json?.error ||
-      `FASHN v1.6 run failed with ${res.status}`
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
-  }
+    if (!CF_ACCOUNT_ID || !CF_IMAGES_TOKEN) {
+      return res.status(500).json({
+        ok: false,
+        error: "Server is missing Cloudflare Images env",
+      })
+    }
 
-  const predictionId =
-    json?.id ||
-    json?.prediction_id ||
-    json?.data?.id ||
-    json?.result?.id ||
-    ""
+    const norm = s3NormalizeInputs(req.body)
+    const errors = s3ValidateInputs(norm)
 
-  if (!predictionId) {
-    throw new Error("FASHN v1.6 response did not include prediction id")
-  }
+    if (errors.length) {
+      return res.status(400).json({
+        ok: false,
+        error: "Invalid request",
+        details: errors,
+      })
+    }
 
-  return {
-    id: predictionId,
-    raw: json,
-    payload,
+    const prepared = await s3PreprocessAll(norm)
+
+    const frontPromise = s3RunSequentialView({
+      view: "front",
+      modelImage: prepared.models.front,
+      garments: prepared.garmentsByView.front,
+      seed: norm.seed,
+      promptMode: norm.promptMode,
+      debug: norm.debug,
+    })
+
+    const backPromise = s3RunSequentialView({
+      view: "back",
+      modelImage: prepared.models.back,
+      garments: prepared.garmentsByView.back,
+      seed: norm.seed + 1000,
+      promptMode: norm.promptMode,
+      debug: norm.debug,
+    })
+
+    const [front, back] = await Promise.all([frontPromise, backPromise])
+
+    return res.json({
+      ok: !!front.ok || !!back.ok,
+      mode: "tryon-max",
+      front,
+      back,
+      meta: {
+        request: requestMeta,
+        elapsedMs: Date.now() - startedAt,
+        prepared: norm.debug
+          ? {
+              models: {
+                front: prepared.models.front || "",
+                back: prepared.models.back || "",
+              },
+              garments: {
+                front: s3Pick(prepared.garmentsByView.front, ["top", "bottom", "outer", "dress"]),
+                back: s3Pick(prepared.garmentsByView.back, ["top", "bottom", "outer", "dress"]),
+              },
+            }
+          : undefined,
+      },
+    })
+  } catch (err) {
+    console.error("[/api/dress-max] ERROR:", err)
+    return res.status(500).json({
+      ok: false,
+      error: s3SafeErrMessage(err),
+      meta: {
+        request: requestMeta,
+        elapsedMs: Date.now() - startedAt,
+      },
+    })
   }
-}
+})
 
 app.post("/api/dress-v16-test", async (req, res) => {
   const startedAt = Date.now()
@@ -1653,6 +1803,13 @@ app.post("/api/dress-v16-test", async (req, res) => {
       return res.status(500).json({
         ok: false,
         error: "Server is missing FASHN_API_KEY",
+      })
+    }
+
+    if (!CF_ACCOUNT_ID || !CF_IMAGES_TOKEN) {
+      return res.status(500).json({
+        ok: false,
+        error: "Server is missing Cloudflare Images env",
       })
     }
 
@@ -1745,6 +1902,8 @@ app.post("/api/dress-v16-test", async (req, res) => {
         garment_photo_type,
         requestMode: mode,
         debug: !!debug,
+        preparedModel,
+        preparedGarment,
       },
       ...(debug
         ? {
@@ -1764,85 +1923,4 @@ app.post("/api/dress-v16-test", async (req, res) => {
       },
     })
   }
-})
-
-  try {
-    if (!process.env.FASHN_API_KEY) {
-      return res.status(500).json({
-        ok: false,
-        error: "Server is missing FASHN_API_KEY",
-      })
-    }
-
-    const norm = s3NormalizeInputs(req.body)
-    const errors = s3ValidateInputs(norm)
-
-    if (errors.length) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid request",
-        details: errors,
-      })
-    }
-
-    const prepared = await s3PreprocessAll(norm)
-
-    const frontPromise = s3RunSequentialView({
-      view: "front",
-      modelImage: prepared.models.front,
-      garments: prepared.garmentsByView.front,
-      seed: norm.seed,
-      promptMode: norm.promptMode,
-      debug: norm.debug,
-    })
-
-    const backPromise = s3RunSequentialView({
-      view: "back",
-      modelImage: prepared.models.back,
-      garments: prepared.garmentsByView.back,
-      seed: norm.seed + 1000,
-      promptMode: norm.promptMode,
-      debug: norm.debug,
-    })
-
-    const [front, back] = await Promise.all([frontPromise, backPromise])
-
-    return res.json({
-      ok: !!front.ok || !!back.ok,
-      mode: "tryon-max",
-      front,
-      back,
-      meta: {
-        request: requestMeta,
-        elapsedMs: Date.now() - startedAt,
-        prepared: norm.debug
-          ? {
-              models: {
-                front: prepared.models.front ? "prepared" : "",
-                back: prepared.models.back ? "prepared" : "",
-              },
-              garments: {
-                front: s3Pick(prepared.garmentsByView.front, ["top", "bottom", "outer", "dress"]),
-                back: s3Pick(prepared.garmentsByView.back, ["top", "bottom", "outer", "dress"]),
-              },
-            }
-          : undefined,
-      },
-    })
-  } catch (err) {
-    console.error("[/api/dress-max] ERROR:", err)
-    return res.status(500).json({
-      ok: false,
-      error: s3SafeErrMessage(err),
-      meta: {
-        request: requestMeta,
-        elapsedMs: Date.now() - startedAt,
-      },
-    })
-  }
-})
-const PORT = Number(process.env.PORT || 3000)
-
-app.listen(PORT, () => {
-  console.log(`[BOOT] Server listening on :${PORT}`)
 })
