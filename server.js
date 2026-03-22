@@ -1067,9 +1067,6 @@ import sharp from "sharp"
 
 const app = express()
 
-/* =========================================================
- * 0) Basic checks
- * ======================================================= */
 const nodeMajor = Number(String(process.versions.node || "0").split(".")[0] || 0)
 if (nodeMajor < 18) {
   console.error(`[BOOT] Node ${process.versions.node} detected. Node 18+ is required.`)
@@ -1083,9 +1080,6 @@ if (!FASHN_API_KEY) {
   console.warn("[BOOT] Missing FASHN_API_KEY")
 }
 
-/* =========================================================
- * 1) Middleware
- * ======================================================= */
 app.use((req, res, next) => {
   const origin = req.headers.origin
   const ok =
@@ -1116,9 +1110,6 @@ app.use((req, res, next) => {
 app.use(cors())
 app.use(express.json({ limit: "50mb" }))
 
-/* =========================================================
- * 2) Constants
- * ======================================================= */
 const FASHN_RUN_URL = "https://api.fashn.ai/v1/run"
 const FASHN_STATUS_URL = (id) => `https://api.fashn.ai/v1/status/${id}`
 
@@ -1131,9 +1122,6 @@ const DEFAULT_POLL_INTERVAL_MS = 2500
 const DEFAULT_POLL_TIMEOUT_MS = 1000 * 60 * 6
 const DEFAULT_RETRY_COUNT = 1
 
-/* =========================================================
- * 3) Helpers
- * ======================================================= */
 function isHttpUrl(v) {
   return typeof v === "string" && /^https?:\/\//i.test(v)
 }
@@ -1214,9 +1202,6 @@ function getRequestDebugMeta(body) {
   }
 }
 
-/* =========================================================
- * 4) Input normalization
- * ======================================================= */
 function normalizeInputs(body) {
   const models = {
     front: body.model_front || "",
@@ -1271,20 +1256,13 @@ function validateInputs(norm) {
   return errors
 }
 
-/* =========================================================
- * 5) Image normalization
- * - Keeps URLs as-is
- * - Converts data URLs -> resized/compressed JPEG data URL
- * ======================================================= */
 async function normalizeImageInput(input, options = {}) {
   const longEdge = clamp(Number(options.longEdge || DEFAULT_LONG_EDGE), 512, 4096)
   const quality = clamp(Number(options.quality || DEFAULT_JPEG_QUALITY), 60, 95)
 
   if (!input) return ""
 
-  if (isHttpUrl(input)) {
-    return input
-  }
+  if (isHttpUrl(input)) return input
 
   if (!isDataUrl(input)) {
     throw new Error("Unsupported image input. Only public URL or data URL is allowed.")
@@ -1355,9 +1333,6 @@ async function preprocessAll(norm) {
   return prepared
 }
 
-/* =========================================================
- * 6) FASHN API
- * ======================================================= */
 async function fashnRunTryOnMax({
   modelImage,
   productImage,
@@ -1478,11 +1453,7 @@ async function fashnPollPrediction(id, opts = {}) {
         json?.result?.url ||
         null
 
-      if (!finalImage) {
-        return { status, raw: json, finalImage: null }
-      }
-
-      return { status, raw: json, finalImage }
+      return { status, raw: json, finalImage: finalImage || null }
     }
 
     if (status === "failed" || status === "error" || status === "cancelled") {
@@ -1502,9 +1473,6 @@ async function fashnPollPrediction(id, opts = {}) {
   }
 }
 
-/* =========================================================
- * 7) Step execution
- * ======================================================= */
 async function runTryOnStep({
   slot,
   inputModel,
@@ -1568,9 +1536,6 @@ async function runTryOnStepWithRetry(args, retryCount = DEFAULT_RETRY_COUNT) {
   }
 }
 
-/* =========================================================
- * 8) Sequential view pipeline
- * ======================================================= */
 async function runSequentialView({
   view,
   modelImage,
@@ -1664,9 +1629,6 @@ async function runSequentialView({
   }
 }
 
-/* =========================================================
- * 9) Main route
- * ======================================================= */
 app.get("/health", (_req, res) => {
   res.json({
     ok: true,
@@ -1721,10 +1683,8 @@ app.post("/api/dress-max", async (req, res) => {
 
     const [front, back] = await Promise.all([frontPromise, backPromise])
 
-    const ok = !!front.ok || !!back.ok
-
     return res.json({
-      ok,
+      ok: !!front.ok || !!back.ok,
       mode: "tryon-max",
       front,
       back,
@@ -1758,9 +1718,6 @@ app.post("/api/dress-max", async (req, res) => {
   }
 })
 
-/* =========================================================
- * 10) Start
- * ======================================================= */
 app.listen(PORT, () => {
   console.log(`[BOOT] DRESSD S3 Try-On Max listening on :${PORT}`)
 })
