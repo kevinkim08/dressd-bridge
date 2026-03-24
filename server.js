@@ -8,6 +8,7 @@ import express from "express"
 import cors from "cors"
 import Replicate from "replicate"
 import sharp from "sharp"
+import NodeFormData from "form-data"
 
 const app = express()
 
@@ -1199,7 +1200,8 @@ async function s3UploadBufferToCloudflareImages(
     throw new Error("Cloudflare Images env is missing")
   }
 
-  const form = new FormData()
+  const form = new NodeFormData()
+
   form.append("file", buffer, {
     filename,
     contentType: mime,
