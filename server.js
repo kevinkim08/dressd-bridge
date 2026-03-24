@@ -1190,13 +1190,20 @@ function s3ValidateInputs(norm) {
  * ============================================================
  */
 
-async function s3UploadBufferToCloudflareImages(buffer, filename = "upload.jpg", mime = "image/jpeg") {
+async function s3UploadBufferToCloudflareImages(
+  buffer,
+  filename = "upload.jpg",
+  mime = "image/jpeg"
+) {
   if (!CF_ACCOUNT_ID || !CF_IMAGES_TOKEN) {
     throw new Error("Cloudflare Images env is missing")
   }
 
   const form = new FormData()
-  form.append("file", new Blob([buffer], { type: mime }), filename)
+  form.append("file", buffer, {
+    filename,
+    contentType: mime,
+  })
 
   const res = await fetch(
     `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/images/v1`,
@@ -1204,6 +1211,7 @@ async function s3UploadBufferToCloudflareImages(buffer, filename = "upload.jpg",
       method: "POST",
       headers: {
         Authorization: `Bearer ${CF_IMAGES_TOKEN}`,
+        ...form.getHeaders(),
       },
       body: form,
     }
@@ -1274,7 +1282,11 @@ async function s3NormalizeImageInput(input, options = {}) {
 
   if (!width || !height) {
     const out = await image.jpeg({ quality, mozjpeg: true }).toBuffer()
-    const uploaded = await s3UploadBufferToCloudflareImages(out, "upload.jpg", "image/jpeg")
+    const uploaded = await s3UploadBufferToCloudflareImages(
+      out,
+      "upload.jpg",
+      "image/jpeg"
+    )
     return uploaded.url
   }
 
@@ -1297,7 +1309,11 @@ async function s3NormalizeImageInput(input, options = {}) {
     .jpeg({ quality, mozjpeg: true })
     .toBuffer()
 
-  const uploaded = await s3UploadBufferToCloudflareImages(out, "upload.jpg", "image/jpeg")
+  const uploaded = await s3UploadBufferToCloudflareImages(
+    out,
+    "upload.jpg",
+    "image/jpeg"
+  )
   return uploaded.url
 }
 
@@ -1924,12 +1940,7 @@ app.post("/api/dress-v16-test", async (req, res) => {
     })
   }
 })
- 
-const PORT = Number(process.env.PORT || 3000)
 
-app.listen(PORT, () => {
-  console.log(`[BOOT] Server listening on :${PORT}`)
-})
 app.get("/api/cf-check", async (_req, res) => {
   try {
     const accountId = process.env.CLOUDFLARE_ACCOUNT_ID || ""
@@ -1972,4 +1983,38 @@ app.get("/api/cf-check", async (_req, res) => {
       error: String(err?.message || err),
     })
   }
+})
+
+app.post("/api/cf-upload-check", async (req, res) => {
+  try {
+    const { image } = req.body || {}
+
+    if (!image) {
+      return res.status(400).json({
+        ok: false,
+        error: "image(data URL) is required",
+      })
+    }
+
+    const uploadedUrl = await s3NormalizeImageInput(image, {
+      longEdge: 1600,
+      quality: 92,
+    })
+
+    return res.json({
+      ok: true,
+      uploadedUrl,
+    })
+  } catch (err) {
+    return res.status(500).json({
+      ok: false,
+      error: s3SafeErrMessage(err),
+    })
+  }
+})
+
+const PORT = Number(process.env.PORT || 3000)
+
+app.listen(PORT, () => {
+  console.log(`[BOOT] Server listening on :${PORT}`)
 })
