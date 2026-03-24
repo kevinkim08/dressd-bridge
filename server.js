@@ -1200,6 +1200,10 @@ async function s3UploadBufferToCloudflareImages(
     throw new Error("Cloudflare Images env is missing")
   }
 
+   // ✅ 여기 넣어 (이 위치 중요)
+  console.log("🔥 CF_ACCOUNT_ID:", CF_ACCOUNT_ID)
+  console.log("🔥 CF_IMAGES_TOKEN:", CF_IMAGES_TOKEN?.slice(0, 10))
+  
   const form = new NodeFormData()
 
   form.append("file", buffer, {
