@@ -1036,7 +1036,8 @@ app.post("/api/s1/pair", async (req, res) => {
 /**
  * ============================================================
  * ✅ 7) S3 Dress (FASHN) - Try-On Max preserve only
- * ✅ CDN URL flow via Cloudflare Images
+ * ✅ INPUT: normalize only (NO Cloudflare upload)
+ * ✅ OUTPUT: final result only -> Cloudflare Images upload
  * ============================================================
  */
 
@@ -1187,9 +1188,33 @@ function s3ValidateInputs(norm) {
 
 /**
  * ============================================================
- * ✅ Cloudflare Images upload helpers
+ * ✅ Cloudflare Images helpers
+ * - INPUT image는 업로드하지 않음
+ * - 최종 결과만 업로드
  * ============================================================
  */
+
+function s3GuessMimeFromFilename(filename = "") {
+  const lower = String(filename).toLowerCase()
+  if (lower.endsWith(".png")) return "image/png"
+  if (lower.endsWith(".webp")) return "image/webp"
+  return "image/jpeg"
+}
+
+function s3DataUrlToBuffer(dataUrl) {
+  const match = String(dataUrl).match(/^data:(image\/[a-zA-Z0-9.+-]+);base64,(.*)$/)
+  if (!match) {
+    throw new Error("Invalid data URL")
+  }
+  return {
+    mime: match[1],
+    buffer: Buffer.from(match[2], "base64"),
+  }
+}
+
+function s3BufferToDataUrl(buffer, mime = "image/jpeg") {
+  return `data:${mime};base64,${buffer.toString("base64")}`
+}
 
 async function s3UploadBufferToCloudflareImages(
   buffer,
@@ -1200,12 +1225,7 @@ async function s3UploadBufferToCloudflareImages(
     throw new Error("Cloudflare Images env is missing")
   }
 
-   // ✅ 여기 넣어 (이 위치 중요)
-  console.log("🔥 CF_ACCOUNT_ID:", CF_ACCOUNT_ID)
-  console.log("🔥 CF_IMAGES_TOKEN:", CF_IMAGES_TOKEN?.slice(0, 10))
-  
   const form = new NodeFormData()
-
   form.append("file", buffer, {
     filename,
     contentType: mime,
@@ -1255,6 +1275,52 @@ async function s3UploadBufferToCloudflareImages(
   }
 }
 
+async function s3FetchRemoteImageAsBuffer(url) {
+  const res = await fetch(url)
+
+  if (!res.ok) {
+    throw new Error(`Failed to fetch remote image: ${res.status}`)
+  }
+
+  const arrayBuffer = await res.arrayBuffer()
+  const contentType = res.headers.get("content-type") || "image/png"
+
+  return {
+    buffer: Buffer.from(arrayBuffer),
+    mime: contentType,
+  }
+}
+
+async function s3UploadRemoteResultToCloudflare(url, filename = "result.png") {
+  if (!url || !s3IsHttpUrl(url)) {
+    throw new Error("Remote result URL is missing or invalid")
+  }
+
+  const fetched = await s3FetchRemoteImageAsBuffer(url)
+  return s3UploadBufferToCloudflareImages(
+    fetched.buffer,
+    filename,
+    fetched.mime || s3GuessMimeFromFilename(filename)
+  )
+}
+
+function s3EmptyAsset() {
+  return {
+    id: "",
+    url: "",
+    filename: "",
+  }
+}
+
+/**
+ * ============================================================
+ * ✅ INPUT normalize helpers
+ * - public URL이면 그대로 사용
+ * - data URL이면 resize/rotate/jpeg 후 data URL로 반환
+ * - Cloudflare 업로드 안 함
+ * ============================================================
+ */
+
 async function s3NormalizeImageInput(input, options = {}) {
   const longEdge = s3Clamp(
     Number(options.longEdge || S3_DEFAULT_LONG_EDGE),
@@ -1277,10 +1343,8 @@ async function s3NormalizeImageInput(input, options = {}) {
     throw new Error("Unsupported image input. Only public URL or data URL is allowed.")
   }
 
-  const base64 = input.split(",")[1] || ""
-  const src = Buffer.from(base64, "base64")
-
-  const image = sharp(src, { failOn: "none" })
+  const parsed = s3DataUrlToBuffer(input)
+  const image = sharp(parsed.buffer, { failOn: "none" })
   const meta = await image.metadata()
 
   let width = meta.width || null
@@ -1288,12 +1352,7 @@ async function s3NormalizeImageInput(input, options = {}) {
 
   if (!width || !height) {
     const out = await image.jpeg({ quality, mozjpeg: true }).toBuffer()
-    const uploaded = await s3UploadBufferToCloudflareImages(
-      out,
-      "upload.jpg",
-      "image/jpeg"
-    )
-    return uploaded.url
+    return s3BufferToDataUrl(out, "image/jpeg")
   }
 
   const currentLong = Math.max(width, height)
@@ -1315,12 +1374,7 @@ async function s3NormalizeImageInput(input, options = {}) {
     .jpeg({ quality, mozjpeg: true })
     .toBuffer()
 
-  const uploaded = await s3UploadBufferToCloudflareImages(
-    out,
-    "upload.jpg",
-    "image/jpeg"
-  )
-  return uploaded.url
+  return s3BufferToDataUrl(out, "image/jpeg")
 }
 
 async function s3PreprocessAll(norm) {
@@ -1648,6 +1702,7 @@ async function s3RunSequentialView({
       error: `model_${view} is missing`,
       plan,
       finalUrl: "",
+      finalCloudflare: s3EmptyAsset(),
       steps: [],
     }
   }
@@ -1658,6 +1713,7 @@ async function s3RunSequentialView({
       view,
       plan,
       finalUrl: modelImage,
+      finalCloudflare: s3EmptyAsset(),
       steps: [],
       warning: `No garments uploaded for ${view}`,
     }
@@ -1690,6 +1746,7 @@ async function s3RunSequentialView({
         view,
         plan,
         finalUrl: currentModel,
+        finalCloudflare: s3EmptyAsset(),
         steps,
         failedStep: slot,
         error: result.error || `Failed on ${slot}`,
@@ -1715,11 +1772,21 @@ async function s3RunSequentialView({
     currentModel = result.step.output || currentModel
   }
 
+  let finalCloudflare = s3EmptyAsset()
+
+  if (currentModel && s3IsHttpUrl(currentModel)) {
+    finalCloudflare = await s3UploadRemoteResultToCloudflare(
+      currentModel,
+      `dress-${view}-${Date.now()}.png`
+    )
+  }
+
   return {
     ok: true,
     view,
     plan,
     finalUrl: currentModel,
+    finalCloudflare,
     steps,
   }
 }
@@ -1787,6 +1854,10 @@ app.post("/api/dress-max", async (req, res) => {
       mode: "tryon-max",
       front,
       back,
+      assets: {
+        front: front?.finalCloudflare || s3EmptyAsset(),
+        back: back?.finalCloudflare || s3EmptyAsset(),
+      },
       meta: {
         request: requestMeta,
         elapsedMs: Date.now() - startedAt,
@@ -1912,12 +1983,21 @@ app.post("/api/dress-v16-test", async (req, res) => {
 
     const done = await s3FashnPollPrediction(run.id)
 
+    let finalCloudflare = s3EmptyAsset()
+    if (done.finalImage && s3IsHttpUrl(done.finalImage)) {
+      finalCloudflare = await s3UploadRemoteResultToCloudflare(
+        done.finalImage,
+        `dress-v16-${slot}-${Date.now()}.png`
+      )
+    }
+
     return res.json({
       ok: true,
       mode: "tryon-v1.6",
       slot,
       category,
       finalUrl: done.finalImage || null,
+      finalCloudflare,
       predictionId: run.id,
       meta: {
         elapsedMs: Date.now() - startedAt,
@@ -1998,18 +2078,38 @@ app.post("/api/cf-upload-check", async (req, res) => {
     if (!image) {
       return res.status(400).json({
         ok: false,
-        error: "image(data URL) is required",
+        error: "image(data URL or public URL) is required",
       })
     }
 
-    const uploadedUrl = await s3NormalizeImageInput(image, {
-      longEdge: 1600,
-      quality: 92,
-    })
+    let uploaded = s3EmptyAsset()
+
+    if (s3IsDataUrl(image)) {
+      const normalized = await s3NormalizeImageInput(image, {
+        longEdge: 1600,
+        quality: 92,
+      })
+      const parsed = s3DataUrlToBuffer(normalized)
+      uploaded = await s3UploadBufferToCloudflareImages(
+        parsed.buffer,
+        "cf-upload-check.jpg",
+        parsed.mime
+      )
+    } else if (s3IsHttpUrl(image)) {
+      uploaded = await s3UploadRemoteResultToCloudflare(
+        image,
+        "cf-upload-check.png"
+      )
+    } else {
+      return res.status(400).json({
+        ok: false,
+        error: "image must be a data URL or public URL",
+      })
+    }
 
     return res.json({
       ok: true,
-      uploadedUrl,
+      uploaded,
     })
   } catch (err) {
     return res.status(500).json({
