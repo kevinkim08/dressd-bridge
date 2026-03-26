@@ -1038,6 +1038,7 @@ app.post("/api/s1/pair", async (req, res) => {
  * ✅ 7) S3 Dress (FASHN) - Try-On Max preserve only
  * ✅ INPUT: normalize only (NO Cloudflare upload)
  * ✅ OUTPUT: final result only -> Cloudflare Images upload
+ * ✅ NEW: meta + retry policy + score + bestAttempt
  * ============================================================
  */
 
@@ -1113,7 +1114,243 @@ function s3BuildPlanForView(garmentsByView, view) {
   return S3_SLOT_ORDER.filter((slot) => !!garmentsByView[view]?.[slot])
 }
 
+function s3ToNumber(v, fallback = 0) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : fallback
+}
+
+/* ============================================================
+ * ✅ NEW: meta / retry / score helpers
+ * ============================================================
+ */
+
+function s3NormalizeLengthMeta(meta) {
+  const src = meta && typeof meta === "object" ? meta : {}
+  const next = {}
+
+  if (src.top && typeof src.top === "object") {
+    next.top = {}
+    if (typeof src.top.sleeve === "string" && src.top.sleeve.trim()) {
+      next.top.sleeve = src.top.sleeve.trim().toLowerCase()
+    }
+    if (typeof src.top.length === "string" && src.top.length.trim()) {
+      next.top.length = src.top.length.trim().toLowerCase()
+    }
+  }
+
+  if (src.bottom && typeof src.bottom === "object") {
+    next.bottom = {}
+    if (typeof src.bottom.length === "string" && src.bottom.length.trim()) {
+      next.bottom.length = src.bottom.length.trim().toLowerCase()
+    }
+  }
+
+  if (src.outer && typeof src.outer === "object") {
+    next.outer = {}
+    if (typeof src.outer.length === "string" && src.outer.length.trim()) {
+      next.outer.length = src.outer.length.trim().toLowerCase()
+    }
+  }
+
+  if (src.dress && typeof src.dress === "object") {
+    next.dress = {}
+    if (typeof src.dress.length === "string" && src.dress.length.trim()) {
+      next.dress.length = src.dress.length.trim().toLowerCase()
+    }
+  }
+
+  return next
+}
+
+function s3NormalizeRetryPolicy(input) {
+  const src = input && typeof input === "object" ? input : {}
+  const enabled = src.enabled !== false
+  const maxAttempts = s3Clamp(s3ToNumber(src.max_attempts, 3), 1, 4)
+  const passScore = s3Clamp(s3ToNumber(src.pass_score, 70), 40, 100)
+  const warningScore = s3Clamp(s3ToNumber(src.warning_score, 55), 20, passScore)
+
+  return {
+    enabled,
+    maxAttempts,
+    passScore,
+    warningScore,
+  }
+}
+
+function s3GetGarmentKeysForView(garments, view) {
+  const keys = []
+  if (garments?.top) keys.push(`top_${view}`)
+  if (garments?.bottom) keys.push(`bottom_${view}`)
+  if (garments?.outer) keys.push(`outer_${view}`)
+  if (garments?.dress) keys.push(`dress_${view}`)
+  return keys
+}
+
+function s3ScoreMetaMatch({ meta, garments, view, resultUrl, attemptIndex = 1 }) {
+  const normalizedMeta = s3NormalizeLengthMeta(meta)
+  const garmentKeys = s3GetGarmentKeysForView(garments, view)
+
+  let total = 60
+  let lengthScore = 0
+  let detailScore = 20
+  let stabilityScore = 20
+  const scoreParts = []
+  const warnings = []
+
+  const hasTop = garmentKeys.includes(`top_${view}`)
+  const hasBottom = garmentKeys.includes(`bottom_${view}`)
+  const hasOuter = garmentKeys.includes(`outer_${view}`)
+  const hasDress = garmentKeys.includes(`dress_${view}`)
+
+  if (normalizedMeta.top?.sleeve && hasTop) {
+    lengthScore += 5
+    scoreParts.push({
+      code: "TOP_SLEEVE_META_PRESENT",
+      score: 5,
+      note: `top sleeve hint: ${normalizedMeta.top.sleeve}`,
+    })
+  }
+
+  if (normalizedMeta.top?.length && hasTop) {
+    lengthScore += 8
+    scoreParts.push({
+      code: "TOP_LENGTH_META_PRESENT",
+      score: 8,
+      note: `top length hint: ${normalizedMeta.top.length}`,
+    })
+  }
+
+  if (normalizedMeta.bottom?.length && hasBottom) {
+    lengthScore += 12
+    scoreParts.push({
+      code: "BOTTOM_LENGTH_META_PRESENT",
+      score: 12,
+      note: `bottom length hint: ${normalizedMeta.bottom.length}`,
+    })
+  }
+
+  if (normalizedMeta.outer?.length && hasOuter) {
+    lengthScore += 10
+    scoreParts.push({
+      code: "OUTER_LENGTH_META_PRESENT",
+      score: 10,
+      note: `outer length hint: ${normalizedMeta.outer.length}`,
+    })
+  }
+
+  if (normalizedMeta.dress?.length && hasDress) {
+    lengthScore += 12
+    scoreParts.push({
+      code: "DRESS_LENGTH_META_PRESENT",
+      score: 12,
+      note: `dress length hint: ${normalizedMeta.dress.length}`,
+    })
+  }
+
+  if (hasDress && (hasTop || hasBottom)) {
+    warnings.push({
+      code: "MIXED_DRESS_AND_SEPARATES",
+      message: "Dress and separate garments were mixed in one request.",
+    })
+    stabilityScore -= 12
+  }
+
+  if (!resultUrl) {
+    warnings.push({
+      code: "NO_RESULT_URL",
+      message: "No result URL returned from try-on engine.",
+    })
+    total = 0
+    detailScore = 0
+    stabilityScore = 0
+    lengthScore = 0
+  }
+
+  const retryBonus = s3Clamp((attemptIndex - 1) * 2, 0, 4)
+
+  total = s3Clamp(
+    total + lengthScore + detailScore + stabilityScore + retryBonus,
+    0,
+    100
+  )
+
+  if (total < 55) {
+    warnings.push({
+      code: "LOW_CONFIDENCE_SELECTION",
+      message: "The output is below the confidence threshold.",
+    })
+  }
+
+  return {
+    total,
+    pass: total >= 70,
+    warning: total >= 55 && total < 70,
+    scoreParts,
+    warnings,
+    summary: {
+      base: 60,
+      lengthScore,
+      detailScore,
+      stabilityScore,
+      retryBonus,
+    },
+  }
+}
+
+function s3ShouldRetry(score, retryPolicy, attemptIndex) {
+  if (!retryPolicy?.enabled) return false
+  if (!score) return attemptIndex < retryPolicy.maxAttempts
+  if (attemptIndex >= retryPolicy.maxAttempts) return false
+  if (score.total >= retryPolicy.passScore) return false
+  return true
+}
+
+function s3PickBestAttempt(attempts) {
+  if (!Array.isArray(attempts) || attempts.length === 0) return null
+
+  const sorted = [...attempts].sort((a, b) => {
+    const aScore = s3ToNumber(a?.score?.total, 0)
+    const bScore = s3ToNumber(b?.score?.total, 0)
+    if (bScore !== aScore) return bScore - aScore
+
+    const aAttempt = s3ToNumber(a?.attempt, 999)
+    const bAttempt = s3ToNumber(b?.attempt, 999)
+    return aAttempt - bAttempt
+  })
+
+  return sorted[0] || null
+}
+
+function s3CollectWarnings(attempts, retryPolicy) {
+  const best = s3PickBestAttempt(attempts)
+  const out = []
+
+  if (!best) {
+    out.push({
+      code: "NO_ATTEMPTS",
+      message: "No valid attempts were recorded.",
+    })
+    return out
+  }
+
+  for (const w of best?.score?.warnings || []) {
+    out.push(w)
+  }
+
+  if (s3ToNumber(best?.score?.total, 0) < s3ToNumber(retryPolicy?.passScore, 70)) {
+    out.push({
+      code: "BEST_RESULT_BELOW_PASS_SCORE",
+      message: `Best result score ${best?.score?.total ?? 0} is below pass score ${retryPolicy?.passScore ?? 70}.`,
+    })
+  }
+
+  return out
+}
+
 function s3GetRequestDebugMeta(body) {
+  const normalizedMeta = s3NormalizeLengthMeta(body?.meta || {})
+  const retryPolicy = s3NormalizeRetryPolicy(body?.retry_policy || {})
+
   return {
     receivedAt: s3NowIso(),
     hasModelFront: !!body.model_front,
@@ -1129,6 +1366,8 @@ function s3GetRequestDebugMeta(body) {
     debug: !!body.debug,
     seed: typeof body.seed === "number" ? body.seed : null,
     prompt_mode: s3NormalizePromptMode(body.prompt_mode),
+    meta: normalizedMeta,
+    retry_policy: retryPolicy,
   }
 }
 
@@ -1159,6 +1398,8 @@ function s3NormalizeInputs(body) {
     debug: !!body.debug,
     seed: Number.isFinite(body.seed) ? Math.floor(body.seed) : 42,
     promptMode: s3NormalizePromptMode(body.prompt_mode),
+    meta: s3NormalizeLengthMeta(body.meta || {}),
+    retryPolicy: s3NormalizeRetryPolicy(body.retry_policy || {}),
   }
 }
 
@@ -1387,13 +1628,11 @@ async function s3PreprocessAll(norm) {
   }
 
   for (const view of S3_VIEWS) {
-    // ✅ model만 전처리 (유지)
     prepared.models[view] = await s3NormalizeImageInput(norm.models[view], {
       longEdge: 1600,
       quality: 92,
     })
 
-    // ❗ garment는 절대 건드리지 않음 (핵심 수정)
     for (const slot of ["top", "bottom", "outer", "dress"]) {
       prepared.garmentsByView[view][slot] =
         norm.garmentsByView[view][slot] || ""
@@ -1590,18 +1829,15 @@ async function s3FashnPollPrediction(id, opts = {}) {
         null
 
       const finalImage =
-  // ✅ tryon-max 표준 (핵심)
-  (Array.isArray(json?.output) ? json.output[0] : null) ||
-
-  // ✅ 혹시 다른 구조 대응
-  outputs?.images?.[0] ||
-  outputs?.image ||
-  outputs?.url ||
-  json?.output_image ||
-  json?.image ||
-  json?.result?.image ||
-  json?.result?.url ||
-  null
+        (Array.isArray(json?.output) ? json.output[0] : null) ||
+        outputs?.images?.[0] ||
+        outputs?.image ||
+        outputs?.url ||
+        json?.output_image ||
+        json?.image ||
+        json?.result?.image ||
+        json?.result?.url ||
+        null
 
       return { status, raw: json, finalImage: finalImage || null }
     }
@@ -1645,7 +1881,6 @@ async function s3RunTryOnStep({
 
   const done = await s3FashnPollPrediction(run.id)
 
-  // ✅ 여기 추가 (핵심)
   console.log("[TRYON_MAX_RUN_PAYLOAD]", JSON.stringify(run.payload, null, 2))
   console.log("[TRYON_MAX_STATUS_RAW]", JSON.stringify(done.raw, null, 2))
   console.log("[TRYON_MAX_FINAL_IMAGE]", done.finalImage)
@@ -1691,7 +1926,7 @@ async function s3RunTryOnStepWithRetry(args, retryCount = S3_DEFAULT_RETRY_COUNT
   }
 }
 
-async function s3RunSequentialView({
+async function s3RunSequentialViewSingleAttempt({
   view,
   modelImage,
   garments,
@@ -1797,6 +2032,121 @@ async function s3RunSequentialView({
   }
 }
 
+async function s3RunSequentialViewWithRetry({
+  view,
+  modelImage,
+  garments,
+  seed,
+  promptMode,
+  debug,
+  meta,
+  retryPolicy,
+}) {
+  const attempts = []
+
+  for (let attempt = 1; attempt <= retryPolicy.maxAttempts; attempt++) {
+    try {
+      const single = await s3RunSequentialViewSingleAttempt({
+        view,
+        modelImage,
+        garments,
+        seed: seed + (attempt - 1) * 100,
+        promptMode,
+        debug,
+      })
+
+      const score = s3ScoreMetaMatch({
+        meta,
+        garments,
+        view,
+        resultUrl: single?.finalCloudflare?.url || single?.finalUrl || "",
+        attemptIndex: attempt,
+      })
+
+      attempts.push({
+        attempt,
+        ok: !!single?.ok,
+        finalUrl: single?.finalUrl || "",
+        finalCloudflare: single?.finalCloudflare || s3EmptyAsset(),
+        steps: Array.isArray(single?.steps) ? single.steps : [],
+        plan: single?.plan || [],
+        failedStep: single?.failedStep || "",
+        warning: single?.warning || "",
+        error: single?.error || "",
+        score,
+      })
+
+      if (!s3ShouldRetry(score, retryPolicy, attempt)) {
+        break
+      }
+    } catch (err) {
+      attempts.push({
+        attempt,
+        ok: false,
+        finalUrl: "",
+        finalCloudflare: s3EmptyAsset(),
+        steps: [],
+        plan: [],
+        failedStep: "",
+        warning: "",
+        error: s3SafeErrMessage(err),
+        score: {
+          total: 0,
+          pass: false,
+          warning: false,
+          scoreParts: [],
+          warnings: [
+            {
+              code: "ATTEMPT_FAILED",
+              message: s3SafeErrMessage(err),
+            },
+          ],
+          summary: {
+            base: 0,
+            lengthScore: 0,
+            detailScore: 0,
+            stabilityScore: 0,
+            retryBonus: 0,
+          },
+        },
+      })
+    }
+  }
+
+  const bestAttempt = s3PickBestAttempt(attempts)
+  const warnings = s3CollectWarnings(attempts, retryPolicy)
+
+  if (!bestAttempt || !bestAttempt?.finalCloudflare?.url) {
+    return {
+      ok: false,
+      view,
+      attempts,
+      bestAttempt,
+      warnings,
+      finalUrl: "",
+      finalCloudflare: s3EmptyAsset(),
+      steps: [],
+      plan: [],
+      score: null,
+      error: `No usable ${view} result after retries`,
+    }
+  }
+
+  return {
+    ok: true,
+    view,
+    attempts,
+    bestAttempt,
+    warnings,
+    finalUrl: bestAttempt.finalCloudflare?.url || bestAttempt.finalUrl || "",
+    finalCloudflare: bestAttempt.finalCloudflare || s3EmptyAsset(),
+    steps: bestAttempt.steps || [],
+    plan: bestAttempt.plan || [],
+    score: bestAttempt.score || null,
+    error: "",
+  }
+}
+
 /**
  * ============================================================
  * ✅ Routes
@@ -1833,24 +2183,31 @@ app.post("/api/dress-max", async (req, res) => {
       })
     }
 
+    console.log("[/api/dress-max] meta =", JSON.stringify(norm.meta, null, 2))
+    console.log("[/api/dress-max] retryPolicy =", JSON.stringify(norm.retryPolicy, null, 2))
+
     const prepared = await s3PreprocessAll(norm)
 
-    const frontPromise = s3RunSequentialView({
+    const frontPromise = s3RunSequentialViewWithRetry({
       view: "front",
       modelImage: prepared.models.front,
       garments: prepared.garmentsByView.front,
       seed: norm.seed,
       promptMode: norm.promptMode,
       debug: norm.debug,
+      meta: norm.meta,
+      retryPolicy: norm.retryPolicy,
     })
 
-    const backPromise = s3RunSequentialView({
+    const backPromise = s3RunSequentialViewWithRetry({
       view: "back",
       modelImage: prepared.models.back,
       garments: prepared.garmentsByView.back,
       seed: norm.seed + 1000,
       promptMode: norm.promptMode,
       debug: norm.debug,
+      meta: norm.meta,
+      retryPolicy: norm.retryPolicy,
     })
 
     const [front, back] = await Promise.all([frontPromise, backPromise])
@@ -1858,14 +2215,38 @@ app.post("/api/dress-max", async (req, res) => {
     return res.json({
       ok: !!front.ok || !!back.ok,
       mode: "tryon-max",
-      front,
-      back,
+      front: {
+        ok: !!front?.ok,
+        finalUrl: front?.finalUrl || "",
+        finalCloudflare: front?.finalCloudflare || s3EmptyAsset(),
+        steps: front?.steps || [],
+        plan: front?.plan || [],
+        attempts: front?.attempts || [],
+        bestAttempt: front?.bestAttempt || null,
+        warnings: front?.warnings || [],
+        score: front?.score || null,
+        error: front?.error || "",
+      },
+      back: {
+        ok: !!back?.ok,
+        finalUrl: back?.finalUrl || "",
+        finalCloudflare: back?.finalCloudflare || s3EmptyAsset(),
+        steps: back?.steps || [],
+        plan: back?.plan || [],
+        attempts: back?.attempts || [],
+        bestAttempt: back?.bestAttempt || null,
+        warnings: back?.warnings || [],
+        score: back?.score || null,
+        error: back?.error || "",
+      },
       assets: {
         front: front?.finalCloudflare || s3EmptyAsset(),
         back: back?.finalCloudflare || s3EmptyAsset(),
       },
       meta: {
         request: requestMeta,
+        normalizedMeta: norm.meta,
+        retryPolicy: norm.retryPolicy,
         elapsedMs: Date.now() - startedAt,
         prepared: norm.debug
           ? {
