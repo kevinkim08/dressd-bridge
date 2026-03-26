@@ -1387,19 +1387,16 @@ async function s3PreprocessAll(norm) {
   }
 
   for (const view of S3_VIEWS) {
+    // ✅ model만 전처리 (유지)
     prepared.models[view] = await s3NormalizeImageInput(norm.models[view], {
       longEdge: 1600,
       quality: 92,
     })
 
+    // ❗ garment는 절대 건드리지 않음 (핵심 수정)
     for (const slot of ["top", "bottom", "outer", "dress"]) {
-      prepared.garmentsByView[view][slot] = await s3NormalizeImageInput(
-        norm.garmentsByView[view][slot],
-        {
-          longEdge: 1600,
-          quality: 92,
-        }
-      )
+      prepared.garmentsByView[view][slot] =
+        norm.garmentsByView[view][slot] || ""
     }
   }
 
