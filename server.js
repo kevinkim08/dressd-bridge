@@ -1225,11 +1225,10 @@ async function s3UploadBufferToCloudflareImages(
     throw new Error("Cloudflare Images env is missing")
   }
 
-  const form = new NodeFormData()
-  form.append("file", buffer, {
-    filename,
-    contentType: mime,
-  })
+  const form = new FormData()
+  const blob = new Blob([buffer], { type: mime })
+
+  form.append("file", blob, filename)
 
   const res = await fetch(
     `https://api.cloudflare.com/client/v4/accounts/${CF_ACCOUNT_ID}/images/v1`,
@@ -1237,7 +1236,6 @@ async function s3UploadBufferToCloudflareImages(
       method: "POST",
       headers: {
         Authorization: `Bearer ${CF_IMAGES_TOKEN}`,
-        ...form.getHeaders(),
       },
       body: form,
     }
@@ -1245,6 +1243,7 @@ async function s3UploadBufferToCloudflareImages(
 
   const text = await res.text()
   let json = null
+
   try {
     json = text ? JSON.parse(text) : null
   } catch {
@@ -1257,6 +1256,7 @@ async function s3UploadBufferToCloudflareImages(
       json?.result?.message ||
       json?.message ||
       "Cloudflare Images upload failed"
+
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
   }
 
