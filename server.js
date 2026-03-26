@@ -1641,6 +1641,11 @@ async function s3RunTryOnStep({
 
   const done = await s3FashnPollPrediction(run.id)
 
+  // ✅ 여기 추가 (핵심)
+  console.log("[TRYON_MAX_RUN_PAYLOAD]", JSON.stringify(run.payload, null, 2))
+  console.log("[TRYON_MAX_STATUS_RAW]", JSON.stringify(done.raw, null, 2))
+  console.log("[TRYON_MAX_FINAL_IMAGE]", done.finalImage)
+
   return {
     slot,
     prompt,
