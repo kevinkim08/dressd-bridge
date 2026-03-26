@@ -1590,14 +1590,18 @@ async function s3FashnPollPrediction(id, opts = {}) {
         null
 
       const finalImage =
-        outputs?.images?.[0] ||
-        outputs?.image ||
-        outputs?.url ||
-        json?.output_image ||
-        json?.image ||
-        json?.result?.image ||
-        json?.result?.url ||
-        null
+  // ✅ tryon-max 표준 (핵심)
+  (Array.isArray(json?.output) ? json.output[0] : null) ||
+
+  // ✅ 혹시 다른 구조 대응
+  outputs?.images?.[0] ||
+  outputs?.image ||
+  outputs?.url ||
+  json?.output_image ||
+  json?.image ||
+  json?.result?.image ||
+  json?.result?.url ||
+  null
 
       return { status, raw: json, finalImage: finalImage || null }
     }
