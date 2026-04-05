@@ -1942,6 +1942,7 @@ async function s3RunTryOnStepWithRetry(args, retryCount = S3_DEFAULT_RETRY_COUNT
         ...args,
         seed,
       })
+
       return {
         ok: true,
         step: out,
@@ -1949,11 +1950,27 @@ async function s3RunTryOnStepWithRetry(args, retryCount = S3_DEFAULT_RETRY_COUNT
       }
     } catch (err) {
       lastErr = err
+      const msg = s3SafeErrMessage(err)
+
       console.error("[TRYON_STEP_RETRY_ERROR]", {
         slot: args?.slot || "",
         attempt: attempt + 1,
-        error: s3SafeErrMessage(err),
+        error: msg,
       })
+
+      // ✅ retry 해도 해결 안 되는 에러는 즉시 중단
+      if (
+        /out of credits/i.test(msg) ||
+        /purchase more/i.test(msg) ||
+        /insufficient/i.test(msg) ||
+        /payment/i.test(msg) ||
+        /unauthorized/i.test(msg) ||
+        /forbidden/i.test(msg) ||
+        /invalid api key/i.test(msg)
+      ) {
+        break
+      }
+
       if (attempt >= retryCount) break
     }
   }
@@ -1961,9 +1978,9 @@ async function s3RunTryOnStepWithRetry(args, retryCount = S3_DEFAULT_RETRY_COUNT
   return {
     ok: false,
     error: s3SafeErrMessage(lastErr),
-    attempts: retryCount + 1,
+    attempts: Math.min(retryCount + 1, (lastErr ? retryCount + 1 : 1)),
   }
-}
+}}
 
 async function s3RunSequentialViewSingleAttempt({
   view,
@@ -2095,6 +2112,76 @@ async function s3RunSequentialViewWithRetry({
 }) {
   const attempts = []
 
+  const hasAnyGarment =
+    !!garments?.top || !!garments?.bottom || !!garments?.outer || !!garments?.dress
+
+  // ✅ back/front 공통: 모델도 없고 의류도 없으면 skip
+  if (!modelImage && !hasAnyGarment) {
+    return {
+      ok: false,
+      skipped: true,
+      skipReason: `${view} skipped: model and garments are missing`,
+      view,
+      attempts: [],
+      bestAttempt: null,
+      warnings: [
+        {
+          code: "VIEW_SKIPPED_EMPTY_INPUT",
+          message: `${view} was skipped because both model and garments are missing.`,
+        },
+      ],
+      finalUrl: "",
+      finalCloudflare: s3EmptyAsset(),
+      steps: [],
+      plan: [],
+      score: null,
+      error: "",
+    }
+  }
+
+  // ✅ 모델 없고 의류만 있으면 명확한 에러
+  if (!modelImage && hasAnyGarment) {
+    return {
+      ok: false,
+      skipped: false,
+      skipReason: "",
+      view,
+      attempts: [],
+      bestAttempt: null,
+      warnings: [],
+      finalUrl: "",
+      finalCloudflare: s3EmptyAsset(),
+      steps: [],
+      plan: [],
+      score: null,
+      error: `model_${view} is missing`,
+    }
+  }
+
+  // ✅ 모델은 있는데 의류가 없으면 skip
+  if (modelImage && !hasAnyGarment) {
+    return {
+      ok: false,
+      skipped: true,
+      skipReason: `${view} skipped: no garments uploaded`,
+      view,
+      attempts: [],
+      bestAttempt: null,
+      warnings: [
+        {
+          code: "VIEW_SKIPPED_NO_GARMENTS",
+          message: `${view} was skipped because no garments were uploaded.`,
+        },
+      ],
+      finalUrl: "",
+      finalCloudflare: s3EmptyAsset(),
+      steps: [],
+      plan: [],
+      score: null,
+      error: "",
+    }
+  }
+
   for (let attempt = 1; attempt <= retryPolicy.maxAttempts; attempt++) {
     try {
       const single = await s3RunSequentialViewSingleAttempt({
@@ -2106,19 +2193,41 @@ async function s3RunSequentialViewWithRetry({
         debug,
       })
 
-      const score = s3ScoreMetaMatch({
-        meta,
-        garments,
-        view,
-        resultUrl: single?.finalCloudflare?.url || single?.finalUrl || "",
-        attemptIndex: attempt,
-      })
+      const score = single?.ok
+        ? s3ScoreMetaMatch({
+            meta,
+            garments,
+            view,
+            resultUrl: single?.finalCloudflare?.url || single?.finalUrl || "",
+            attemptIndex: attempt,
+          })
+        : {
+            total: 0,
+            pass: false,
+            warning: false,
+            scoreParts: [],
+            warnings: [
+              {
+                code: "ATTEMPT_FAILED",
+                message: single?.error || "Attempt failed",
+              },
+            ],
+            summary: {
+              base: 0,
+              lengthScore: 0,
+              detailScore: 0,
+              stabilityScore: 0,
+              retryBonus: 0,
+            },
+          }
 
       attempts.push({
         attempt,
         ok: !!single?.ok,
-        finalUrl: single?.finalUrl || "",
-        finalCloudflare: single?.finalCloudflare || s3EmptyAsset(),
+        finalUrl: single?.ok ? (single?.finalUrl || "") : "",
+        finalCloudflare: single?.ok
+          ? (single?.finalCloudflare || s3EmptyAsset())
+          : s3EmptyAsset(),
         steps: Array.isArray(single?.steps) ? single.steps : [],
         plan: single?.plan || [],
         failedStep: single?.failedStep || "",
@@ -2134,14 +2243,33 @@ async function s3RunSequentialViewWithRetry({
         stepCount: Array.isArray(single?.steps) ? single.steps.length : 0,
         failedStep: single?.failedStep || "",
         error: single?.error || "",
-        finalUrl: single?.finalUrl || "",
+        finalUrl: single?.ok ? (single?.finalUrl || "") : "",
         score: score?.total ?? null,
       })
 
-      if (!s3ShouldRetry(score, retryPolicy, attempt)) {
+      // ✅ 성공했고 기준점 넘으면 중단
+      if (single?.ok && !s3ShouldRetry(score, retryPolicy, attempt)) {
         break
       }
+
+      // ✅ 실패인데 retry해도 의미 없는 에러면 즉시 중단
+      if (!single?.ok) {
+        const msg = String(single?.error || "")
+        if (
+          /out of credits/i.test(msg) ||
+          /purchase more/i.test(msg) ||
+          /insufficient/i.test(msg) ||
+          /payment/i.test(msg) ||
+          /unauthorized/i.test(msg) ||
+          /forbidden/i.test(msg) ||
+          /invalid api key/i.test(msg)
+        ) {
+          break
+        }
+      }
     } catch (err) {
+      const fatalMessage = s3SafeErrMessage(err)
+
       attempts.push({
         attempt,
         ok: false,
@@ -2151,7 +2279,7 @@ async function s3RunSequentialViewWithRetry({
         plan: [],
         failedStep: "",
         warning: "",
-        error: s3SafeErrMessage(err),
+        error: fatalMessage,
         score: {
           total: 0,
           pass: false,
@@ -2160,7 +2288,7 @@ async function s3RunSequentialViewWithRetry({
           warnings: [
             {
               code: "ATTEMPT_FAILED",
-              message: s3SafeErrMessage(err),
+              message: fatalMessage,
             },
           ],
           summary: {
@@ -2176,17 +2304,37 @@ async function s3RunSequentialViewWithRetry({
       console.error("[VIEW_ATTEMPT_FATAL_ERROR]", {
         view,
         attempt,
-        error: s3SafeErrMessage(err),
+        error: fatalMessage,
       })
+
+      if (
+        /out of credits/i.test(fatalMessage) ||
+        /purchase more/i.test(fatalMessage) ||
+        /insufficient/i.test(fatalMessage) ||
+        /payment/i.test(fatalMessage) ||
+        /unauthorized/i.test(fatalMessage) ||
+        /forbidden/i.test(fatalMessage) ||
+        /invalid api key/i.test(fatalMessage)
+      ) {
+        break
+      }
     }
   }
 
   const bestAttempt = s3PickBestAttempt(attempts)
   const warnings = s3CollectWarnings(attempts, retryPolicy)
 
+  // ✅ usable 결과가 없으면 실제 에러를 우선 노출
   if (!bestAttempt || !bestAttempt?.finalCloudflare?.url) {
+    const realError =
+      bestAttempt?.error ||
+      attempts.find((a) => a?.error)?.error ||
+      `No usable ${view} result after retries`
+
     return {
       ok: false,
+      skipped: false,
+      skipReason: "",
       view,
       attempts,
       bestAttempt,
@@ -2194,14 +2342,16 @@ async function s3RunSequentialViewWithRetry({
       finalUrl: "",
       finalCloudflare: s3EmptyAsset(),
       steps: [],
-      plan: [],
+      plan: bestAttempt?.plan || [],
       score: null,
-      error: `No usable ${view} result after retries`,
+      error: realError,
     }
   }
 
   return {
     ok: true,
+    skipped: false,
+    skipReason: "",
     view,
     attempts,
     bestAttempt,
