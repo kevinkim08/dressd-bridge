@@ -1564,18 +1564,20 @@ function s3EmptyAsset() {
 
 async function s3NormalizeImageInput(input, options = {}) {
   const longEdge = s3Clamp(
-    Number(options.longEdge || S3_DEFAULT_LONG_EDGE),
-    512,
+    Number(options.longEdge || 2048),
+    1024,
     4096
   )
-  const quality = s3Clamp(
-    Number(options.quality || S3_DEFAULT_JPEG_QUALITY),
-    60,
-    95
+
+  const jpegQuality = s3Clamp(
+    Number(options.quality || 98),
+    85,
+    100
   )
 
   if (!input) return ""
 
+  // ✅ public URL은 그대로
   if (s3IsHttpUrl(input)) {
     return input
   }
@@ -1588,33 +1590,46 @@ async function s3NormalizeImageInput(input, options = {}) {
   const image = sharp(parsed.buffer, { failOn: "none" })
   const meta = await image.metadata()
 
-  let width = meta.width || null
-  let height = meta.height || null
+  const width = meta.width || null
+  const height = meta.height || null
+  const hasAlpha = !!meta.hasAlpha
+  const srcMime = parsed.mime || ""
 
   if (!width || !height) {
-    const out = await image.jpeg({ quality, mozjpeg: true }).toBuffer()
-    return s3BufferToDataUrl(out, "image/jpeg")
+    // 메타 못 읽으면 최대한 손실 적게 처리
+    if (hasAlpha || srcMime === "image/png") {
+      const out = await image.png({ compressionLevel: 6 }).toBuffer()
+      return s3BufferToDataUrl(out, "image/png")
+    } else {
+      const out = await image.jpeg({ quality: jpegQuality, mozjpeg: true }).toBuffer()
+      return s3BufferToDataUrl(out, "image/jpeg")
+    }
   }
 
   const currentLong = Math.max(width, height)
   let targetWidth = width
   let targetHeight = height
 
+  // ✅ 너무 큰 것만 축소
   if (currentLong > longEdge) {
     const ratio = longEdge / currentLong
     targetWidth = Math.max(1, Math.round(width * ratio))
     targetHeight = Math.max(1, Math.round(height * ratio))
   }
 
-  const out = await image
-    .rotate()
-    .resize(targetWidth, targetHeight, {
-      fit: "inside",
-      withoutEnlargement: true,
-    })
-    .jpeg({ quality, mozjpeg: true })
-    .toBuffer()
+  let pipeline = image.rotate().resize(targetWidth, targetHeight, {
+    fit: "inside",
+    withoutEnlargement: true,
+  })
 
+  // ✅ 알파 있거나 PNG면 PNG 유지
+  if (hasAlpha || srcMime === "image/png") {
+    const out = await pipeline.png({ compressionLevel: 6 }).toBuffer()
+    return s3BufferToDataUrl(out, "image/png")
+  }
+
+  // ✅ JPEG는 고품질 유지
+  const out = await pipeline.jpeg({ quality: jpegQuality, mozjpeg: true }).toBuffer()
   return s3BufferToDataUrl(out, "image/jpeg")
 }
 
@@ -1628,10 +1643,13 @@ async function s3PreprocessAll(norm) {
   }
 
   for (const view of S3_VIEWS) {
-    // ✅🔥 모델 원본 그대로 (화질 핵심)
-    prepared.models[view] = norm.models[view] || ""
+    // ✅ 모델만 약하게 normalize
+    prepared.models[view] = await s3NormalizeImageInput(norm.models[view], {
+      longEdge: 2048,
+      quality: 98,
+    })
 
-    // ✅ garment도 그대로
+    // ✅ garment는 원본 유지
     for (const slot of ["top", "bottom", "outer", "dress"]) {
       prepared.garmentsByView[view][slot] =
         norm.garmentsByView[view][slot] || ""
