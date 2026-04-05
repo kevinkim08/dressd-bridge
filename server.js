@@ -1036,9 +1036,9 @@ app.post("/api/s1/pair", async (req, res) => {
 /**
  * ============================================================
  * ✅ 7) S3 Dress (FASHN) - Try-On Max preserve only
- * ✅ INPUT: normalize only (NO Cloudflare upload)
+ * ✅ INPUT: model dataURL -> Cloudflare URL / garment 원본 유지
  * ✅ OUTPUT: final result only -> Cloudflare Images upload
- * ✅ NEW: meta + retry policy + score + bestAttempt
+ * ✅ NEW: meta + retry policy + score + bestAttempt + full debug logs
  * ============================================================
  */
 
@@ -1120,7 +1120,7 @@ function s3ToNumber(v, fallback = 0) {
 }
 
 /* ============================================================
- * ✅ NEW: meta / retry / score helpers
+ * ✅ meta / retry / score helpers
  * ============================================================
  */
 
@@ -1556,9 +1556,9 @@ function s3EmptyAsset() {
 /**
  * ============================================================
  * ✅ INPUT normalize helpers
- * - public URL이면 그대로 사용
- * - data URL이면 resize/rotate/jpeg 후 data URL로 반환
- * - Cloudflare 업로드 안 함
+ * - HTTP URL은 그대로 사용
+ * - data URL model은 Cloudflare에 먼저 올려 URL로 변환
+ * - garment는 원본 그대로 유지
  * ============================================================
  */
 
@@ -1577,7 +1577,6 @@ async function s3NormalizeImageInput(input, options = {}) {
 
   if (!input) return ""
 
-  // ✅ public URL은 그대로
   if (s3IsHttpUrl(input)) {
     return input
   }
@@ -1596,7 +1595,6 @@ async function s3NormalizeImageInput(input, options = {}) {
   const srcMime = parsed.mime || ""
 
   if (!width || !height) {
-    // 메타 못 읽으면 최대한 손실 적게 처리
     if (hasAlpha || srcMime === "image/png") {
       const out = await image.png({ compressionLevel: 6 }).toBuffer()
       return s3BufferToDataUrl(out, "image/png")
@@ -1610,7 +1608,6 @@ async function s3NormalizeImageInput(input, options = {}) {
   let targetWidth = width
   let targetHeight = height
 
-  // ✅ 너무 큰 것만 축소
   if (currentLong > longEdge) {
     const ratio = longEdge / currentLong
     targetWidth = Math.max(1, Math.round(width * ratio))
@@ -1622,13 +1619,11 @@ async function s3NormalizeImageInput(input, options = {}) {
     withoutEnlargement: true,
   })
 
-  // ✅ 알파 있거나 PNG면 PNG 유지
   if (hasAlpha || srcMime === "image/png") {
     const out = await pipeline.png({ compressionLevel: 6 }).toBuffer()
     return s3BufferToDataUrl(out, "image/png")
   }
 
-  // ✅ JPEG는 고품질 유지
   const out = await pipeline.jpeg({ quality: jpegQuality, mozjpeg: true }).toBuffer()
   return s3BufferToDataUrl(out, "image/jpeg")
 }
@@ -1646,12 +1641,16 @@ async function s3PreprocessAll(norm) {
     const modelInput = norm.models[view]
 
     if (s3IsDataUrl(modelInput)) {
-      // 🔥 핵심: model은 Cloudflare 업로드
-      const parsed = s3DataUrlToBuffer(modelInput)
+      const normalizedModel = await s3NormalizeImageInput(modelInput, {
+        longEdge: 1600,
+        quality: 92,
+      })
+
+      const parsed = s3DataUrlToBuffer(normalizedModel)
 
       const uploaded = await s3UploadBufferToCloudflareImages(
         parsed.buffer,
-        `model-${view}-${Date.now()}.png`,
+        `model-${view}-${Date.now()}.jpg`,
         parsed.mime
       )
 
@@ -1660,7 +1659,6 @@ async function s3PreprocessAll(norm) {
       prepared.models[view] = modelInput || ""
     }
 
-    // garment는 그대로
     for (const slot of ["top", "bottom", "outer", "dress"]) {
       prepared.garmentsByView[view][slot] =
         norm.garmentsByView[view][slot] || ""
@@ -1897,6 +1895,14 @@ async function s3RunTryOnStep({
 }) {
   const prompt = promptMode === "short" ? s3ShortPromptForSlot(slot) : ""
 
+  if (!inputModel) {
+    throw new Error(`Missing inputModel for slot ${slot}`)
+  }
+
+  if (!garment) {
+    throw new Error(`Missing garment for slot ${slot}`)
+  }
+
   const run = await s3FashnRunTryOnMax({
     modelImage: inputModel,
     productImage: garment,
@@ -1943,6 +1949,11 @@ async function s3RunTryOnStepWithRetry(args, retryCount = S3_DEFAULT_RETRY_COUNT
       }
     } catch (err) {
       lastErr = err
+      console.error("[TRYON_STEP_RETRY_ERROR]", {
+        slot: args?.slot || "",
+        attempt: attempt + 1,
+        error: s3SafeErrMessage(err),
+      })
       if (attempt >= retryCount) break
     }
   }
@@ -1963,6 +1974,18 @@ async function s3RunSequentialViewSingleAttempt({
   debug,
 }) {
   const plan = s3BuildPlanForView({ [view]: garments }, view)
+
+  console.log("[SEQUENTIAL_VIEW_START]", {
+    view,
+    hasModel: !!modelImage,
+    garments: {
+      top: !!garments?.top,
+      bottom: !!garments?.bottom,
+      outer: !!garments?.outer,
+      dress: !!garments?.dress,
+    },
+    plan,
+  })
 
   if (!modelImage) {
     return {
@@ -2104,6 +2127,17 @@ async function s3RunSequentialViewWithRetry({
         score,
       })
 
+      console.log("[VIEW_ATTEMPT_RESULT]", {
+        view,
+        attempt,
+        ok: !!single?.ok,
+        stepCount: Array.isArray(single?.steps) ? single.steps.length : 0,
+        failedStep: single?.failedStep || "",
+        error: single?.error || "",
+        finalUrl: single?.finalUrl || "",
+        score: score?.total ?? null,
+      })
+
       if (!s3ShouldRetry(score, retryPolicy, attempt)) {
         break
       }
@@ -2137,6 +2171,12 @@ async function s3RunSequentialViewWithRetry({
             retryBonus: 0,
           },
         },
+      })
+
+      console.error("[VIEW_ATTEMPT_FATAL_ERROR]", {
+        view,
+        attempt,
+        error: s3SafeErrMessage(err),
       })
     }
   }
@@ -2203,6 +2243,27 @@ app.post("/api/dress-max", async (req, res) => {
     const norm = s3NormalizeInputs(req.body)
     const errors = s3ValidateInputs(norm)
 
+    // =========================
+    // ✅ RAW BODY DEBUG
+    // =========================
+    console.log("===================================")
+    console.log("[RAW BODY KEYS]", Object.keys(req.body || {}))
+    console.log("[RAW BODY GARMENTS]", {
+      top_front: !!req.body?.top_front,
+      bottom_front: !!req.body?.bottom_front,
+      outer_front: !!req.body?.outer_front,
+      dress_front: !!req.body?.dress_front,
+      top_back: !!req.body?.top_back,
+      bottom_back: !!req.body?.bottom_back,
+      outer_back: !!req.body?.outer_back,
+      dress_back: !!req.body?.dress_back,
+    })
+    console.log("[RAW BODY MODELS]", {
+      model_front: !!req.body?.model_front,
+      model_back: !!req.body?.model_back,
+    })
+    console.log("===================================")
+
     if (errors.length) {
       return res.status(400).json({
         ok: false,
@@ -2219,9 +2280,9 @@ app.post("/api/dress-max", async (req, res) => {
 
     const prepared = await s3PreprocessAll(norm)
 
-    // ===================================
-    // ✅ INPUT DEBUG
-    // ===================================
+    // =========================
+    // ✅ PREPARED DEBUG
+    // =========================
     console.log("===================================")
     console.log("[S3 INPUT DEBUG]")
     console.log("model_front:", !!prepared.models.front)
@@ -2260,9 +2321,9 @@ app.post("/api/dress-max", async (req, res) => {
 
     const [front, back] = await Promise.all([frontPromise, backPromise])
 
-    // ===================================
+    // =========================
     // ✅ RESULT DEBUG
-    // ===================================
+    // =========================
     console.log("===================================")
     console.log("[S3 RESULT DEBUG]")
     console.log("front ok:", !!front?.ok)
@@ -2311,7 +2372,19 @@ app.post("/api/dress-max", async (req, res) => {
       },
 
       debug: {
-        input: {
+        rawBody: {
+          model_front: !!req.body?.model_front,
+          model_back: !!req.body?.model_back,
+          top_front: !!req.body?.top_front,
+          bottom_front: !!req.body?.bottom_front,
+          outer_front: !!req.body?.outer_front,
+          dress_front: !!req.body?.dress_front,
+          top_back: !!req.body?.top_back,
+          bottom_back: !!req.body?.bottom_back,
+          outer_back: !!req.body?.outer_back,
+          dress_back: !!req.body?.dress_back,
+        },
+        prepared: {
           model_front: !!prepared.models.front,
           model_back: !!prepared.models.back,
           garments_front: s3Pick(prepared.garmentsByView.front, [
@@ -2344,28 +2417,6 @@ app.post("/api/dress-max", async (req, res) => {
         normalizedMeta: norm.meta,
         retryPolicy: norm.retryPolicy,
         elapsedMs: Date.now() - startedAt,
-        prepared: norm.debug
-          ? {
-              models: {
-                front: prepared.models.front || "",
-                back: prepared.models.back || "",
-              },
-              garments: {
-                front: s3Pick(prepared.garmentsByView.front, [
-                  "top",
-                  "bottom",
-                  "outer",
-                  "dress",
-                ]),
-                back: s3Pick(prepared.garmentsByView.back, [
-                  "top",
-                  "bottom",
-                  "outer",
-                  "dress",
-                ]),
-              },
-            }
-          : undefined,
       },
     })
   } catch (err) {
