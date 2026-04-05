@@ -1501,9 +1501,16 @@ async function s3UploadBufferToCloudflareImages(
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
   }
 
-  const variants = json?.result?.variants || []
-  const url = variants[0] || ""
+ const variants = Array.isArray(json?.result?.variants) ? json.result.variants : []
 
+const preferredUrl =
+  variants.find((v) => /\/original(?:\/|$)/i.test(v)) ||
+  variants.find((v) => /\/public(?:\/|$)/i.test(v)) ||
+  variants[0] ||
+  ""
+
+const url = preferredUrl
+  
   if (!url) {
     throw new Error("Cloudflare Images did not return a public variant URL")
   }
@@ -1562,28 +1569,20 @@ function s3EmptyAsset() {
  * ============================================================
  */
 
-async function s3NormalizeImageInput(input, options = {}) {
-  const longEdge = s3Clamp(
-    Number(options.longEdge || 2048),
-    1024,
-    4096
-  )
-
-  const jpegQuality = s3Clamp(
-    Number(options.quality || 98),
-    85,
-    100
-  )
-
+async function s3NormalizeImageInput(input, _options = {}) {
   if (!input) return ""
 
   if (s3IsHttpUrl(input)) {
     return input
   }
 
-  if (!s3IsDataUrl(input)) {
-    throw new Error("Unsupported image input. Only public URL or data URL is allowed.")
+  if (s3IsDataUrl(input)) {
+    // ✅ 원본 data URL 그대로 유지
+    return input
   }
+
+  throw new Error("Unsupported image input. Only public URL or data URL is allowed.")
+}
 
   const parsed = s3DataUrlToBuffer(input)
   const image = sharp(parsed.buffer, { failOn: "none" })
@@ -1640,24 +1639,26 @@ async function s3PreprocessAll(norm) {
   for (const view of S3_VIEWS) {
     const modelInput = norm.models[view]
 
-    if (s3IsDataUrl(modelInput)) {
-      const normalizedModel = await s3NormalizeImageInput(modelInput, {
-        longEdge: 1600,
-        quality: 92,
-      })
+   if (s3IsDataUrl(modelInput)) {
+  const parsed = s3DataUrlToBuffer(modelInput)
 
-      const parsed = s3DataUrlToBuffer(normalizedModel)
+  const ext =
+    parsed.mime === "image/png"
+      ? "png"
+      : parsed.mime === "image/webp"
+      ? "webp"
+      : "jpg"
 
-      const uploaded = await s3UploadBufferToCloudflareImages(
-        parsed.buffer,
-        `model-${view}-${Date.now()}.jpg`,
-        parsed.mime
-      )
+  const uploaded = await s3UploadBufferToCloudflareImages(
+    parsed.buffer,
+    `model-${view}-${Date.now()}.${ext}`,
+    parsed.mime
+  )
 
-      prepared.models[view] = uploaded.url
-    } else {
-      prepared.models[view] = modelInput || ""
-    }
+  prepared.models[view] = uploaded.url
+} else {
+  prepared.models[view] = modelInput || ""
+}
 
     for (const slot of ["top", "bottom", "outer", "dress"]) {
       prepared.garmentsByView[view][slot] =
@@ -2654,15 +2655,8 @@ app.post("/api/dress-v16-test", async (req, res) => {
       })
     }
 
-    const preparedModel = await s3NormalizeImageInput(modelImage, {
-      longEdge: 1600,
-      quality: 92,
-    })
-
-    const preparedGarment = await s3NormalizeImageInput(garmentImage, {
-      longEdge: 1600,
-      quality: 92,
-    })
+    const preparedModel = await s3NormalizeImageInput(modelImage)
+const preparedGarment = await s3NormalizeImageInput(garmentImage)
 
     const run = await s3FashnRunTryOnV16({
       modelImage: preparedModel,
@@ -2780,16 +2774,20 @@ app.post("/api/cf-upload-check", async (req, res) => {
     let uploaded = s3EmptyAsset()
 
     if (s3IsDataUrl(image)) {
-      const normalized = await s3NormalizeImageInput(image, {
-        longEdge: 1600,
-        quality: 92,
-      })
-      const parsed = s3DataUrlToBuffer(normalized)
-      uploaded = await s3UploadBufferToCloudflareImages(
-        parsed.buffer,
-        "cf-upload-check.jpg",
-        parsed.mime
-      )
+   const parsed = s3DataUrlToBuffer(image)
+
+const ext =
+  parsed.mime === "image/png"
+    ? "png"
+    : parsed.mime === "image/webp"
+    ? "webp"
+    : "jpg"
+
+uploaded = await s3UploadBufferToCloudflareImages(
+  parsed.buffer,
+  `cf-upload-check.${ext}`,
+  parsed.mime
+)
     } else if (s3IsHttpUrl(image)) {
       uploaded = await s3UploadRemoteResultToCloudflare(
         image,
