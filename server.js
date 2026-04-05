@@ -1628,11 +1628,10 @@ async function s3PreprocessAll(norm) {
   }
 
   for (const view of S3_VIEWS) {
-    prepared.models[view] = await s3NormalizeImageInput(norm.models[view], {
-      longEdge: 1600,
-      quality: 92,
-    })
+    // ✅🔥 모델 원본 그대로 (화질 핵심)
+    prepared.models[view] = norm.models[view] || ""
 
+    // ✅ garment도 그대로
     for (const slot of ["top", "bottom", "outer", "dress"]) {
       prepared.garmentsByView[view][slot] =
         norm.garmentsByView[view][slot] || ""
@@ -2184,9 +2183,29 @@ app.post("/api/dress-max", async (req, res) => {
     }
 
     console.log("[/api/dress-max] meta =", JSON.stringify(norm.meta, null, 2))
-    console.log("[/api/dress-max] retryPolicy =", JSON.stringify(norm.retryPolicy, null, 2))
+    console.log(
+      "[/api/dress-max] retryPolicy =",
+      JSON.stringify(norm.retryPolicy, null, 2)
+    )
 
     const prepared = await s3PreprocessAll(norm)
+
+    // ===================================
+    // ✅ INPUT DEBUG
+    // ===================================
+    console.log("===================================")
+    console.log("[S3 INPUT DEBUG]")
+    console.log("model_front:", !!prepared.models.front)
+    console.log("model_back:", !!prepared.models.back)
+    console.log(
+      "garment_front:",
+      JSON.stringify(prepared.garmentsByView.front, null, 2)
+    )
+    console.log(
+      "garment_back:",
+      JSON.stringify(prepared.garmentsByView.back, null, 2)
+    )
+    console.log("===================================")
 
     const frontPromise = s3RunSequentialViewWithRetry({
       view: "front",
@@ -2212,9 +2231,25 @@ app.post("/api/dress-max", async (req, res) => {
 
     const [front, back] = await Promise.all([frontPromise, backPromise])
 
+    // ===================================
+    // ✅ RESULT DEBUG
+    // ===================================
+    console.log("===================================")
+    console.log("[S3 RESULT DEBUG]")
+    console.log("front ok:", !!front?.ok)
+    console.log("front error:", front?.error || "")
+    console.log("front steps:", Array.isArray(front?.steps) ? front.steps.length : 0)
+    console.log("front url:", front?.finalUrl || "")
+    console.log("back ok:", !!back?.ok)
+    console.log("back error:", back?.error || "")
+    console.log("back steps:", Array.isArray(back?.steps) ? back.steps.length : 0)
+    console.log("back url:", back?.finalUrl || "")
+    console.log("===================================")
+
     return res.json({
-      ok: !!front.ok || !!back.ok,
+      ok: !!front?.ok || !!back?.ok,
       mode: "tryon-max",
+
       front: {
         ok: !!front?.ok,
         finalUrl: front?.finalUrl || "",
@@ -2227,6 +2262,7 @@ app.post("/api/dress-max", async (req, res) => {
         score: front?.score || null,
         error: front?.error || "",
       },
+
       back: {
         ok: !!back?.ok,
         finalUrl: back?.finalUrl || "",
@@ -2239,10 +2275,41 @@ app.post("/api/dress-max", async (req, res) => {
         score: back?.score || null,
         error: back?.error || "",
       },
+
       assets: {
         front: front?.finalCloudflare || s3EmptyAsset(),
         back: back?.finalCloudflare || s3EmptyAsset(),
       },
+
+      debug: {
+        input: {
+          model_front: !!prepared.models.front,
+          model_back: !!prepared.models.back,
+          garments_front: s3Pick(prepared.garmentsByView.front, [
+            "top",
+            "bottom",
+            "outer",
+            "dress",
+          ]),
+          garments_back: s3Pick(prepared.garmentsByView.back, [
+            "top",
+            "bottom",
+            "outer",
+            "dress",
+          ]),
+        },
+        output: {
+          front_ok: !!front?.ok,
+          front_error: front?.error || "",
+          front_steps: Array.isArray(front?.steps) ? front.steps.length : 0,
+          front_url: front?.finalUrl || "",
+          back_ok: !!back?.ok,
+          back_error: back?.error || "",
+          back_steps: Array.isArray(back?.steps) ? back.steps.length : 0,
+          back_url: back?.finalUrl || "",
+        },
+      },
+
       meta: {
         request: requestMeta,
         normalizedMeta: norm.meta,
@@ -2255,8 +2322,18 @@ app.post("/api/dress-max", async (req, res) => {
                 back: prepared.models.back || "",
               },
               garments: {
-                front: s3Pick(prepared.garmentsByView.front, ["top", "bottom", "outer", "dress"]),
-                back: s3Pick(prepared.garmentsByView.back, ["top", "bottom", "outer", "dress"]),
+                front: s3Pick(prepared.garmentsByView.front, [
+                  "top",
+                  "bottom",
+                  "outer",
+                  "dress",
+                ]),
+                back: s3Pick(prepared.garmentsByView.back, [
+                  "top",
+                  "bottom",
+                  "outer",
+                  "dress",
+                ]),
               },
             }
           : undefined,
@@ -2264,6 +2341,7 @@ app.post("/api/dress-max", async (req, res) => {
     })
   } catch (err) {
     console.error("[/api/dress-max] ERROR:", err)
+
     return res.status(500).json({
       ok: false,
       error: s3SafeErrMessage(err),
