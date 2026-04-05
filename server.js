@@ -1048,14 +1048,17 @@ const FASHN_STATUS_URL = (id) => `https://api.fashn.ai/v1/status/${id}`
 const S3_SLOT_ORDER = ["bottom", "top", "outer"]
 const S3_VIEWS = ["front", "back"]
 
-const S3_DEFAULT_LONG_EDGE = 1600
-const S3_DEFAULT_JPEG_QUALITY = 92
 const S3_DEFAULT_POLL_INTERVAL_MS = 2500
 const S3_DEFAULT_POLL_TIMEOUT_MS = 1000 * 60 * 6
 const S3_DEFAULT_RETRY_COUNT = 1
 
 const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || ""
 const CF_IMAGES_TOKEN = process.env.CLOUDFLARE_IMAGES_TOKEN || ""
+
+/* ============================================================
+ * ✅ common helpers
+ * ============================================================
+ */
 
 function s3IsHttpUrl(v) {
   return typeof v === "string" && /^https?:\/\//i.test(v)
@@ -1085,6 +1088,11 @@ function s3Clamp(n, min, max) {
   return Math.max(min, Math.min(max, n))
 }
 
+function s3ToNumber(v, fallback = 0) {
+  const n = Number(v)
+  return Number.isFinite(n) ? n : fallback
+}
+
 function s3SafeErrMessage(err) {
   if (!err) return "Unknown error"
   if (typeof err === "string") return err
@@ -1112,11 +1120,6 @@ function s3BuildPlanForView(garmentsByView, view) {
   const hasDress = !!garmentsByView[view]?.dress
   if (hasDress) return ["dress"]
   return S3_SLOT_ORDER.filter((slot) => !!garmentsByView[view]?.[slot])
-}
-
-function s3ToNumber(v, fallback = 0) {
-  const n = Number(v)
-  return Number.isFinite(n) ? n : fallback
 }
 
 /* ============================================================
@@ -1353,53 +1356,55 @@ function s3GetRequestDebugMeta(body) {
 
   return {
     receivedAt: s3NowIso(),
-    hasModelFront: !!body.model_front,
-    hasModelBack: !!body.model_back,
-    hasTopFront: !!body.top_front,
-    hasTopBack: !!body.top_back,
-    hasBottomFront: !!body.bottom_front,
-    hasBottomBack: !!body.bottom_back,
-    hasOuterFront: !!body.outer_front,
-    hasOuterBack: !!body.outer_back,
-    hasDressFront: !!body.dress_front,
-    hasDressBack: !!body.dress_back,
-    debug: !!body.debug,
-    seed: typeof body.seed === "number" ? body.seed : null,
-    prompt_mode: s3NormalizePromptMode(body.prompt_mode),
+    hasModelFront: !!body?.model_front,
+    hasModelBack: !!body?.model_back,
+    hasTopFront: !!body?.top_front,
+    hasTopBack: !!body?.top_back,
+    hasBottomFront: !!body?.bottom_front,
+    hasBottomBack: !!body?.bottom_back,
+    hasOuterFront: !!body?.outer_front,
+    hasOuterBack: !!body?.outer_back,
+    hasDressFront: !!body?.dress_front,
+    hasDressBack: !!body?.dress_back,
+    debug: !!body?.debug,
+    seed: typeof body?.seed === "number" ? body.seed : null,
+    prompt_mode: s3NormalizePromptMode(body?.prompt_mode),
     meta: normalizedMeta,
     retry_policy: retryPolicy,
   }
 }
 
 function s3NormalizeInputs(body) {
+  const src = body && typeof body === "object" ? body : {}
+
   const models = {
-    front: body.model_front || "",
-    back: body.model_back || "",
+    front: src.model_front || "",
+    back: src.model_back || "",
   }
 
   const garmentsByView = {
     front: {
-      top: body.top_front || "",
-      bottom: body.bottom_front || "",
-      outer: body.outer_front || "",
-      dress: body.dress_front || "",
+      top: src.top_front || "",
+      bottom: src.bottom_front || "",
+      outer: src.outer_front || "",
+      dress: src.dress_front || "",
     },
     back: {
-      top: body.top_back || "",
-      bottom: body.bottom_back || "",
-      outer: body.outer_back || "",
-      dress: body.dress_back || "",
+      top: src.top_back || "",
+      bottom: src.bottom_back || "",
+      outer: src.outer_back || "",
+      dress: src.dress_back || "",
     },
   }
 
   return {
     models,
     garmentsByView,
-    debug: !!body.debug,
-    seed: Number.isFinite(body.seed) ? Math.floor(body.seed) : 42,
-    promptMode: s3NormalizePromptMode(body.prompt_mode),
-    meta: s3NormalizeLengthMeta(body.meta || {}),
-    retryPolicy: s3NormalizeRetryPolicy(body.retry_policy || {}),
+    debug: !!src.debug,
+    seed: Number.isFinite(src.seed) ? Math.floor(src.seed) : 42,
+    promptMode: s3NormalizePromptMode(src.prompt_mode),
+    meta: s3NormalizeLengthMeta(src.meta || {}),
+    retryPolicy: s3NormalizeRetryPolicy(src.retry_policy || {}),
   }
 }
 
@@ -1427,8 +1432,7 @@ function s3ValidateInputs(norm) {
   return errors
 }
 
-/**
- * ============================================================
+/* ============================================================
  * ✅ Cloudflare Images helpers
  * - INPUT image는 업로드하지 않음
  * - 최종 결과만 업로드
@@ -1451,10 +1455,6 @@ function s3DataUrlToBuffer(dataUrl) {
     mime: match[1],
     buffer: Buffer.from(match[2], "base64"),
   }
-}
-
-function s3BufferToDataUrl(buffer, mime = "image/jpeg") {
-  return `data:${mime};base64,${buffer.toString("base64")}`
 }
 
 async function s3UploadBufferToCloudflareImages(
@@ -1501,17 +1501,17 @@ async function s3UploadBufferToCloudflareImages(
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
   }
 
- const variants = Array.isArray(json?.result?.variants) ? json.result.variants : []
+  const variants = Array.isArray(json?.result?.variants)
+    ? json.result.variants
+    : []
 
-const preferredUrl =
-  variants.find((v) => /\/original(?:\/|$)/i.test(v)) ||
-  variants.find((v) => /\/public(?:\/|$)/i.test(v)) ||
-  variants[0] ||
-  ""
+  const preferredUrl =
+    variants.find((v) => /\/original(?:\/|$)/i.test(v)) ||
+    variants.find((v) => /\/public(?:\/|$)/i.test(v)) ||
+    variants[0] ||
+    ""
 
-const url = preferredUrl
-  
-  if (!url) {
+  if (!preferredUrl) {
     throw new Error("Cloudflare Images did not return a public variant URL")
   }
 
@@ -1519,7 +1519,7 @@ const url = preferredUrl
     id: json?.result?.id || "",
     filename: json?.result?.filename || filename,
     uploaded: json,
-    url,
+    url: preferredUrl,
   }
 }
 
@@ -1560,8 +1560,7 @@ function s3EmptyAsset() {
   }
 }
 
-/**
- * ============================================================
+/* ============================================================
  * ✅ INPUT normalize helpers
  * - HTTP URL은 그대로 사용
  * - data URL model은 Cloudflare에 먼저 올려 URL로 변환
@@ -1577,54 +1576,10 @@ async function s3NormalizeImageInput(input, _options = {}) {
   }
 
   if (s3IsDataUrl(input)) {
-    // ✅ 원본 data URL 그대로 유지
     return input
   }
 
   throw new Error("Unsupported image input. Only public URL or data URL is allowed.")
-}
-
-  const parsed = s3DataUrlToBuffer(input)
-  const image = sharp(parsed.buffer, { failOn: "none" })
-  const meta = await image.metadata()
-
-  const width = meta.width || null
-  const height = meta.height || null
-  const hasAlpha = !!meta.hasAlpha
-  const srcMime = parsed.mime || ""
-
-  if (!width || !height) {
-    if (hasAlpha || srcMime === "image/png") {
-      const out = await image.png({ compressionLevel: 6 }).toBuffer()
-      return s3BufferToDataUrl(out, "image/png")
-    } else {
-      const out = await image.jpeg({ quality: jpegQuality, mozjpeg: true }).toBuffer()
-      return s3BufferToDataUrl(out, "image/jpeg")
-    }
-  }
-
-  const currentLong = Math.max(width, height)
-  let targetWidth = width
-  let targetHeight = height
-
-  if (currentLong > longEdge) {
-    const ratio = longEdge / currentLong
-    targetWidth = Math.max(1, Math.round(width * ratio))
-    targetHeight = Math.max(1, Math.round(height * ratio))
-  }
-
-  let pipeline = image.rotate().resize(targetWidth, targetHeight, {
-    fit: "inside",
-    withoutEnlargement: true,
-  })
-
-  if (hasAlpha || srcMime === "image/png") {
-    const out = await pipeline.png({ compressionLevel: 6 }).toBuffer()
-    return s3BufferToDataUrl(out, "image/png")
-  }
-
-  const out = await pipeline.jpeg({ quality: jpegQuality, mozjpeg: true }).toBuffer()
-  return s3BufferToDataUrl(out, "image/jpeg")
 }
 
 async function s3PreprocessAll(norm) {
@@ -1639,26 +1594,26 @@ async function s3PreprocessAll(norm) {
   for (const view of S3_VIEWS) {
     const modelInput = norm.models[view]
 
-   if (s3IsDataUrl(modelInput)) {
-  const parsed = s3DataUrlToBuffer(modelInput)
+    if (s3IsDataUrl(modelInput)) {
+      const parsed = s3DataUrlToBuffer(modelInput)
 
-  const ext =
-    parsed.mime === "image/png"
-      ? "png"
-      : parsed.mime === "image/webp"
-      ? "webp"
-      : "jpg"
+      const ext =
+        parsed.mime === "image/png"
+          ? "png"
+          : parsed.mime === "image/webp"
+          ? "webp"
+          : "jpg"
 
-  const uploaded = await s3UploadBufferToCloudflareImages(
-    parsed.buffer,
-    `model-${view}-${Date.now()}.${ext}`,
-    parsed.mime
-  )
+      const uploaded = await s3UploadBufferToCloudflareImages(
+        parsed.buffer,
+        `model-${view}-${Date.now()}.${ext}`,
+        parsed.mime
+      )
 
-  prepared.models[view] = uploaded.url
-} else {
-  prepared.models[view] = modelInput || ""
-}
+      prepared.models[view] = uploaded.url
+    } else {
+      prepared.models[view] = modelInput || ""
+    }
 
     for (const slot of ["top", "bottom", "outer", "dress"]) {
       prepared.garmentsByView[view][slot] =
@@ -1669,8 +1624,7 @@ async function s3PreprocessAll(norm) {
   return prepared
 }
 
-/**
- * ============================================================
+/* ============================================================
  * ✅ FASHN helpers
  * ============================================================
  */
@@ -1708,6 +1662,7 @@ async function s3FashnRunTryOnMax({
 
   const text = await res.text()
   let json = null
+
   try {
     json = text ? JSON.parse(text) : null
   } catch {
@@ -1720,6 +1675,7 @@ async function s3FashnRunTryOnMax({
       json?.message ||
       json?.error ||
       `FASHN run failed with ${res.status}`
+
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
   }
 
@@ -1778,6 +1734,7 @@ async function s3FashnRunTryOnV16({
 
   const text = await res.text()
   let json = null
+
   try {
     json = text ? JSON.parse(text) : null
   } catch {
@@ -1790,6 +1747,7 @@ async function s3FashnRunTryOnV16({
       json?.message ||
       json?.error ||
       `FASHN v1.6 run failed with ${res.status}`
+
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
   }
 
@@ -1826,6 +1784,7 @@ async function s3FashnPollPrediction(id, opts = {}) {
 
     const text = await res.text()
     let json = null
+
     try {
       json = text ? JSON.parse(text) : null
     } catch {
@@ -1838,6 +1797,7 @@ async function s3FashnPollPrediction(id, opts = {}) {
         json?.message ||
         json?.error ||
         `FASHN status failed with ${res.status}`
+
       throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
     }
 
@@ -1866,7 +1826,11 @@ async function s3FashnPollPrediction(id, opts = {}) {
         json?.result?.url ||
         null
 
-      return { status, raw: json, finalImage: finalImage || null }
+      return {
+        status,
+        raw: json,
+        finalImage: finalImage || null,
+      }
     }
 
     if (status === "failed" || status === "error" || status === "cancelled") {
@@ -1875,6 +1839,7 @@ async function s3FashnPollPrediction(id, opts = {}) {
         json?.message ||
         json?.error ||
         `Prediction ${id} failed`
+
       throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
     }
 
@@ -1959,7 +1924,6 @@ async function s3RunTryOnStepWithRetry(args, retryCount = S3_DEFAULT_RETRY_COUNT
         error: msg,
       })
 
-      // ✅ retry 해도 해결 안 되는 에러는 즉시 중단
       if (
         /out of credits/i.test(msg) ||
         /purchase more/i.test(msg) ||
@@ -1979,9 +1943,9 @@ async function s3RunTryOnStepWithRetry(args, retryCount = S3_DEFAULT_RETRY_COUNT
   return {
     ok: false,
     error: s3SafeErrMessage(lastErr),
-    attempts: Math.min(retryCount + 1, (lastErr ? retryCount + 1 : 1)),
+    attempts: Math.min(retryCount + 1, lastErr ? retryCount + 1 : 1),
   }
-}}
+}
 
 async function s3RunSequentialViewSingleAttempt({
   view,
@@ -2116,7 +2080,6 @@ async function s3RunSequentialViewWithRetry({
   const hasAnyGarment =
     !!garments?.top || !!garments?.bottom || !!garments?.outer || !!garments?.dress
 
-  // ✅ back/front 공통: 모델도 없고 의류도 없으면 skip
   if (!modelImage && !hasAnyGarment) {
     return {
       ok: false,
@@ -2140,7 +2103,6 @@ async function s3RunSequentialViewWithRetry({
     }
   }
 
-  // ✅ 모델 없고 의류만 있으면 명확한 에러
   if (!modelImage && hasAnyGarment) {
     return {
       ok: false,
@@ -2159,7 +2121,6 @@ async function s3RunSequentialViewWithRetry({
     }
   }
 
-  // ✅ 모델은 있는데 의류가 없으면 skip
   if (modelImage && !hasAnyGarment) {
     return {
       ok: false,
@@ -2248,12 +2209,10 @@ async function s3RunSequentialViewWithRetry({
         score: score?.total ?? null,
       })
 
-      // ✅ 성공했고 기준점 넘으면 중단
       if (single?.ok && !s3ShouldRetry(score, retryPolicy, attempt)) {
         break
       }
 
-      // ✅ 실패인데 retry해도 의미 없는 에러면 즉시 중단
       if (!single?.ok) {
         const msg = String(single?.error || "")
         if (
@@ -2325,7 +2284,6 @@ async function s3RunSequentialViewWithRetry({
   const bestAttempt = s3PickBestAttempt(attempts)
   const warnings = s3CollectWarnings(attempts, retryPolicy)
 
-  // ✅ usable 결과가 없으면 실제 에러를 우선 노출
   if (!bestAttempt || !bestAttempt?.finalCloudflare?.url) {
     const realError =
       bestAttempt?.error ||
@@ -2366,8 +2324,7 @@ async function s3RunSequentialViewWithRetry({
   }
 }
 
-/**
- * ============================================================
+/* ============================================================
  * ✅ Routes
  * ============================================================
  */
@@ -2394,9 +2351,6 @@ app.post("/api/dress-max", async (req, res) => {
     const norm = s3NormalizeInputs(req.body)
     const errors = s3ValidateInputs(norm)
 
-    // =========================
-    // ✅ RAW BODY DEBUG
-    // =========================
     console.log("===================================")
     console.log("[RAW BODY KEYS]", Object.keys(req.body || {}))
     console.log("[RAW BODY GARMENTS]", {
@@ -2431,9 +2385,6 @@ app.post("/api/dress-max", async (req, res) => {
 
     const prepared = await s3PreprocessAll(norm)
 
-    // =========================
-    // ✅ PREPARED DEBUG
-    // =========================
     console.log("===================================")
     console.log("[S3 INPUT DEBUG]")
     console.log("model_front:", !!prepared.models.front)
@@ -2472,9 +2423,6 @@ app.post("/api/dress-max", async (req, res) => {
 
     const [front, back] = await Promise.all([frontPromise, backPromise])
 
-    // =========================
-    // ✅ RESULT DEBUG
-    // =========================
     console.log("===================================")
     console.log("[S3 RESULT DEBUG]")
     console.log("front ok:", !!front?.ok)
@@ -2656,7 +2604,7 @@ app.post("/api/dress-v16-test", async (req, res) => {
     }
 
     const preparedModel = await s3NormalizeImageInput(modelImage)
-const preparedGarment = await s3NormalizeImageInput(garmentImage)
+    const preparedGarment = await s3NormalizeImageInput(garmentImage)
 
     const run = await s3FashnRunTryOnV16({
       modelImage: preparedModel,
@@ -2740,6 +2688,7 @@ app.get("/api/cf-check", async (_req, res) => {
 
     const text = await r.text()
     let json = null
+
     try {
       json = text ? JSON.parse(text) : null
     } catch {
@@ -2774,20 +2723,20 @@ app.post("/api/cf-upload-check", async (req, res) => {
     let uploaded = s3EmptyAsset()
 
     if (s3IsDataUrl(image)) {
-   const parsed = s3DataUrlToBuffer(image)
+      const parsed = s3DataUrlToBuffer(image)
 
-const ext =
-  parsed.mime === "image/png"
-    ? "png"
-    : parsed.mime === "image/webp"
-    ? "webp"
-    : "jpg"
+      const ext =
+        parsed.mime === "image/png"
+          ? "png"
+          : parsed.mime === "image/webp"
+          ? "webp"
+          : "jpg"
 
-uploaded = await s3UploadBufferToCloudflareImages(
-  parsed.buffer,
-  `cf-upload-check.${ext}`,
-  parsed.mime
-)
+      uploaded = await s3UploadBufferToCloudflareImages(
+        parsed.buffer,
+        `cf-upload-check.${ext}`,
+        parsed.mime
+      )
     } else if (s3IsHttpUrl(image)) {
       uploaded = await s3UploadRemoteResultToCloudflare(
         image,
@@ -2810,10 +2759,4 @@ uploaded = await s3UploadBufferToCloudflareImages(
       error: s3SafeErrMessage(err),
     })
   }
-})
-
-const PORT = Number(process.env.PORT || 3000)
-
-app.listen(PORT, () => {
-  console.log(`[BOOT] Server listening on :${PORT}`)
 })
