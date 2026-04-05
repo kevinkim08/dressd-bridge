@@ -2755,3 +2755,8 @@ app.post("/api/cf-upload-check", async (req, res) => {
     })
   }
 })
+const PORT = Number(process.env.PORT || 10000)
+
+app.listen(PORT, "0.0.0.0", () => {
+  console.log(`[BOOT] Server listening on :${PORT}`)
+})
