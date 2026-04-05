@@ -1643,13 +1643,24 @@ async function s3PreprocessAll(norm) {
   }
 
   for (const view of S3_VIEWS) {
-    // ✅ 모델만 약하게 normalize
-    prepared.models[view] = await s3NormalizeImageInput(norm.models[view], {
-      longEdge: 2048,
-      quality: 98,
-    })
+    const modelInput = norm.models[view]
 
-    // ✅ garment는 원본 유지
+    if (s3IsDataUrl(modelInput)) {
+      // 🔥 핵심: model은 Cloudflare 업로드
+      const parsed = s3DataUrlToBuffer(modelInput)
+
+      const uploaded = await s3UploadBufferToCloudflareImages(
+        parsed.buffer,
+        `model-${view}-${Date.now()}.png`,
+        parsed.mime
+      )
+
+      prepared.models[view] = uploaded.url
+    } else {
+      prepared.models[view] = modelInput || ""
+    }
+
+    // garment는 그대로
     for (const slot of ["top", "bottom", "outer", "dress"]) {
       prepared.garmentsByView[view][slot] =
         norm.garmentsByView[view][slot] || ""
