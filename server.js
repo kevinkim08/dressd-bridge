@@ -1536,6 +1536,58 @@ async function s3FetchRemoteImageAsBuffer(url) {
     mime: contentType,
   }
 }
+async function s3ProbeImageSizeFromUrl(url) {
+  if (!url || !s3IsHttpUrl(url)) {
+    return { url: url || "", ok: false, error: "invalid url" }
+  }
+
+  try {
+    const res = await fetch(url)
+    if (!res.ok) {
+      return {
+        url,
+        ok: false,
+        status: res.status,
+        error: `fetch failed: ${res.status}`,
+      }
+    }
+
+    const arrayBuffer = await res.arrayBuffer()
+    const buffer = Buffer.from(arrayBuffer)
+    const contentType = res.headers.get("content-type") || ""
+
+    let width = null
+    let height = null
+
+    try {
+      const meta = await sharp(buffer, { failOn: "none" }).metadata()
+      width = meta?.width || null
+      height = meta?.height || null
+    } catch (e) {
+      return {
+        url,
+        ok: false,
+        contentType,
+        error: `sharp metadata failed: ${String(e?.message || e)}`,
+      }
+    }
+
+    return {
+      url,
+      ok: true,
+      contentType,
+      width,
+      height,
+      bytes: buffer.length,
+    }
+  } catch (e) {
+    return {
+      url,
+      ok: false,
+      error: String(e?.message || e),
+    }
+  }
+}
 
 async function s3UploadRemoteResultToCloudflare(url, filename = "result.png") {
   if (!url || !s3IsHttpUrl(url)) {
