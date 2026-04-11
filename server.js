@@ -2060,23 +2060,27 @@ async function s3RunSequentialViewSingleAttempt({
     currentModel = result.step.output || currentModel
   }
 
-  let finalCloudflare = s3EmptyAsset()
+let finalCloudflare = s3EmptyAsset()
+let finalUrl = currentModel || ""
 
-  if (currentModel && s3IsHttpUrl(currentModel)) {
-    finalCloudflare = await s3UploadRemoteResultToCloudflare(
-      currentModel,
-      `dress-${view}-${Date.now()}.png`
-    )
-  }
+if (currentModel && s3IsHttpUrl(currentModel)) {
+  finalCloudflare = await s3UploadRemoteResultToCloudflare(
+    currentModel,
+    `dress-${view}-${Date.now()}.png`
+  )
 
-  return {
-    ok: true,
-    view,
-    plan,
-    finalUrl: currentModel,
-    finalCloudflare,
-    steps,
+  if (finalCloudflare?.url) {
+    finalUrl = finalCloudflare.url
   }
+}
+
+return {
+  ok: true,
+  view,
+  plan,
+  finalUrl,
+  finalCloudflare,
+  steps,
 }
 
 async function s3RunSequentialViewWithRetry({
@@ -2329,7 +2333,7 @@ async function s3RunSequentialViewWithRetry({
     attempts,
     bestAttempt,
     warnings,
-    finalUrl: bestAttempt.finalUrl || bestAttempt.finalCloudflare?.url || "",
+    finalUrl: bestAttempt.finalCloudflare?.url || bestAttempt.finalUrl || "",
     finalCloudflare: bestAttempt.finalCloudflare || s3EmptyAsset(),
     steps: bestAttempt.steps || [],
     plan: bestAttempt.plan || [],
