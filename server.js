@@ -1543,10 +1543,29 @@ async function s3UploadRemoteResultToCloudflare(url, filename = "result.png") {
   }
 
   const fetched = await s3FetchRemoteImageAsBuffer(url)
+
+  const mime =
+    fetched.mime && String(fetched.mime).startsWith("image/")
+      ? fetched.mime
+      : s3GuessMimeFromFilename(filename)
+
+  const ext =
+    mime === "image/png"
+      ? "png"
+      : mime === "image/webp"
+      ? "webp"
+      : mime === "image/jpeg"
+      ? "jpg"
+      : "png"
+
+  const safeFilename = filename.includes(".")
+    ? filename
+    : `result.${ext}`
+
   return s3UploadBufferToCloudflareImages(
     fetched.buffer,
-    filename,
-    fetched.mime || s3GuessMimeFromFilename(filename)
+    safeFilename,
+    mime
   )
 }
 
