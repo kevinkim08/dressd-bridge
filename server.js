@@ -1685,8 +1685,28 @@ async function s3PreprocessAll(norm) {
     }
 
     for (const slot of ["top", "bottom", "outer", "dress"]) {
-      prepared.garmentsByView[view][slot] =
-        norm.garmentsByView[view][slot] || ""
+      const garmentInput = norm.garmentsByView[view][slot]
+
+      if (s3IsDataUrl(garmentInput)) {
+        const parsed = s3DataUrlToBuffer(garmentInput)
+
+        const ext =
+          parsed.mime === "image/png"
+            ? "png"
+            : parsed.mime === "image/webp"
+            ? "webp"
+            : "jpg"
+
+        const uploaded = await s3UploadBufferToCloudflareImages(
+          parsed.buffer,
+          `${slot}-${view}-${Date.now()}.${ext}`,
+          parsed.mime
+        )
+
+        prepared.garmentsByView[view][slot] = uploaded.url
+      } else {
+        prepared.garmentsByView[view][slot] = garmentInput || ""
+      }
     }
   }
 
@@ -2464,18 +2484,30 @@ app.post("/api/dress-max", async (req, res) => {
     const prepared = await s3PreprocessAll(norm)
 
     console.log("===================================")
-    console.log("[S3 INPUT DEBUG]")
-    console.log("model_front:", !!prepared.models.front)
-    console.log("model_back:", !!prepared.models.back)
-    console.log(
-      "garment_front:",
-      JSON.stringify(prepared.garmentsByView.front, null, 2)
-    )
-    console.log(
-      "garment_back:",
-      JSON.stringify(prepared.garmentsByView.back, null, 2)
-    )
-    console.log("===================================")
+console.log("[S3 INPUT DEBUG]")
+console.log("model_front:", prepared.models.front)
+console.log("model_back:", prepared.models.back)
+console.log(
+  "garment_front:",
+  JSON.stringify(prepared.garmentsByView.front, null, 2)
+)
+console.log(
+  "garment_back:",
+  JSON.stringify(prepared.garmentsByView.back, null, 2)
+)
+console.log("[S3 INPUT TYPE CHECK]", {
+  model_front_is_url: s3IsHttpUrl(prepared.models.front),
+  model_back_is_url: s3IsHttpUrl(prepared.models.back),
+  top_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.top),
+  bottom_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.bottom),
+  outer_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.outer),
+  dress_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.dress),
+  top_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.top),
+  bottom_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.bottom),
+  outer_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.outer),
+  dress_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.dress),
+})
+console.log("===================================")
 
     const frontPromise = s3RunSequentialViewWithRetry({
       view: "front",
