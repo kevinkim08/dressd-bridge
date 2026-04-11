@@ -2120,10 +2120,15 @@ if (currentModel && s3IsHttpUrl(currentModel)) {
     currentModel,
     `dress-${view}-${Date.now()}.png`
   )
+}
 
-  if (finalCloudflare?.url) {
-    finalUrl = finalCloudflare.url
-  }
+return {
+  ok: true,
+  view,
+  plan,
+  finalUrl,            // ✅ FASHN 원본 유지
+  finalCloudflare,     // ✅ 저장용 보조 자산
+  steps,
 }
 
 return {
