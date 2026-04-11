@@ -2310,7 +2310,7 @@ async function s3RunSequentialViewWithRetry({
     attempts,
     bestAttempt,
     warnings,
-    finalUrl: bestAttempt.finalCloudflare?.url || bestAttempt.finalUrl || "",
+    finalUrl: bestAttempt.finalUrl || bestAttempt.finalCloudflare?.url || "",
     finalCloudflare: bestAttempt.finalCloudflare || s3EmptyAsset(),
     steps: bestAttempt.steps || [],
     plan: bestAttempt.plan || [],
