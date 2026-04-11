@@ -1039,6 +1039,8 @@ app.post("/api/s1/pair", async (req, res) => {
  * ✅ INPUT: model dataURL -> Cloudflare URL / garment 원본 유지
  * ✅ OUTPUT: final result only -> Cloudflare Images upload
  * ✅ NEW: meta + retry policy + score + bestAttempt + full debug logs
+ * ✅ FIX: finalUrl always keeps FASHN original URL
+ * ✅ FIX: Cloudflare is storage-only asset, never representative output
  * ============================================================
  */
 
@@ -1536,6 +1538,7 @@ async function s3FetchRemoteImageAsBuffer(url) {
     mime: contentType,
   }
 }
+
 async function s3ProbeImageSizeFromUrl(url) {
   if (!url || !s3IsHttpUrl(url)) {
     return { url: url || "", ok: false, error: "invalid url" }
@@ -2112,34 +2115,34 @@ async function s3RunSequentialViewSingleAttempt({
     currentModel = result.step.output || currentModel
   }
 
-let finalCloudflare = s3EmptyAsset()
-let finalUrl = currentModel || ""
+  let finalCloudflare = s3EmptyAsset()
+  let finalUrl = currentModel || ""
 
-if (currentModel && s3IsHttpUrl(currentModel)) {
-  finalCloudflare = await s3UploadRemoteResultToCloudflare(
-    currentModel,
-    `dress-${view}-${Date.now()}.png`
-  )
+  if (currentModel && s3IsHttpUrl(currentModel)) {
+    try {
+      finalCloudflare = await s3UploadRemoteResultToCloudflare(
+        currentModel,
+        `dress-${view}-${Date.now()}.png`
+      )
+    } catch (cfErr) {
+      console.error("[S3_CF_UPLOAD_FAILED]", {
+        view,
+        error: s3SafeErrMessage(cfErr),
+      })
+      finalCloudflare = s3EmptyAsset()
+    }
+  }
+
+  return {
+    ok: true,
+    view,
+    plan,
+    finalUrl,        // ✅ FASHN 원본 유지
+    finalCloudflare, // ✅ 저장용 보조 자산
+    steps,
+  }
 }
 
-return {
-  ok: true,
-  view,
-  plan,
-  finalUrl,            // ✅ FASHN 원본 유지
-  finalCloudflare,     // ✅ 저장용 보조 자산
-  steps,
-}
-
-return {
-  ok: true,
-  view,
-  plan,
-  finalUrl,
-  finalCloudflare,
-  steps,
-}
-}
 async function s3RunSequentialViewWithRetry({
   view,
   modelImage,
@@ -2235,7 +2238,7 @@ async function s3RunSequentialViewWithRetry({
             meta,
             garments,
             view,
-            resultUrl: single?.finalCloudflare?.url || single?.finalUrl || "",
+            resultUrl: single?.finalUrl || single?.finalCloudflare?.url || "",
             attemptIndex: attempt,
           })
         : {
@@ -2359,7 +2362,7 @@ async function s3RunSequentialViewWithRetry({
   const bestAttempt = s3PickBestAttempt(attempts)
   const warnings = s3CollectWarnings(attempts, retryPolicy)
 
-  if (!bestAttempt || !bestAttempt?.finalCloudflare?.url) {
+  if (!bestAttempt || !bestAttempt?.finalUrl) {
     const realError =
       bestAttempt?.error ||
       attempts.find((a) => a?.error)?.error ||
@@ -2697,10 +2700,17 @@ app.post("/api/dress-v16-test", async (req, res) => {
 
     let finalCloudflare = s3EmptyAsset()
     if (done.finalImage && s3IsHttpUrl(done.finalImage)) {
-      finalCloudflare = await s3UploadRemoteResultToCloudflare(
-        done.finalImage,
-        `dress-v16-${slot}-${Date.now()}.png`
-      )
+      try {
+        finalCloudflare = await s3UploadRemoteResultToCloudflare(
+          done.finalImage,
+          `dress-v16-${slot}-${Date.now()}.png`
+        )
+      } catch (cfErr) {
+        console.error("[DRESS_V16_CF_UPLOAD_FAILED]", {
+          slot,
+          error: s3SafeErrMessage(cfErr),
+        })
+      }
     }
 
     return res.json({
@@ -2835,6 +2845,7 @@ app.post("/api/cf-upload-check", async (req, res) => {
     })
   }
 })
+
 const PORT = Number(process.env.PORT || 10000)
 
 app.listen(PORT, "0.0.0.0", () => {
