@@ -2082,7 +2082,7 @@ return {
   finalCloudflare,
   steps,
 }
-
+}
 async function s3RunSequentialViewWithRetry({
   view,
   modelImage,
