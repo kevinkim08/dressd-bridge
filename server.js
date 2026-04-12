@@ -1741,17 +1741,6 @@ async function s3PreprocessAll(norm, baseUrl) {
  */
 
 async function s3FashnRunTryOnMax({
-  
-  const runSeq = s3NextRunCounter()
-console.log("[FASHN_RUN_START]", {
-  runSeq,
-  modelImage,
-  productImage,
-  seed,
-  resolution,
-  generationMode,
-})
-  
   modelImage,
   productImage,
   prompt = "",
@@ -1762,6 +1751,17 @@ console.log("[FASHN_RUN_START]", {
   resolution = "2k",
   generationMode = "quality",
 }) {
+  const runSeq = s3NextRunCounter()
+
+  console.log("[FASHN_RUN_START]", {
+    runSeq,
+    modelImage,
+    productImage,
+    seed,
+    resolution,
+    generationMode,
+  })
+
   const payload = {
     model_name: "tryon-max",
     inputs: {
@@ -1816,12 +1816,12 @@ console.log("[FASHN_RUN_START]", {
     throw new Error("FASHN response did not include prediction id")
   }
 
- return {
-  id: predictionId,
-  raw: json,
-  payload,
-  runSeq,
-}
+  return {
+    id: predictionId,
+    raw: json,
+    payload,
+    runSeq,
+  }
 }
 
 async function s3FashnPollPrediction(id, opts = {}) {
@@ -2276,16 +2276,16 @@ async function s3RunSequentialViewWithRetry({
         score,
       })
 
-      ("[VIEW_ATTEMPT_RESULT]", {
-        view,
-        attempt,
-        ok: !!single?.ok,
-        stepCount: Array.isArray(single?.steps) ? single.steps.length : 0,
-        failedStep: single?.failedStep || "",
-        error: single?.error || "",
-        finalUrl: single?.ok ? (single?.finalUrl || "") : "",
-        score: score?.total ?? null,
-      })
+     console.log("[VIEW_ATTEMPT_RESULT]", {
+  view,
+  attempt,
+  ok: !!single?.ok,
+  stepCount: Array.isArray(single?.steps) ? single.steps.length : 0,
+  failedStep: single?.failedStep || "",
+  error: single?.error || "",
+  finalUrl: single?.ok ? (single?.finalUrl || "") : "",
+  score: score?.total ?? null,
+})
 
       if (single?.ok && !s3ShouldRetry(score, retryPolicy, attempt)) {
         break
