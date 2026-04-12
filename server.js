@@ -1035,12 +1035,11 @@ app.post("/api/s1/pair", async (req, res) => {
 
 /**
  * ============================================================
- * ✅ 7) S3 Dress (FASHN) - Try-On Max preserve only
- * ✅ INPUT: model dataURL -> Cloudflare URL / garment 원본 유지
- * ✅ OUTPUT: final result only -> Cloudflare Images upload
- * ✅ NEW: meta + retry policy + score + bestAttempt + full debug logs
- * ✅ FIX: finalUrl always keeps FASHN original URL
- * ✅ FIX: Cloudflare is storage-only asset, never representative output
+ * ✅ 7) S3 Dress (FASHN) - v1.6 quality-first
+ * ✅ INPUT: model / garment dataURL -> Cloudflare URL normalize
+ * ✅ OUTPUT: final result keeps FASHN original URL
+ * ✅ STORAGE: Cloudflare is storage-only asset
+ * ✅ POLICY: one garment per view for quality-first mode
  * ============================================================
  */
 
@@ -1110,18 +1109,30 @@ function s3NormalizePromptMode(v) {
   return v === "short" ? "short" : "empty"
 }
 
-function s3ShortPromptForSlot(slot) {
-  if (slot === "bottom") return "put on the pants"
-  if (slot === "top") return "put on the top"
-  if (slot === "outer") return "put on the outerwear"
-  if (slot === "dress") return "put on the dress"
-  return ""
-}
-
 function s3BuildPlanForView(garmentsByView, view) {
   const hasDress = !!garmentsByView[view]?.dress
   if (hasDress) return ["dress"]
   return S3_SLOT_ORDER.filter((slot) => !!garmentsByView[view]?.[slot])
+}
+
+function s3CountGarmentsForView(garments) {
+  return ["top", "bottom", "outer", "dress"].filter((slot) => !!garments?.[slot]).length
+}
+
+function s3PickSingleGarmentSlot(garments) {
+  if (garments?.dress) return "dress"
+  if (garments?.bottom) return "bottom"
+  if (garments?.top) return "top"
+  if (garments?.outer) return "outer"
+  return ""
+}
+
+function s3MapSlotToV16Category(slot) {
+  if (slot === "top") return "tops"
+  if (slot === "bottom") return "bottoms"
+  if (slot === "dress") return "one-pieces"
+  if (slot === "outer") return "auto"
+  return "auto"
 }
 
 /* ============================================================
@@ -1718,74 +1729,6 @@ async function s3PreprocessAll(norm) {
  * ============================================================
  */
 
-async function s3FashnRunTryOnMax({
-  modelImage,
-  productImage,
-  prompt = "",
-  seed = 42,
-  numImages = 1,
-  outputFormat = "png",
-  returnBase64 = false,
-}) {
-  const payload = {
-    model_name: "tryon-max",
-    inputs: {
-      model_image: modelImage,
-      product_image: productImage,
-      prompt,
-      seed,
-      num_images: numImages,
-      output_format: outputFormat,
-      return_base64: returnBase64,
-    },
-  }
-
-  const res = await fetch(FASHN_RUN_URL, {
-    method: "POST",
-    headers: {
-      "Content-Type": "application/json",
-      Authorization: `Bearer ${process.env.FASHN_API_KEY || ""}`,
-    },
-    body: JSON.stringify(payload),
-  })
-
-  const text = await res.text()
-  let json = null
-
-  try {
-    json = text ? JSON.parse(text) : null
-  } catch {
-    json = { raw: text }
-  }
-
-  if (!res.ok) {
-    const msg =
-      json?.error?.message ||
-      json?.message ||
-      json?.error ||
-      `FASHN run failed with ${res.status}`
-
-    throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
-  }
-
-  const predictionId =
-    json?.id ||
-    json?.prediction_id ||
-    json?.data?.id ||
-    json?.result?.id ||
-    ""
-
-  if (!predictionId) {
-    throw new Error("FASHN response did not include prediction id")
-  }
-
-  return {
-    id: predictionId,
-    raw: json,
-    payload,
-  }
-}
-
 async function s3FashnRunTryOnV16({
   modelImage,
   garmentImage,
@@ -1945,11 +1888,24 @@ async function s3RunTryOnStep({
   inputModel,
   garment,
   seed,
+  debug = false,
 }) {
+  const category = s3MapSlotToV16Category(slot)
+
+  console.log("[TRYON_STEP_INPUT]", {
+    slot,
+    inputModel,
+    garment,
+    seed,
+    category,
+    inputModelIsUrl: s3IsHttpUrl(inputModel),
+    garmentIsUrl: s3IsHttpUrl(garment),
+  })
+
   const run = await s3FashnRunTryOnV16({
     modelImage: inputModel,
     garmentImage: garment,
-    category: "auto",
+    category,
     garmentPhotoType: "auto",
     mode: "quality",
     seed,
@@ -1960,12 +1916,19 @@ async function s3RunTryOnStep({
 
   const done = await s3FashnPollPrediction(run.id)
 
+  console.log("[TRYON_V16_RUN_PAYLOAD]", JSON.stringify(run.payload, null, 2))
+  console.log("[TRYON_V16_STATUS_RAW]", JSON.stringify(done.raw, null, 2))
+  console.log("[TRYON_V16_FINAL_IMAGE]", done.finalImage)
+
   return {
     slot,
+    category,
     predictionId: run.id,
     inputModel,
     garment,
     output: done.finalImage,
+    debugRunRaw: debug ? run.raw : undefined,
+    debugStatusRaw: debug ? done.raw : undefined,
   }
 }
 
@@ -2024,10 +1987,10 @@ async function s3RunSequentialViewSingleAttempt({
   modelImage,
   garments,
   seed,
-  promptMode,
   debug,
 }) {
   const plan = s3BuildPlanForView({ [view]: garments }, view)
+  const garmentCount = s3CountGarmentsForView(garments)
 
   console.log("[SEQUENTIAL_VIEW_START]", {
     view,
@@ -2039,6 +2002,7 @@ async function s3RunSequentialViewSingleAttempt({
       dress: !!garments?.dress,
     },
     plan,
+    garmentCount,
   })
 
   if (!modelImage) {
@@ -2065,66 +2029,66 @@ async function s3RunSequentialViewSingleAttempt({
     }
   }
 
-  let currentModel = modelImage
-  const steps = []
-
-  for (let i = 0; i < plan.length; i++) {
-    const slot = plan[i]
-    const garment = garments[slot]
-
-    if (!garment) continue
-
-    const result = await s3RunTryOnStepWithRetry(
-      {
-        slot,
-        inputModel: currentModel,
-        garment,
-        seed: seed + i,
-        promptMode,
-        debug,
-      },
-      S3_DEFAULT_RETRY_COUNT
-    )
-
-    if (!result.ok) {
-      return {
-        ok: false,
-        view,
-        plan,
-        finalUrl: currentModel,
-        finalCloudflare: s3EmptyAsset(),
-        steps,
-        failedStep: slot,
-        error: result.error || `Failed on ${slot}`,
-      }
+  if (garmentCount > 1) {
+    return {
+      ok: false,
+      view,
+      error: `quality-first mode supports one garment per view. ${view} has ${garmentCount} garments`,
+      plan,
+      finalUrl: "",
+      finalCloudflare: s3EmptyAsset(),
+      steps: [],
     }
-
-    steps.push({
-      slot,
-      attempts: result.attempts,
-      inputModel: result.step.inputModel,
-      garment: result.step.garment,
-      output: result.step.output,
-      prompt: result.step.prompt,
-      predictionId: result.step.predictionId,
-      ...(debug
-        ? {
-            debugRunRaw: result.step.debugRunRaw,
-            debugStatusRaw: result.step.debugStatusRaw,
-          }
-        : {}),
-    })
-
-    currentModel = result.step.output || currentModel
   }
 
-  let finalCloudflare = s3EmptyAsset()
-  let finalUrl = currentModel || ""
+  const slot = s3PickSingleGarmentSlot(garments)
+  const garment = garments?.[slot] || ""
 
-  if (currentModel && s3IsHttpUrl(currentModel)) {
+  if (!slot || !garment) {
+    return {
+      ok: false,
+      view,
+      error: `No valid garment found for ${view}`,
+      plan,
+      finalUrl: "",
+      finalCloudflare: s3EmptyAsset(),
+      steps: [],
+    }
+  }
+
+  const originalModel = modelImage
+
+  const result = await s3RunTryOnStepWithRetry(
+    {
+      slot,
+      inputModel: originalModel,
+      garment,
+      seed,
+      debug,
+    },
+    S3_DEFAULT_RETRY_COUNT
+  )
+
+  if (!result.ok) {
+    return {
+      ok: false,
+      view,
+      plan,
+      finalUrl: "",
+      finalCloudflare: s3EmptyAsset(),
+      steps: [],
+      failedStep: slot,
+      error: result.error || `Failed on ${slot}`,
+    }
+  }
+
+  const finalUrl = result.step.output || ""
+  let finalCloudflare = s3EmptyAsset()
+
+  if (finalUrl && s3IsHttpUrl(finalUrl)) {
     try {
       finalCloudflare = await s3UploadRemoteResultToCloudflare(
-        currentModel,
+        finalUrl,
         `dress-${view}-${Date.now()}.png`
       )
     } catch (cfErr) {
@@ -2136,12 +2100,30 @@ async function s3RunSequentialViewSingleAttempt({
     }
   }
 
+  const steps = [
+    {
+      slot,
+      category: result.step.category,
+      attempts: result.attempts,
+      inputModel: result.step.inputModel,
+      garment: result.step.garment,
+      output: result.step.output,
+      predictionId: result.step.predictionId,
+      ...(debug
+        ? {
+            debugRunRaw: result.step.debugRunRaw,
+            debugStatusRaw: result.step.debugStatusRaw,
+          }
+        : {}),
+    },
+  ]
+
   return {
     ok: true,
     view,
-    plan,
-    finalUrl,        // ✅ FASHN 원본 유지
-    finalCloudflare, // ✅ 저장용 보조 자산
+    plan: [slot],
+    finalUrl,
+    finalCloudflare,
     steps,
   }
 }
@@ -2151,7 +2133,6 @@ async function s3RunSequentialViewWithRetry({
   modelImage,
   garments,
   seed,
-  promptMode,
   debug,
   meta,
   retryPolicy,
@@ -2232,7 +2213,6 @@ async function s3RunSequentialViewWithRetry({
         modelImage,
         garments,
         seed: seed + (attempt - 1) * 100,
-        promptMode,
         debug,
       })
 
@@ -2467,37 +2447,36 @@ app.post("/api/dress-max", async (req, res) => {
     const prepared = await s3PreprocessAll(norm)
 
     console.log("===================================")
-console.log("[S3 INPUT DEBUG]")
-console.log("model_front:", prepared.models.front)
-console.log("model_back:", prepared.models.back)
-console.log(
-  "garment_front:",
-  JSON.stringify(prepared.garmentsByView.front, null, 2)
-)
-console.log(
-  "garment_back:",
-  JSON.stringify(prepared.garmentsByView.back, null, 2)
-)
-console.log("[S3 INPUT TYPE CHECK]", {
-  model_front_is_url: s3IsHttpUrl(prepared.models.front),
-  model_back_is_url: s3IsHttpUrl(prepared.models.back),
-  top_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.top),
-  bottom_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.bottom),
-  outer_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.outer),
-  dress_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.dress),
-  top_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.top),
-  bottom_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.bottom),
-  outer_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.outer),
-  dress_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.dress),
-})
-console.log("===================================")
+    console.log("[S3 INPUT DEBUG]")
+    console.log("model_front:", prepared.models.front)
+    console.log("model_back:", prepared.models.back)
+    console.log(
+      "garment_front:",
+      JSON.stringify(prepared.garmentsByView.front, null, 2)
+    )
+    console.log(
+      "garment_back:",
+      JSON.stringify(prepared.garmentsByView.back, null, 2)
+    )
+    console.log("[S3 INPUT TYPE CHECK]", {
+      model_front_is_url: s3IsHttpUrl(prepared.models.front),
+      model_back_is_url: s3IsHttpUrl(prepared.models.back),
+      top_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.top),
+      bottom_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.bottom),
+      outer_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.outer),
+      dress_front_is_url: s3IsHttpUrl(prepared.garmentsByView.front.dress),
+      top_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.top),
+      bottom_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.bottom),
+      outer_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.outer),
+      dress_back_is_url: s3IsHttpUrl(prepared.garmentsByView.back.dress),
+    })
+    console.log("===================================")
 
     const frontPromise = s3RunSequentialViewWithRetry({
       view: "front",
       modelImage: prepared.models.front,
       garments: prepared.garmentsByView.front,
       seed: norm.seed,
-      promptMode: norm.promptMode,
       debug: norm.debug,
       meta: norm.meta,
       retryPolicy: norm.retryPolicy,
@@ -2508,7 +2487,6 @@ console.log("===================================")
       modelImage: prepared.models.back,
       garments: prepared.garmentsByView.back,
       seed: norm.seed + 1000,
-      promptMode: norm.promptMode,
       debug: norm.debug,
       meta: norm.meta,
       retryPolicy: norm.retryPolicy,
@@ -2516,21 +2494,28 @@ console.log("===================================")
 
     const [front, back] = await Promise.all([frontPromise, backPromise])
 
+    const frontProbe = front?.finalUrl
+      ? await s3ProbeImageSizeFromUrl(front.finalUrl)
+      : null
+
+    const backProbe = back?.finalUrl
+      ? await s3ProbeImageSizeFromUrl(back.finalUrl)
+      : null
+
+    console.log("[S3 OUTPUT SIZE PROBE]", {
+      front: frontProbe,
+      back: backProbe,
+    })
+
     console.log("===================================")
     console.log("[S3 RESULT DEBUG]")
-    console.log("front ok:", !!front?.ok)
-    console.log("front error:", front?.error || "")
-    console.log("front steps:", Array.isArray(front?.steps) ? front.steps.length : 0)
-    console.log("front url:", front?.finalUrl || "")
-    console.log("back ok:", !!back?.ok)
-    console.log("back error:", back?.error || "")
-    console.log("back steps:", Array.isArray(back?.steps) ? back.steps.length : 0)
-    console.log("back url:", back?.finalUrl || "")
+    console.log("front raw:", JSON.stringify(front, null, 2))
+    console.log("back raw:", JSON.stringify(back, null, 2))
     console.log("===================================")
 
     return res.json({
       ok: !!front?.ok || !!back?.ok,
-      mode: "tryon-max",
+      mode: "tryon-v1.6-quality",
 
       front: {
         ok: !!front?.ok,
@@ -2542,6 +2527,7 @@ console.log("===================================")
         bestAttempt: front?.bestAttempt || null,
         warnings: front?.warnings || [],
         score: front?.score || null,
+        probe: frontProbe,
         error: front?.error || "",
       },
 
@@ -2555,6 +2541,7 @@ console.log("===================================")
         bestAttempt: back?.bestAttempt || null,
         warnings: back?.warnings || [],
         score: back?.score || null,
+        probe: backProbe,
         error: back?.error || "",
       },
 
@@ -2601,6 +2588,8 @@ console.log("===================================")
           back_error: back?.error || "",
           back_steps: Array.isArray(back?.steps) ? back.steps.length : 0,
           back_url: back?.finalUrl || "",
+          front_probe: frontProbe,
+          back_probe: backProbe,
         },
       },
 
