@@ -11,7 +11,7 @@ import sharp from "sharp"
 import NodeFormData from "form-data"
 
 const app = express()
-
+app.set("trust proxy", true)
 /**
  * ============================================================
  * ✅ 0) Boot safety: Node version check
@@ -1432,7 +1432,69 @@ function s3ValidateInputs(norm) {
 
   return errors
 }
+/* ============================================================
+ * ✅ RAW INPUT public URL helpers (preserve original input)
+ * ============================================================
+ */
 
+const S3_RAW_IMAGE_TTL_MS = 1000 * 60 * 20
+const s3RawImageStore = new Map()
+
+function s3MakeId() {
+  return `${Date.now()}-${Math.random().toString(36).slice(2, 10)}`
+}
+
+function s3CleanupRawImageStore() {
+  const now = Date.now()
+  for (const [id, item] of s3RawImageStore.entries()) {
+    if (!item?.expiresAt || item.expiresAt <= now) {
+      s3RawImageStore.delete(id)
+    }
+  }
+}
+
+function s3BuildPublicBaseUrl(req) {
+  const forwardedProto = req.headers["x-forwarded-proto"]
+  const forwardedHost = req.headers["x-forwarded-host"]
+  const proto =
+    (Array.isArray(forwardedProto) ? forwardedProto[0] : forwardedProto) ||
+    req.protocol ||
+    "https"
+  const host =
+    (Array.isArray(forwardedHost) ? forwardedHost[0] : forwardedHost) ||
+    req.get("host") ||
+    ""
+
+  if (!host) {
+    throw new Error("Unable to determine public host for raw image URL")
+  }
+
+  return `${proto}://${host}`
+}
+
+function s3StoreRawImageBuffer(buffer, mime = "image/png", filename = "image.png") {
+  s3CleanupRawImageStore()
+
+  const id = s3MakeId()
+  s3RawImageStore.set(id, {
+    buffer,
+    mime,
+    filename,
+    createdAt: Date.now(),
+    expiresAt: Date.now() + S3_RAW_IMAGE_TTL_MS,
+  })
+
+  return id
+}
+
+function s3StoreRawImageFromDataUrl(dataUrl, filename = "image.png") {
+  const parsed = s3DataUrlToBuffer(dataUrl)
+  return s3StoreRawImageBuffer(parsed.buffer, parsed.mime, filename)
+}
+
+function s3BuildRawImageUrl(baseUrl, id) {
+  return `${baseUrl}/api/raw-image/${id}`
+}
 /* ============================================================
  * ✅ Cloudflare Images helpers
  * ============================================================
@@ -1628,7 +1690,7 @@ async function s3NormalizeImageInput(input, _options = {}) {
   throw new Error("Unsupported image input. Only public URL or data URL is allowed.")
 }
 
-async function s3PreprocessAll(norm) {
+async function s3PreprocessAll(norm, baseUrl) {
   const prepared = {
     models: { front: "", back: "" },
     garmentsByView: {
@@ -1641,22 +1703,11 @@ async function s3PreprocessAll(norm) {
     const modelInput = norm.models[view]
 
     if (s3IsDataUrl(modelInput)) {
-      const parsed = s3DataUrlToBuffer(modelInput)
-
-      const ext =
-        parsed.mime === "image/png"
-          ? "png"
-          : parsed.mime === "image/webp"
-          ? "webp"
-          : "jpg"
-
-      const uploaded = await s3UploadBufferToCloudflareImages(
-        parsed.buffer,
-        `model-${view}-${Date.now()}.${ext}`,
-        parsed.mime
+      const rawId = s3StoreRawImageFromDataUrl(
+        modelInput,
+        `model-${view}-${Date.now()}.png`
       )
-
-      prepared.models[view] = uploaded.url
+      prepared.models[view] = s3BuildRawImageUrl(baseUrl, rawId)
     } else {
       prepared.models[view] = modelInput || ""
     }
@@ -1665,22 +1716,11 @@ async function s3PreprocessAll(norm) {
       const garmentInput = norm.garmentsByView[view][slot]
 
       if (s3IsDataUrl(garmentInput)) {
-        const parsed = s3DataUrlToBuffer(garmentInput)
-
-        const ext =
-          parsed.mime === "image/png"
-            ? "png"
-            : parsed.mime === "image/webp"
-            ? "webp"
-            : "jpg"
-
-        const uploaded = await s3UploadBufferToCloudflareImages(
-          parsed.buffer,
-          `${slot}-${view}-${Date.now()}.${ext}`,
-          parsed.mime
+        const rawId = s3StoreRawImageFromDataUrl(
+          garmentInput,
+          `${slot}-${view}-${Date.now()}.png`
         )
-
-        prepared.garmentsByView[view][slot] = uploaded.url
+        prepared.garmentsByView[view][slot] = s3BuildRawImageUrl(baseUrl, rawId)
       } else {
         prepared.garmentsByView[view][slot] = garmentInput || ""
       }
@@ -2347,7 +2387,31 @@ async function s3RunSequentialViewWithRetry({
  * ✅ Routes
  * ============================================================
  */
+app.get("/api/raw-image/:id", async (req, res) => {
+  try {
+    s3CleanupRawImageStore()
 
+    const id = String(req.params.id || "")
+    const item = s3RawImageStore.get(id)
+
+    if (!item) {
+      return res.status(404).send("Raw image not found")
+    }
+
+    if (item.expiresAt <= Date.now()) {
+      s3RawImageStore.delete(id)
+      return res.status(410).send("Raw image expired")
+    }
+
+    res.setHeader("Content-Type", item.mime || "application/octet-stream")
+    res.setHeader("Content-Length", String(item.buffer.length || 0))
+    res.setHeader("Cache-Control", "public, max-age=1200")
+
+    return res.send(item.buffer)
+  } catch (err) {
+    return res.status(500).send(s3SafeErrMessage(err))
+  }
+})
 app.post("/api/dress-max", async (req, res) => {
   const startedAt = Date.now()
   const requestMeta = s3GetRequestDebugMeta(req.body)
@@ -2403,7 +2467,8 @@ app.post("/api/dress-max", async (req, res) => {
     )
 
     console.log("[S3] before preprocess")
-    const prepared = await s3PreprocessAll(norm)
+    const baseUrl = s3BuildPublicBaseUrl(req)
+    const prepared = await s3PreprocessAll(norm, baseUrl)
     console.log("[S3] after preprocess")
 
     console.log("[S3] before input probe")
