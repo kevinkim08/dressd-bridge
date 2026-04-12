@@ -2496,6 +2496,52 @@ async function s3RunSequentialViewWithRetry({
  * ✅ Routes
  * ============================================================
  */
+
+app.post(
+  "/api/upload-binary",
+  express.raw({ type: "image/*", limit: "25mb" }),
+  async (req, res) => {
+    try {
+      const body = req.body
+
+      if (!body || !Buffer.isBuffer(body) || body.length === 0) {
+        return res.status(400).json({
+          ok: false,
+          error: "Binary image body is required",
+        })
+      }
+
+      const mime =
+        typeof req.headers["content-type"] === "string" &&
+        req.headers["content-type"].startsWith("image/")
+          ? req.headers["content-type"]
+          : "image/png"
+
+      const filename =
+        typeof req.query.filename === "string" && req.query.filename.trim()
+          ? decodeURIComponent(req.query.filename)
+          : `upload-${Date.now()}.png`
+
+      const rawId = s3StoreRawImageBuffer(body, mime, filename)
+      const baseUrl = s3BuildPublicBaseUrl(req)
+      const url = s3BuildRawImageUrl(baseUrl, rawId)
+
+      return res.json({
+        ok: true,
+        url,
+        mime,
+        bytes: body.length,
+        filename,
+      })
+    } catch (err) {
+      return res.status(500).json({
+        ok: false,
+        error: s3SafeErrMessage(err),
+      })
+    }
+  }
+)
+
 app.get("/api/raw-image/:id", async (req, res) => {
   try {
     s3CleanupRawImageStore()
