@@ -1035,11 +1035,11 @@ app.post("/api/s1/pair", async (req, res) => {
 
 /**
  * ============================================================
- * ✅ 7) S3 Dress (FASHN) - v1.6 quality-first
- * ✅ INPUT: model / garment dataURL -> Cloudflare URL normalize
- * ✅ OUTPUT: final result keeps FASHN original URL
- * ✅ STORAGE: Cloudflare is storage-only asset
- * ✅ POLICY: one garment per view for quality-first mode
+ * ✅ 7) S3 Dress (FASHN) - Try-On Max preserve only
+ * ✅ INPUT: model dataURL -> Cloudflare URL / garment dataURL -> Cloudflare URL
+ * ✅ OUTPUT: final result only -> Cloudflare Images upload
+ * ✅ finalUrl always keeps FASHN original URL
+ * ✅ Cloudflare is storage-only asset
  * ============================================================
  */
 
@@ -1109,30 +1109,18 @@ function s3NormalizePromptMode(v) {
   return v === "short" ? "short" : "empty"
 }
 
+function s3ShortPromptForSlot(slot) {
+  if (slot === "bottom") return "put on the pants"
+  if (slot === "top") return "put on the top"
+  if (slot === "outer") return "put on the outerwear"
+  if (slot === "dress") return "put on the dress"
+  return ""
+}
+
 function s3BuildPlanForView(garmentsByView, view) {
   const hasDress = !!garmentsByView[view]?.dress
   if (hasDress) return ["dress"]
   return S3_SLOT_ORDER.filter((slot) => !!garmentsByView[view]?.[slot])
-}
-
-function s3CountGarmentsForView(garments) {
-  return ["top", "bottom", "outer", "dress"].filter((slot) => !!garments?.[slot]).length
-}
-
-function s3PickSingleGarmentSlot(garments) {
-  if (garments?.dress) return "dress"
-  if (garments?.bottom) return "bottom"
-  if (garments?.top) return "top"
-  if (garments?.outer) return "outer"
-  return ""
-}
-
-function s3MapSlotToV16Category(slot) {
-  if (slot === "top") return "tops"
-  if (slot === "bottom") return "bottoms"
-  if (slot === "dress") return "one-pieces"
-  if (slot === "outer") return "auto"
-  return "auto"
 }
 
 /* ============================================================
@@ -1479,7 +1467,6 @@ async function s3UploadBufferToCloudflareImages(
 
   const form = new FormData()
   const blob = new Blob([buffer], { type: mime })
-
   form.append("file", blob, filename)
 
   const res = await fetch(
@@ -1628,11 +1615,7 @@ async function s3UploadRemoteResultToCloudflare(url, filename = "result.png") {
     ? filename
     : `result.${ext}`
 
-  return s3UploadBufferToCloudflareImages(
-    fetched.buffer,
-    safeFilename,
-    mime
-  )
+  return s3UploadBufferToCloudflareImages(fetched.buffer, safeFilename, mime)
 }
 
 function s3EmptyAsset() {
@@ -1651,13 +1634,8 @@ function s3EmptyAsset() {
 async function s3NormalizeImageInput(input, _options = {}) {
   if (!input) return ""
 
-  if (s3IsHttpUrl(input)) {
-    return input
-  }
-
-  if (s3IsDataUrl(input)) {
-    return input
-  }
+  if (s3IsHttpUrl(input)) return input
+  if (s3IsDataUrl(input)) return input
 
   throw new Error("Unsupported image input. Only public URL or data URL is allowed.")
 }
@@ -1729,27 +1707,23 @@ async function s3PreprocessAll(norm) {
  * ============================================================
  */
 
-async function s3FashnRunTryOnV16({
+async function s3FashnRunTryOnMax({
   modelImage,
-  garmentImage,
-  category = "auto",
-  garmentPhotoType = "auto",
-  mode = "quality",
+  productImage,
+  prompt = "",
   seed = 42,
-  numSamples = 1,
+  numImages = 1,
   outputFormat = "png",
   returnBase64 = false,
 }) {
   const payload = {
-    model_name: "tryon-v1.6",
+    model_name: "tryon-max",
     inputs: {
       model_image: modelImage,
-      garment_image: garmentImage,
-      category,
-      garment_photo_type: garmentPhotoType,
-      mode,
+      product_image: productImage,
+      prompt,
       seed,
-      num_samples: numSamples,
+      num_images: numImages,
       output_format: outputFormat,
       return_base64: returnBase64,
     },
@@ -1778,7 +1752,7 @@ async function s3FashnRunTryOnV16({
       json?.error?.message ||
       json?.message ||
       json?.error ||
-      `FASHN v1.6 run failed with ${res.status}`
+      `FASHN run failed with ${res.status}`
 
     throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
   }
@@ -1791,7 +1765,7 @@ async function s3FashnRunTryOnV16({
     ""
 
   if (!predictionId) {
-    throw new Error("FASHN v1.6 response did not include prediction id")
+    throw new Error("FASHN response did not include prediction id")
   }
 
   return {
@@ -1888,41 +1862,48 @@ async function s3RunTryOnStep({
   inputModel,
   garment,
   seed,
+  promptMode,
   debug = false,
 }) {
-  const category = s3MapSlotToV16Category(slot)
+  const prompt = promptMode === "short" ? s3ShortPromptForSlot(slot) : ""
+
+  if (!inputModel) {
+    throw new Error(`Missing inputModel for slot ${slot}`)
+  }
+
+  if (!garment) {
+    throw new Error(`Missing garment for slot ${slot}`)
+  }
 
   console.log("[TRYON_STEP_INPUT]", {
     slot,
     inputModel,
     garment,
     seed,
-    category,
+    prompt,
     inputModelIsUrl: s3IsHttpUrl(inputModel),
     garmentIsUrl: s3IsHttpUrl(garment),
   })
 
-  const run = await s3FashnRunTryOnV16({
+  const run = await s3FashnRunTryOnMax({
     modelImage: inputModel,
-    garmentImage: garment,
-    category,
-    garmentPhotoType: "auto",
-    mode: "quality",
+    productImage: garment,
+    prompt,
     seed,
-    numSamples: 1,
+    numImages: 1,
     outputFormat: "png",
     returnBase64: false,
   })
 
   const done = await s3FashnPollPrediction(run.id)
 
-  console.log("[TRYON_V16_RUN_PAYLOAD]", JSON.stringify(run.payload, null, 2))
-  console.log("[TRYON_V16_STATUS_RAW]", JSON.stringify(done.raw, null, 2))
-  console.log("[TRYON_V16_FINAL_IMAGE]", done.finalImage)
+  console.log("[TRYON_MAX_RUN_PAYLOAD]", JSON.stringify(run.payload, null, 2))
+  console.log("[TRYON_MAX_STATUS_RAW]", JSON.stringify(done.raw, null, 2))
+  console.log("[TRYON_MAX_FINAL_IMAGE]", done.finalImage)
 
   return {
     slot,
-    category,
+    prompt,
     predictionId: run.id,
     inputModel,
     garment,
@@ -1987,10 +1968,10 @@ async function s3RunSequentialViewSingleAttempt({
   modelImage,
   garments,
   seed,
+  promptMode,
   debug,
 }) {
   const plan = s3BuildPlanForView({ [view]: garments }, view)
-  const garmentCount = s3CountGarmentsForView(garments)
 
   console.log("[SEQUENTIAL_VIEW_START]", {
     view,
@@ -2002,7 +1983,6 @@ async function s3RunSequentialViewSingleAttempt({
       dress: !!garments?.dress,
     },
     plan,
-    garmentCount,
   })
 
   if (!modelImage) {
@@ -2029,66 +2009,66 @@ async function s3RunSequentialViewSingleAttempt({
     }
   }
 
-  if (garmentCount > 1) {
-    return {
-      ok: false,
-      view,
-      error: `quality-first mode supports one garment per view. ${view} has ${garmentCount} garments`,
-      plan,
-      finalUrl: "",
-      finalCloudflare: s3EmptyAsset(),
-      steps: [],
+  let currentModel = modelImage
+  const steps = []
+
+  for (let i = 0; i < plan.length; i++) {
+    const slot = plan[i]
+    const garment = garments[slot]
+
+    if (!garment) continue
+
+    const result = await s3RunTryOnStepWithRetry(
+      {
+        slot,
+        inputModel: currentModel,
+        garment,
+        seed: seed + i,
+        promptMode,
+        debug,
+      },
+      S3_DEFAULT_RETRY_COUNT
+    )
+
+    if (!result.ok) {
+      return {
+        ok: false,
+        view,
+        plan,
+        finalUrl: currentModel,
+        finalCloudflare: s3EmptyAsset(),
+        steps,
+        failedStep: slot,
+        error: result.error || `Failed on ${slot}`,
+      }
     }
-  }
 
-  const slot = s3PickSingleGarmentSlot(garments)
-  const garment = garments?.[slot] || ""
-
-  if (!slot || !garment) {
-    return {
-      ok: false,
-      view,
-      error: `No valid garment found for ${view}`,
-      plan,
-      finalUrl: "",
-      finalCloudflare: s3EmptyAsset(),
-      steps: [],
-    }
-  }
-
-  const originalModel = modelImage
-
-  const result = await s3RunTryOnStepWithRetry(
-    {
+    steps.push({
       slot,
-      inputModel: originalModel,
-      garment,
-      seed,
-      debug,
-    },
-    S3_DEFAULT_RETRY_COUNT
-  )
+      attempts: result.attempts,
+      inputModel: result.step.inputModel,
+      garment: result.step.garment,
+      output: result.step.output,
+      prompt: result.step.prompt,
+      predictionId: result.step.predictionId,
+      ...(debug
+        ? {
+            debugRunRaw: result.step.debugRunRaw,
+            debugStatusRaw: result.step.debugStatusRaw,
+          }
+        : {}),
+    })
 
-  if (!result.ok) {
-    return {
-      ok: false,
-      view,
-      plan,
-      finalUrl: "",
-      finalCloudflare: s3EmptyAsset(),
-      steps: [],
-      failedStep: slot,
-      error: result.error || `Failed on ${slot}`,
-    }
+    currentModel = result.step.output || currentModel
   }
 
-  const finalUrl = result.step.output || ""
   let finalCloudflare = s3EmptyAsset()
+  let finalUrl = currentModel || ""
 
-  if (finalUrl && s3IsHttpUrl(finalUrl)) {
+  if (currentModel && s3IsHttpUrl(currentModel)) {
     try {
       finalCloudflare = await s3UploadRemoteResultToCloudflare(
-        finalUrl,
+        currentModel,
         `dress-${view}-${Date.now()}.png`
       )
     } catch (cfErr) {
@@ -2100,28 +2080,10 @@ async function s3RunSequentialViewSingleAttempt({
     }
   }
 
-  const steps = [
-    {
-      slot,
-      category: result.step.category,
-      attempts: result.attempts,
-      inputModel: result.step.inputModel,
-      garment: result.step.garment,
-      output: result.step.output,
-      predictionId: result.step.predictionId,
-      ...(debug
-        ? {
-            debugRunRaw: result.step.debugRunRaw,
-            debugStatusRaw: result.step.debugStatusRaw,
-          }
-        : {}),
-    },
-  ]
-
   return {
     ok: true,
     view,
-    plan: [slot],
+    plan,
     finalUrl,
     finalCloudflare,
     steps,
@@ -2133,6 +2095,7 @@ async function s3RunSequentialViewWithRetry({
   modelImage,
   garments,
   seed,
+  promptMode,
   debug,
   meta,
   retryPolicy,
@@ -2213,6 +2176,7 @@ async function s3RunSequentialViewWithRetry({
         modelImage,
         garments,
         seed: seed + (attempt - 1) * 100,
+        promptMode,
         debug,
       })
 
@@ -2477,6 +2441,7 @@ app.post("/api/dress-max", async (req, res) => {
       modelImage: prepared.models.front,
       garments: prepared.garmentsByView.front,
       seed: norm.seed,
+      promptMode: norm.promptMode,
       debug: norm.debug,
       meta: norm.meta,
       retryPolicy: norm.retryPolicy,
@@ -2487,6 +2452,7 @@ app.post("/api/dress-max", async (req, res) => {
       modelImage: prepared.models.back,
       garments: prepared.garmentsByView.back,
       seed: norm.seed + 1000,
+      promptMode: norm.promptMode,
       debug: norm.debug,
       meta: norm.meta,
       retryPolicy: norm.retryPolicy,
@@ -2515,7 +2481,7 @@ app.post("/api/dress-max", async (req, res) => {
 
     return res.json({
       ok: !!front?.ok || !!back?.ok,
-      mode: "tryon-v1.6-quality",
+      mode: "tryon-max",
 
       front: {
         ok: !!front?.ok,
@@ -2688,19 +2654,61 @@ app.post("/api/dress-v16-test", async (req, res) => {
     const preparedModel = await s3NormalizeImageInput(modelImage)
     const preparedGarment = await s3NormalizeImageInput(garmentImage)
 
-    const run = await s3FashnRunTryOnV16({
-      modelImage: preparedModel,
-      garmentImage: preparedGarment,
-      category,
-      garmentPhotoType: garment_photo_type,
-      mode,
-      seed,
-      numSamples: 1,
-      outputFormat: "png",
-      returnBase64: false,
+    const payload = {
+      model_name: "tryon-v1.6",
+      inputs: {
+        model_image: preparedModel,
+        garment_image: preparedGarment,
+        category,
+        garment_photo_type,
+        mode,
+        seed,
+        num_samples: 1,
+        output_format: "png",
+        return_base64: false,
+      },
+    }
+
+    const resRun = await fetch(FASHN_RUN_URL, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${process.env.FASHN_API_KEY || ""}`,
+      },
+      body: JSON.stringify(payload),
     })
 
-    const done = await s3FashnPollPrediction(run.id)
+    const runText = await resRun.text()
+    let runJson = null
+
+    try {
+      runJson = runText ? JSON.parse(runText) : null
+    } catch {
+      runJson = { raw: runText }
+    }
+
+    if (!resRun.ok) {
+      const msg =
+        runJson?.error?.message ||
+        runJson?.message ||
+        runJson?.error ||
+        `FASHN v1.6 run failed with ${resRun.status}`
+
+      throw new Error(typeof msg === "string" ? msg : JSON.stringify(msg))
+    }
+
+    const predictionId =
+      runJson?.id ||
+      runJson?.prediction_id ||
+      runJson?.data?.id ||
+      runJson?.result?.id ||
+      ""
+
+    if (!predictionId) {
+      throw new Error("FASHN v1.6 response did not include prediction id")
+    }
+
+    const done = await s3FashnPollPrediction(predictionId)
 
     let finalCloudflare = s3EmptyAsset()
     if (done.finalImage && s3IsHttpUrl(done.finalImage)) {
@@ -2724,7 +2732,7 @@ app.post("/api/dress-v16-test", async (req, res) => {
       category,
       finalUrl: done.finalImage || null,
       finalCloudflare,
-      predictionId: run.id,
+      predictionId,
       meta: {
         elapsedMs: Date.now() - startedAt,
         garment_photo_type,
@@ -2735,8 +2743,8 @@ app.post("/api/dress-v16-test", async (req, res) => {
       },
       ...(debug
         ? {
-            debugPayload: run.payload,
-            debugRunRaw: run.raw,
+            debugPayload: payload,
+            debugRunRaw: runJson,
             debugStatusRaw: done.raw,
           }
         : {}),
