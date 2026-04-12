@@ -1701,7 +1701,7 @@ function s3EmptyAsset() {
 }
 
 /* ============================================================
- * ✅ INPUT normalize helpers
+ * ✅ INPUT: model dataURL -> Cloudflare URL / garment dataURL -> Cloudflare URL
  * ============================================================
  */
 
@@ -1739,15 +1739,26 @@ async function s3PreprocessAll(norm, baseUrl) {
     for (const slot of ["top", "bottom", "outer", "dress"]) {
       const garmentInput = norm.garmentsByView[view][slot]
 
-      if (s3IsDataUrl(garmentInput)) {
-        const rawId = s3StoreRawImageFromDataUrl(
-          garmentInput,
-          `${slot}-${view}-${Date.now()}.png`
-        )
-        prepared.garmentsByView[view][slot] = s3BuildRawImageUrl(baseUrl, rawId)
-      } else {
-        prepared.garmentsByView[view][slot] = garmentInput || ""
-      }
+     if (s3IsDataUrl(garmentInput)) {
+  const parsed = s3DataUrlToBuffer(garmentInput)
+
+  let garmentBuffer = parsed.buffer
+  let garmentMime = parsed.mime || "image/png"
+
+  // ✅ garment만 FASHN 친화적으로 확대
+  garmentBuffer = await s3ResizeGarmentForFashn(garmentBuffer)
+  garmentMime = "image/png"
+
+  const rawId = s3StoreRawImageBuffer(
+    garmentBuffer,
+    garmentMime,
+    `${slot}-${view}-${Date.now()}.png`
+  )
+
+  prepared.garmentsByView[view][slot] = s3BuildRawImageUrl(baseUrl, rawId)
+} else {
+  prepared.garmentsByView[view][slot] = garmentInput || ""
+}
     }
   }
 
