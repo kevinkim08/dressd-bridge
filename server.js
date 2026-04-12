@@ -1715,6 +1715,8 @@ async function s3FashnRunTryOnMax({
   numImages = 1,
   outputFormat = "png",
   returnBase64 = false,
+  resolution = "2k",
+  generationMode = "quality",
 }) {
   const payload = {
     model_name: "tryon-max",
@@ -1726,6 +1728,8 @@ async function s3FashnRunTryOnMax({
       num_images: numImages,
       output_format: outputFormat,
       return_base64: returnBase64,
+      resolution,
+      generation_mode: generationMode,
     },
   }
 
@@ -1886,14 +1890,16 @@ async function s3RunTryOnStep({
   })
 
   const run = await s3FashnRunTryOnMax({
-    modelImage: inputModel,
-    productImage: garment,
-    prompt,
-    seed,
-    numImages: 1,
-    outputFormat: "png",
-    returnBase64: false,
-  })
+  modelImage: inputModel,
+  productImage: garment,
+  prompt,
+  seed,
+  numImages: 1,
+  outputFormat: "png",
+  returnBase64: false,
+  resolution: "2k",
+  generationMode: "quality",
+})
 
   const done = await s3FashnPollPrediction(run.id)
 
