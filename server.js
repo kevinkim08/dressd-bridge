@@ -2415,6 +2415,27 @@ app.post("/api/dress-max", async (req, res) => {
     )
 
     const prepared = await s3PreprocessAll(norm)
+    
+    const inputProbe = {
+  frontModel: prepared.models.front
+    ? await s3ProbeImageSizeFromUrl(prepared.models.front)
+    : null,
+  backModel: prepared.models.back
+    ? await s3ProbeImageSizeFromUrl(prepared.models.back)
+    : null,
+  frontBottom: prepared.garmentsByView.front.bottom
+    ? await s3ProbeImageSizeFromUrl(prepared.garmentsByView.front.bottom)
+    : null,
+  backBottom: prepared.garmentsByView.back.bottom
+    ? await s3ProbeImageSizeFromUrl(prepared.garmentsByView.back.bottom)
+    : null,
+}
+return {
+  ok: true,
+  ...
+  inputProbe, // 👈 이거 추가
+}
+console.log("[S3 INPUT SIZE PROBE]", JSON.stringify(inputProbe, null, 2))
 
     console.log("===================================")
     console.log("[S3 INPUT DEBUG]")
