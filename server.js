@@ -1051,7 +1051,7 @@ const S3_VIEWS = ["front", "back"]
 
 const S3_DEFAULT_POLL_INTERVAL_MS = 2500
 const S3_DEFAULT_POLL_TIMEOUT_MS = 1000 * 60 * 6
-const S3_DEFAULT_RETRY_COUNT = 1
+const S3_DEFAULT_RETRY_COUNT = 0
 
 const CF_ACCOUNT_ID = process.env.CLOUDFLARE_ACCOUNT_ID || ""
 const CF_IMAGES_TOKEN = process.env.CLOUDFLARE_IMAGES_TOKEN || ""
@@ -1169,7 +1169,7 @@ function s3NormalizeLengthMeta(meta) {
 function s3NormalizeRetryPolicy(input) {
   const src = input && typeof input === "object" ? input : {}
   const enabled = src.enabled !== false
-  const maxAttempts = s3Clamp(s3ToNumber(src.max_attempts, 3), 1, 4)
+  const maxAttempts = 1
   const passScore = s3Clamp(s3ToNumber(src.pass_score, 70), 40, 100)
   const warningScore = s3Clamp(s3ToNumber(src.warning_score, 55), 20, passScore)
 
@@ -1436,7 +1436,12 @@ function s3ValidateInputs(norm) {
  * ✅ RAW INPUT public URL helpers (preserve original input)
  * ============================================================
  */
+let s3GlobalRunCounter = 0
 
+function s3NextRunCounter() {
+  s3GlobalRunCounter += 1
+  return s3GlobalRunCounter
+}
 const S3_RAW_IMAGE_TTL_MS = 1000 * 60 * 20
 const s3RawImageStore = new Map()
 
@@ -1736,6 +1741,17 @@ async function s3PreprocessAll(norm, baseUrl) {
  */
 
 async function s3FashnRunTryOnMax({
+  
+  const runSeq = s3NextRunCounter()
+console.log("[FASHN_RUN_START]", {
+  runSeq,
+  modelImage,
+  productImage,
+  seed,
+  resolution,
+  generationMode,
+})
+  
   modelImage,
   productImage,
   prompt = "",
@@ -1800,11 +1816,12 @@ async function s3FashnRunTryOnMax({
     throw new Error("FASHN response did not include prediction id")
   }
 
-  return {
-    id: predictionId,
-    raw: json,
-    payload,
-  }
+ return {
+  id: predictionId,
+  raw: json,
+  payload,
+  runSeq,
+}
 }
 
 async function s3FashnPollPrediction(id, opts = {}) {
@@ -1936,15 +1953,16 @@ async function s3RunTryOnStep({
   console.log("[TRYON_MAX_FINAL_IMAGE]", done.finalImage)
 
   return {
-    slot,
-    prompt,
-    predictionId: run.id,
-    inputModel,
-    garment,
-    output: done.finalImage,
-    debugRunRaw: debug ? run.raw : undefined,
-    debugStatusRaw: debug ? done.raw : undefined,
-  }
+  slot,
+  prompt,
+  predictionId: run.id,
+  runSeq: run.runSeq,
+  inputModel,
+  garment,
+  output: done.finalImage,
+  debugRunRaw: debug ? run.raw : undefined,
+  debugStatusRaw: debug ? done.raw : undefined,
+}
 }
 
 async function s3RunTryOnStepWithRetry(args, retryCount = S3_DEFAULT_RETRY_COUNT) {
@@ -2080,6 +2098,7 @@ async function s3RunSequentialViewSingleAttempt({
     steps.push({
       slot,
       attempts: result.attempts,
+      runSeq: result.step.runSeq,
       inputModel: result.step.inputModel,
       garment: result.step.garment,
       output: result.step.output,
@@ -2641,6 +2660,7 @@ app.post("/api/dress-max", async (req, res) => {
         normalizedMeta: norm.meta,
         retryPolicy: norm.retryPolicy,
         elapsedMs: Date.now() - startedAt,
+        fashnRunCounter: s3GlobalRunCounter,
       },
     })
   } catch (err) {
