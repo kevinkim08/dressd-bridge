@@ -1537,56 +1537,44 @@ async function s3FetchRemoteImageAsBuffer(url) {
   }
 }
 
-async function s3ProbeImageSizeFromUrl(url) {
-  if (!url || !s3IsHttpUrl(url)) {
-    return { url: url || "", ok: false, error: "invalid url" }
-  }
+async function s3ProbeImageSizeFromUrl(url, timeoutMs = 8000) {
+  let timer = null
 
   try {
-    const res = await fetch(url)
+    const controller = new AbortController()
+    timer = setTimeout(() => controller.abort(), timeoutMs)
+
+    const res = await fetch(url, {
+      method: "GET",
+      signal: controller.signal,
+    })
+
     if (!res.ok) {
-      return {
-        url,
-        ok: false,
-        status: res.status,
-        error: `fetch failed: ${res.status}`,
-      }
+      throw new Error(`HTTP ${res.status}`)
     }
 
     const arrayBuffer = await res.arrayBuffer()
     const buffer = Buffer.from(arrayBuffer)
-    const contentType = res.headers.get("content-type") || ""
-
-    let width = null
-    let height = null
-
-    try {
-      const meta = await sharp(buffer, { failOn: "none" }).metadata()
-      width = meta?.width || null
-      height = meta?.height || null
-    } catch (e) {
-      return {
-        url,
-        ok: false,
-        contentType,
-        error: `sharp metadata failed: ${String(e?.message || e)}`,
-      }
-    }
+    const meta = await sharp(buffer).metadata()
 
     return {
-      url,
       ok: true,
-      contentType,
-      width,
-      height,
-      bytes: buffer.length,
-    }
-  } catch (e) {
-    return {
       url,
-      ok: false,
-      error: String(e?.message || e),
+      width: meta.width || 0,
+      height: meta.height || 0,
+      format: meta.format || "",
+      sizeBytes: buffer.length || 0,
     }
+  } catch (err) {
+    return {
+      ok: false,
+      url,
+      error: err?.name === "AbortError"
+        ? `Probe timeout after ${timeoutMs}ms`
+        : err?.message || String(err),
+    }
+  } finally {
+    if (timer) clearTimeout(timer)
   }
 }
 
@@ -1879,7 +1867,7 @@ async function s3RunTryOnStep({
     throw new Error(`Missing garment for slot ${slot}`)
   }
 
-  console.log("[TRYON_STEP_INPUT]", {
+  ("[TRYON_STEP_INPUT]", {
     slot,
     inputModel,
     garment,
@@ -1903,9 +1891,9 @@ async function s3RunTryOnStep({
 
   const done = await s3FashnPollPrediction(run.id)
 
-  console.log("[TRYON_MAX_RUN_PAYLOAD]", JSON.stringify(run.payload, null, 2))
-  console.log("[TRYON_MAX_STATUS_RAW]", JSON.stringify(done.raw, null, 2))
-  console.log("[TRYON_MAX_FINAL_IMAGE]", done.finalImage)
+  ("[TRYON_MAX_RUN_PAYLOAD]", JSON.stringify(run.payload, null, 2))
+  ("[TRYON_MAX_STATUS_RAW]", JSON.stringify(done.raw, null, 2))
+  ("[TRYON_MAX_FINAL_IMAGE]", done.finalImage)
 
   return {
     slot,
@@ -1979,7 +1967,7 @@ async function s3RunSequentialViewSingleAttempt({
 }) {
   const plan = s3BuildPlanForView({ [view]: garments }, view)
 
-  console.log("[SEQUENTIAL_VIEW_START]", {
+  ("[SEQUENTIAL_VIEW_START]", {
     view,
     hasModel: !!modelImage,
     garments: {
@@ -2229,7 +2217,7 @@ async function s3RunSequentialViewWithRetry({
         score,
       })
 
-      console.log("[VIEW_ATTEMPT_RESULT]", {
+      ("[VIEW_ATTEMPT_RESULT]", {
         view,
         attempt,
         ok: !!single?.ok,
@@ -2414,28 +2402,23 @@ app.post("/api/dress-max", async (req, res) => {
       JSON.stringify(norm.retryPolicy, null, 2)
     )
 
+    console.log("[S3] before preprocess")
     const prepared = await s3PreprocessAll(norm)
-    
+    console.log("[S3] after preprocess")
+
+    console.log("[S3] before input probe")
     const inputProbe = {
-  frontModel: prepared.models.front
-    ? await s3ProbeImageSizeFromUrl(prepared.models.front)
-    : null,
-  backModel: prepared.models.back
-    ? await s3ProbeImageSizeFromUrl(prepared.models.back)
-    : null,
-  frontBottom: prepared.garmentsByView.front.bottom
-    ? await s3ProbeImageSizeFromUrl(prepared.garmentsByView.front.bottom)
-    : null,
-  backBottom: prepared.garmentsByView.back.bottom
-    ? await s3ProbeImageSizeFromUrl(prepared.garmentsByView.back.bottom)
-    : null,
-}
-return {
-  ok: true,
-  ...
-  inputProbe, // 👈 이거 추가
-}
-console.log("[S3 INPUT SIZE PROBE]", JSON.stringify(inputProbe, null, 2))
+      frontModel: prepared.models.front
+        ? await s3ProbeImageSizeFromUrl(prepared.models.front, 8000)
+        : null,
+      frontBottom: prepared.garmentsByView.front.bottom
+        ? await s3ProbeImageSizeFromUrl(
+            prepared.garmentsByView.front.bottom,
+            8000
+          )
+        : null,
+    }
+    console.log("[S3] after input probe", JSON.stringify(inputProbe, null, 2))
 
     console.log("===================================")
     console.log("[S3 INPUT DEBUG]")
@@ -2463,6 +2446,7 @@ console.log("[S3 INPUT SIZE PROBE]", JSON.stringify(inputProbe, null, 2))
     })
     console.log("===================================")
 
+    console.log("[S3] before run tryon")
     const frontPromise = s3RunSequentialViewWithRetry({
       view: "front",
       modelImage: prepared.models.front,
@@ -2488,11 +2472,11 @@ console.log("[S3 INPUT SIZE PROBE]", JSON.stringify(inputProbe, null, 2))
     const [front, back] = await Promise.all([frontPromise, backPromise])
 
     const frontProbe = front?.finalUrl
-      ? await s3ProbeImageSizeFromUrl(front.finalUrl)
+      ? await s3ProbeImageSizeFromUrl(front.finalUrl, 8000)
       : null
 
     const backProbe = back?.finalUrl
-      ? await s3ProbeImageSizeFromUrl(back.finalUrl)
+      ? await s3ProbeImageSizeFromUrl(back.finalUrl, 8000)
       : null
 
     console.log("[S3 OUTPUT SIZE PROBE]", {
@@ -2572,6 +2556,7 @@ console.log("[S3 INPUT SIZE PROBE]", JSON.stringify(inputProbe, null, 2))
             "dress",
           ]),
         },
+        inputProbe,
         output: {
           front_ok: !!front?.ok,
           front_error: front?.error || "",
