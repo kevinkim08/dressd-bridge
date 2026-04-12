@@ -1728,7 +1728,19 @@ async function s3PreprocessAll(norm, baseUrl) {
   let garmentMime = parsed.mime || "image/png"
 
   // ✅ garment만 FASHN 친화적으로 확대
+       console.log("[GARMENT_INPUT_CHECK]", {
+  mime: parsed.mime,
+  size: parsed.buffer.length,
+  isDataUrl: garmentInput?.startsWith("data:image"),
+})
+  try {
   garmentBuffer = await s3NormalizeGarmentForFashn(garmentBuffer)
+} catch (e) {
+  console.error("[GARMENT_NORMALIZE_FAILED]", e.message)
+
+  // 👉 fallback: 원본 그대로 사용
+  garmentBuffer = parsed.buffer
+}
   garmentMime = "image/png"
 
   const rawId = s3StoreRawImageBuffer(
