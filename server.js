@@ -1123,69 +1123,6 @@ function s3BuildPlanForView(garmentsByView, view) {
   return S3_SLOT_ORDER.filter((slot) => !!garmentsByView[view]?.[slot])
 }
 
-async function s3NormalizeGarmentForFashn(buffer) {
-  const image = sharp(buffer)
-  const meta = await image.metadata()
-
-  const width = meta.width || 1
-  const height = meta.height || 1
-
-  const raw = await image.ensureAlpha().raw().toBuffer()
-
-  let minX = width
-  let minY = height
-  let maxX = 0
-  let maxY = 0
-
-  // 👉 투명 영역 제거 (bounding box 계산)
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      const alpha = raw[(y * width + x) * 4 + 3]
-
-      if (alpha > 10) {
-        if (x < minX) minX = x
-        if (y < minY) minY = y
-        if (x > maxX) maxX = x
-        if (y > maxY) maxY = y
-      }
-    }
-  }
-
-  // 👉 예외 처리 (전체 투명 방지)
-  if (maxX <= minX || maxY <= minY) {
-    return buffer
-  }
-
-  const cropWidth = maxX - minX
-  const cropHeight = maxY - minY
-
-  // 👉 실제 의류만 crop
-  const cropped = await image
-    .extract({
-      left: minX,
-      top: minY,
-      width: cropWidth,
-      height: cropHeight,
-    })
-    .toBuffer()
-
-  // 👉 목표 크기
-  const TARGET_HEIGHT = 1800
-
-  const scale = TARGET_HEIGHT / cropHeight
-  const newWidth = Math.round(cropWidth * scale)
-
-  // 👉 중앙 정렬 + 확대
-  const finalBuffer = await sharp(cropped)
-    .resize(newWidth, TARGET_HEIGHT, {
-      fit: "contain",
-      background: { r: 0, g: 0, b: 0, alpha: 0 },
-    })
-    .png()
-    .toBuffer()
-
-  return finalBuffer
-}
 
 /* ============================================================
  * ✅ meta / retry / score helpers
@@ -1815,7 +1752,7 @@ async function s3PreprocessAll(norm, baseUrl) {
  * ✅ IMAGE PREPROCESS HELPERS
  * ============================================================
  */
-async function s3NormalizeGarmentForFashn(buffer) {
+ {
   const image = sharp(buffer)
   const meta = await image.metadata()
 
