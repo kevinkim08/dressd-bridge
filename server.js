@@ -1867,7 +1867,7 @@ async function s3RunTryOnStep({
     throw new Error(`Missing garment for slot ${slot}`)
   }
 
-  ("[TRYON_STEP_INPUT]", {
+  console.log("[TRYON_STEP_INPUT]", {
     slot,
     inputModel,
     garment,
@@ -1891,9 +1891,9 @@ async function s3RunTryOnStep({
 
   const done = await s3FashnPollPrediction(run.id)
 
-  ("[TRYON_MAX_RUN_PAYLOAD]", JSON.stringify(run.payload, null, 2))
-  ("[TRYON_MAX_STATUS_RAW]", JSON.stringify(done.raw, null, 2))
-  ("[TRYON_MAX_FINAL_IMAGE]", done.finalImage)
+  console.log("[TRYON_MAX_RUN_PAYLOAD]", JSON.stringify(run.payload, null, 2))
+  console.log("[TRYON_MAX_STATUS_RAW]", JSON.stringify(done.raw, null, 2))
+  console.log("[TRYON_MAX_FINAL_IMAGE]", done.finalImage)
 
   return {
     slot,
@@ -1965,9 +1965,9 @@ async function s3RunSequentialViewSingleAttempt({
   promptMode,
   debug,
 }) {
-  const plan = s3BuildPlanForView({ [view]: garments }, view)
+  const planList = s3BuildPlanForView({ [view]: garments }, view)
 
-  ("[SEQUENTIAL_VIEW_START]", {
+  console.log("[SEQUENTIAL_VIEW_START]", {
     view,
     hasModel: !!modelImage,
     garments: {
@@ -1976,7 +1976,7 @@ async function s3RunSequentialViewSingleAttempt({
       outer: !!garments?.outer,
       dress: !!garments?.dress,
     },
-    plan,
+    plan: planList,
   })
 
   if (!modelImage) {
@@ -1984,18 +1984,18 @@ async function s3RunSequentialViewSingleAttempt({
       ok: false,
       view,
       error: `model_${view} is missing`,
-      plan,
+      plan: planList,
       finalUrl: "",
       finalCloudflare: s3EmptyAsset(),
       steps: [],
     }
   }
 
-  if (plan.length === 0) {
+  if (!Array.isArray(planList) || planList.length === 0) {
     return {
       ok: true,
       view,
-      plan,
+      plan: [],
       finalUrl: modelImage,
       finalCloudflare: s3EmptyAsset(),
       steps: [],
@@ -2006,9 +2006,9 @@ async function s3RunSequentialViewSingleAttempt({
   let currentModel = modelImage
   const steps = []
 
-  for (let i = 0; i < plan.length; i++) {
-    const slot = plan[i]
-    const garment = garments[slot]
+  for (let i = 0; i < planList.length; i++) {
+    const slot = planList[i]
+    const garment = garments?.[slot] || ""
 
     if (!garment) continue
 
@@ -2028,8 +2028,8 @@ async function s3RunSequentialViewSingleAttempt({
       return {
         ok: false,
         view,
-        plan,
-        finalUrl: currentModel,
+        plan: planList,
+        finalUrl: currentModel || "",
         finalCloudflare: s3EmptyAsset(),
         steps,
         failedStep: slot,
@@ -2059,10 +2059,10 @@ async function s3RunSequentialViewSingleAttempt({
   let finalCloudflare = s3EmptyAsset()
   let finalUrl = currentModel || ""
 
-  if (currentModel && s3IsHttpUrl(currentModel)) {
+  if (finalUrl && s3IsHttpUrl(finalUrl)) {
     try {
       finalCloudflare = await s3UploadRemoteResultToCloudflare(
-        currentModel,
+        finalUrl,
         `dress-${view}-${Date.now()}.png`
       )
     } catch (cfErr) {
@@ -2077,7 +2077,7 @@ async function s3RunSequentialViewSingleAttempt({
   return {
     ok: true,
     view,
-    plan,
+    plan: planList,
     finalUrl,
     finalCloudflare,
     steps,
