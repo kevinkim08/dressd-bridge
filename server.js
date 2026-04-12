@@ -1945,44 +1945,27 @@ async function s3RunTryOnStep({
   inputModel,
   garment,
   seed,
-  promptMode,
-  debug = false,
 }) {
-  const prompt = promptMode === "short" ? s3ShortPromptForSlot(slot) : ""
-
-  if (!inputModel) {
-    throw new Error(`Missing inputModel for slot ${slot}`)
-  }
-
-  if (!garment) {
-    throw new Error(`Missing garment for slot ${slot}`)
-  }
-
-  const run = await s3FashnRunTryOnMax({
+  const run = await s3FashnRunTryOnV16({
     modelImage: inputModel,
-    productImage: garment,
-    prompt,
+    garmentImage: garment,
+    category: "auto",
+    garmentPhotoType: "auto",
+    mode: "quality",
     seed,
-    numImages: 1,
+    numSamples: 1,
     outputFormat: "png",
     returnBase64: false,
   })
 
   const done = await s3FashnPollPrediction(run.id)
 
-  console.log("[TRYON_MAX_RUN_PAYLOAD]", JSON.stringify(run.payload, null, 2))
-  console.log("[TRYON_MAX_STATUS_RAW]", JSON.stringify(done.raw, null, 2))
-  console.log("[TRYON_MAX_FINAL_IMAGE]", done.finalImage)
-
   return {
     slot,
-    prompt,
     predictionId: run.id,
     inputModel,
     garment,
     output: done.finalImage,
-    debugRunRaw: debug ? run.raw : undefined,
-    debugStatusRaw: debug ? done.raw : undefined,
   }
 }
 
