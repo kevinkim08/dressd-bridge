@@ -1123,6 +1123,25 @@ function s3BuildPlanForView(garmentsByView, view) {
   return S3_SLOT_ORDER.filter((slot) => !!garmentsByView[view]?.[slot])
 }
 
+async function s3ResizeGarmentForFashn(buffer) {
+  const meta = await sharp(buffer).metadata()
+
+  const TARGET_HEIGHT = 1800
+
+  const scale = TARGET_HEIGHT / (meta.height || 1)
+  const newWidth = Math.round((meta.width || 1) * scale)
+
+  const resized = await sharp(buffer)
+    .resize(newWidth, TARGET_HEIGHT, {
+      fit: "contain",
+      background: { r: 0, g: 0, b: 0, alpha: 0 },
+    })
+    .png()
+    .toBuffer()
+
+  return resized
+}
+
 /* ============================================================
  * ✅ meta / retry / score helpers
  * ============================================================
