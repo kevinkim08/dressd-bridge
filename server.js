@@ -1752,7 +1752,8 @@ async function s3PreprocessAll(norm, baseUrl) {
  * ✅ IMAGE PREPROCESS HELPERS
  * ============================================================
  */
- {
+
+async function s3NormalizeGarmentForFashn(buffer) {
   const image = sharp(buffer)
   const meta = await image.metadata()
 
@@ -1783,8 +1784,8 @@ async function s3PreprocessAll(norm, baseUrl) {
     return buffer
   }
 
-  const cropWidth = maxX - minX
-  const cropHeight = maxY - minY
+  const cropWidth = maxX - minX + 1
+  const cropHeight = maxY - minY + 1
 
   const cropped = await image
     .extract({
@@ -1810,6 +1811,7 @@ async function s3PreprocessAll(norm, baseUrl) {
 
   return finalBuffer
 }
+
 
 /* ============================================================
  * ✅ FASHN helpers
