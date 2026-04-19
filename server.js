@@ -3091,6 +3091,136 @@ app.post("/api/cf-upload-check", async (req, res) => {
   }
 })
 
+/**
+ * ============================================================
+ * ✅ 8) S4 LOOKBOOK (Scene Generation)
+ * ============================================================
+ */
+
+app.post("/api/s4-lookbook", async (req, res) => {
+  const requestId = rid()
+  const {
+    model_image,
+    background_image,
+    prompt,
+    format = "4:5",
+    resolution = "2K",
+    reservationId,
+  } = req.body || {}
+
+  if (!mustHaveToken(res)) return
+
+  if (!model_image) {
+    return res.status(400).json({
+      ok: false,
+      requestId,
+      error: "model_image is required",
+    })
+  }
+
+  if (!prompt) {
+    return res.status(400).json({
+      ok: false,
+      requestId,
+      error: "prompt is required",
+    })
+  }
+
+  try {
+    // ============================================================
+    // ✅ Prompt 구성 (S4 핵심)
+    // ============================================================
+
+    let finalPrompt = [
+      "high fashion editorial photography",
+      "clean composition",
+      "full body",
+      "professional lighting",
+      prompt,
+    ].join(", ")
+
+    if (background_image) {
+      finalPrompt += `, background reference: ${background_image}`
+    }
+
+    // ============================================================
+    // ✅ Imagen 실행
+    // ============================================================
+
+    const aspectRatioMap = {
+      "1:1": "1:1",
+      "3:4": "3:4",
+      "4:5": "4:5",
+      "16:9": "16:9",
+      A4: "3:4",
+    }
+
+    const imageSize = resolution === "4K" ? "4K" : "2K"
+
+    const output = await replicate.run("google/imagen-4", {
+      input: {
+        prompt: finalPrompt,
+        image_size: imageSize,
+        aspect_ratio: aspectRatioMap[format] || "4:5",
+        output_format: "png",
+      },
+    })
+
+    const imageUrl = pickImageUrl(output)
+
+    if (!imageUrl) {
+      throw new Error("No image generated")
+    }
+
+    // ============================================================
+    // ✅ Cloudflare 업로드 (선택)
+    // ============================================================
+
+    let finalUrl = imageUrl
+    let cloudflare = s3EmptyAsset()
+
+    try {
+      cloudflare = await s3UploadRemoteResultToCloudflare(
+        imageUrl,
+        `s4-${Date.now()}.png`
+      )
+
+      if (cloudflare?.url) {
+        finalUrl = cloudflare.url
+      }
+    } catch (e) {
+      console.warn("[S4_CF_UPLOAD_FAILED]", e?.message)
+    }
+
+    // ============================================================
+    // ✅ 크레딧 처리
+    // ============================================================
+
+    await confirmIfReserved(req, reservationId)
+
+    return res.json({
+      ok: true,
+      requestId,
+      outputImage: finalUrl,
+      rawImage: imageUrl,
+      prompt: finalPrompt,
+      format,
+      resolution,
+    })
+  } catch (e) {
+    await releaseIfReserved(req, reservationId)
+
+    console.error(`[${requestId}] /api/s4-lookbook ERROR`, e?.stack || e)
+
+    return res.status(500).json({
+      ok: false,
+      requestId,
+      error: e?.message || "S4 generation failed",
+    })
+  }
+})
+
+
 const PORT = Number(process.env.PORT || 10000)
 
 app.listen(PORT, "0.0.0.0", () => {
