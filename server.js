@@ -3093,32 +3093,61 @@ app.post("/api/cf-upload-check", async (req, res) => {
 
 /**
  * ============================================================
- * ✅ 8) S4 LOOKBOOK (Scene Generation)
+ * ✅ 8) S4 LOOKBOOK (Scene + Shot Compose)
  * ============================================================
  */
 
 app.post("/api/s4-lookbook", async (req, res) => {
   const requestId = rid()
+
   const {
     model_image,
-    background_image,
+    scene_image,
+    shot_image,
     prompt,
+
     format = "4:5",
     resolution = "2K",
+    gender = "female",
+    view = "front",
+
+    sceneKey = "",
+    shotKey = "",
+
     reservationId,
+    meta = null,
   } = req.body || {}
 
   if (!mustHaveToken(res)) return
 
-  if (!model_image) {
+  // ============================================================
+  // 1) Input validation
+  // ============================================================
+  if (!model_image || !s3IsHttpUrl(model_image)) {
     return res.status(400).json({
       ok: false,
       requestId,
-      error: "model_image is required",
+      error: "model_image must be a public URL",
     })
   }
 
-  if (!prompt) {
+  if (!scene_image || !s3IsHttpUrl(scene_image)) {
+    return res.status(400).json({
+      ok: false,
+      requestId,
+      error: "scene_image must be a public URL",
+    })
+  }
+
+  if (!shot_image || !s3IsHttpUrl(shot_image)) {
+    return res.status(400).json({
+      ok: false,
+      requestId,
+      error: "shot_image must be a public URL",
+    })
+  }
+
+  if (!prompt || typeof prompt !== "string") {
     return res.status(400).json({
       ok: false,
       requestId,
@@ -3126,27 +3155,18 @@ app.post("/api/s4-lookbook", async (req, res) => {
     })
   }
 
+  const safeFormat = ["1:1", "3:4", "4:5", "16:9", "A4"].includes(format)
+    ? format
+    : "4:5"
+
+  const safeResolution = resolution === "4K" ? "4K" : "2K"
+  const safeGender = gender === "male" ? "male" : "female"
+  const safeView = view === "back" ? "back" : "front"
+
   try {
     // ============================================================
-    // ✅ Prompt 구성 (S4 핵심)
+    // 2) Compose final prompt
     // ============================================================
-
-    let finalPrompt = [
-      "high fashion editorial photography",
-      "clean composition",
-      "full body",
-      "professional lighting",
-      prompt,
-    ].join(", ")
-
-    if (background_image) {
-      finalPrompt += `, background reference: ${background_image}`
-    }
-
-    // ============================================================
-    // ✅ Imagen 실행
-    // ============================================================
-
     const aspectRatioMap = {
       "1:1": "1:1",
       "3:4": "3:4",
@@ -3155,13 +3175,36 @@ app.post("/api/s4-lookbook", async (req, res) => {
       A4: "3:4",
     }
 
-    const imageSize = resolution === "4K" ? "4K" : "2K"
+    const finalPrompt = [
+      "high fashion commercial lookbook photography",
+      "premium editorial quality",
+      "realistic scene integration",
+      "preserve model identity",
+      "preserve garment details exactly",
+      safeGender === "male"
+        ? "male fashion model"
+        : "female fashion model",
+      safeView === "back"
+        ? "rear-view priority, preserve back-facing composition"
+        : "front-view priority, preserve front-facing readability",
 
+      // 핵심: scene / shot 둘 다 reference로 명시
+      `use this scene reference image as the exact environment: ${scene_image}`,
+      `use this shot reference image as the exact composition and framing guide: ${shot_image}`,
+
+      prompt,
+    ]
+      .filter(Boolean)
+      .join(", ")
+
+    // ============================================================
+    // 3) Generate with Imagen
+    // ============================================================
     const output = await replicate.run("google/imagen-4", {
       input: {
         prompt: finalPrompt,
-        image_size: imageSize,
-        aspect_ratio: aspectRatioMap[format] || "4:5",
+        image_size: safeResolution,
+        aspect_ratio: aspectRatioMap[safeFormat] || "4:5",
         output_format: "png",
       },
     })
@@ -3169,13 +3212,12 @@ app.post("/api/s4-lookbook", async (req, res) => {
     const imageUrl = pickImageUrl(output)
 
     if (!imageUrl) {
-      throw new Error("No image generated")
+      throw new Error("No image generated from S4")
     }
 
     // ============================================================
-    // ✅ Cloudflare 업로드 (선택)
+    // 4) Upload result to Cloudflare (storage-only)
     // ============================================================
-
     let finalUrl = imageUrl
     let cloudflare = s3EmptyAsset()
 
@@ -3188,14 +3230,16 @@ app.post("/api/s4-lookbook", async (req, res) => {
       if (cloudflare?.url) {
         finalUrl = cloudflare.url
       }
-    } catch (e) {
-      console.warn("[S4_CF_UPLOAD_FAILED]", e?.message)
+    } catch (cfErr) {
+      console.warn("[S4_CF_UPLOAD_FAILED]", {
+        requestId,
+        error: cfErr?.message || String(cfErr),
+      })
     }
 
     // ============================================================
-    // ✅ 크레딧 처리
+    // 5) Confirm credits
     // ============================================================
-
     await confirmIfReserved(req, reservationId)
 
     return res.json({
@@ -3203,14 +3247,35 @@ app.post("/api/s4-lookbook", async (req, res) => {
       requestId,
       outputImage: finalUrl,
       rawImage: imageUrl,
-      prompt: finalPrompt,
-      format,
-      resolution,
+
+      format: safeFormat,
+      resolution: safeResolution,
+      gender: safeGender,
+      view: safeView,
+
+      sceneKey,
+      shotKey,
+      meta: meta || null,
+
+      debug: {
+        model_image,
+        scene_image,
+        shot_image,
+        finalPrompt,
+      },
     })
   } catch (e) {
     await releaseIfReserved(req, reservationId)
 
-    console.error(`[${requestId}] /api/s4-lookbook ERROR`, e?.stack || e)
+    console.error(`[${requestId}] /api/s4-lookbook ERROR`, {
+      message: e?.message || String(e),
+      stack: e?.stack,
+      sceneKey,
+      shotKey,
+      format: safeFormat,
+      resolution: safeResolution,
+      view: safeView,
+    })
 
     return res.status(500).json({
       ok: false,
