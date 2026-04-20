@@ -3180,14 +3180,14 @@ app.post("/api/s4-lookbook", async (req, res) => {
       "premium editorial quality",
       "realistic scene integration",
       "preserve model identity exactly",
-      "preserve garment details, silhouette, seams, and texture exactly",
+      "preserve garment silhouette, seams, texture, and details exactly",
 
       safeGender === "male"
         ? "male fashion model"
         : "female fashion model",
 
       safeView === "back"
-        ? "rear-view priority, preserve back-facing composition"
+        ? "rear-view priority, preserve back-facing readability"
         : "front-view priority, preserve front-facing readability",
 
       `use this scene reference as the exact environment: ${scene_image}`,
@@ -3195,7 +3195,7 @@ app.post("/api/s4-lookbook", async (req, res) => {
 
       "do not invent a new pose",
       "do not change the framing logic",
-      "do not alter the intended body direction or camera structure",
+      "do not alter camera structure or body direction",
 
       prompt,
     ]
