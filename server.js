@@ -3093,7 +3093,7 @@ app.post("/api/cf-upload-check", async (req, res) => {
 
 /**
  * ============================================================
- * ✅ 8) S4 LOOKBOOK (Scene + Shot Compose)
+ * ✅ 8) S4 LOOKBOOK (Scene + Pose Reference Compose)
  * ============================================================
  */
 
@@ -3103,7 +3103,7 @@ app.post("/api/s4-lookbook", async (req, res) => {
   const {
     model_image,
     scene_image,
-    shot_image,
+    pose_reference,
     prompt,
 
     format = "4:5",
@@ -3123,27 +3123,27 @@ app.post("/api/s4-lookbook", async (req, res) => {
   // ============================================================
   // 1) Input validation
   // ============================================================
-  if (!model_image || !s3IsHttpUrl(model_image)) {
+  if (!model_image || typeof model_image !== "string") {
     return res.status(400).json({
       ok: false,
       requestId,
-      error: "model_image must be a public URL",
+      error: "model_image is required",
     })
   }
 
-  if (!scene_image || !s3IsHttpUrl(scene_image)) {
+  if (!scene_image || typeof scene_image !== "string") {
     return res.status(400).json({
       ok: false,
       requestId,
-      error: "scene_image must be a public URL",
+      error: "scene_image is required",
     })
   }
 
-  if (!shot_image || !s3IsHttpUrl(shot_image)) {
+  if (!pose_reference || typeof pose_reference !== "string") {
     return res.status(400).json({
       ok: false,
       requestId,
-      error: "shot_image must be a public URL",
+      error: "pose_reference is required",
     })
   }
 
@@ -3165,7 +3165,7 @@ app.post("/api/s4-lookbook", async (req, res) => {
 
   try {
     // ============================================================
-    // 2) Compose final prompt
+    // 2) Final prompt compose
     // ============================================================
     const aspectRatioMap = {
       "1:1": "1:1",
@@ -3179,18 +3179,23 @@ app.post("/api/s4-lookbook", async (req, res) => {
       "high fashion commercial lookbook photography",
       "premium editorial quality",
       "realistic scene integration",
-      "preserve model identity",
-      "preserve garment details exactly",
+      "preserve model identity exactly",
+      "preserve garment details, silhouette, seams, and texture exactly",
+
       safeGender === "male"
         ? "male fashion model"
         : "female fashion model",
+
       safeView === "back"
         ? "rear-view priority, preserve back-facing composition"
         : "front-view priority, preserve front-facing readability",
 
-      // 핵심: scene / shot 둘 다 reference로 명시
-      `use this scene reference image as the exact environment: ${scene_image}`,
-      `use this shot reference image as the exact composition and framing guide: ${shot_image}`,
+      `use this scene reference as the exact environment: ${scene_image}`,
+      `follow this pose and framing reference exactly: ${pose_reference}`,
+
+      "do not invent a new pose",
+      "do not change the framing logic",
+      "do not alter the intended body direction or camera structure",
 
       prompt,
     ]
@@ -3198,7 +3203,7 @@ app.post("/api/s4-lookbook", async (req, res) => {
       .join(", ")
 
     // ============================================================
-    // 3) Generate with Imagen
+    // 3) Imagen run
     // ============================================================
     const output = await replicate.run("google/imagen-4", {
       input: {
@@ -3216,7 +3221,7 @@ app.post("/api/s4-lookbook", async (req, res) => {
     }
 
     // ============================================================
-    // 4) Upload result to Cloudflare (storage-only)
+    // 4) Upload to Cloudflare
     // ============================================================
     let finalUrl = imageUrl
     let cloudflare = s3EmptyAsset()
@@ -3260,7 +3265,7 @@ app.post("/api/s4-lookbook", async (req, res) => {
       debug: {
         model_image,
         scene_image,
-        shot_image,
+        pose_reference,
         finalPrompt,
       },
     })
