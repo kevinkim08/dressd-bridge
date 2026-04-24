@@ -3091,9 +3091,11 @@ app.post("/api/cf-upload-check", async (req, res) => {
   }
 })
 
-// ==============================
-// S4 LOOKBOOK ENDPOINT
-// ==============================
+/**
+ * ============================================================
+ * ✅ 8) S4 LOOKBOOK (Scene + Pose Reference Compose)
+ * ============================================================
+ */
 
 function s4IsNonEmptyString(v) {
   return typeof v === "string" && v.trim().length > 0
@@ -3110,170 +3112,217 @@ function s4JoinPrompt(parts) {
     .join(", ")
 }
 
-function s4BuildEnginePrompt(payload) {
-  const prompts = payload?.prompts || {}
+function s4ResolveLegacyOrNestedBody(body = {}) {
+  const input = body?.input || {}
+  const selection = body?.selection || {}
+  const resolved = body?.resolved || {}
+  const prompts = body?.prompts || {}
+  const output = body?.output || {}
+  const controls = body?.controls || {}
 
-  return s4JoinPrompt([
-    prompts.genderPrompt,
-    prompts.viewPrompt,
-    prompts.formatPrompt,
-    prompts.shotPrompt,
-    prompts.cropRule,
-    prompts.shotPerspectiveRule,
-    prompts.scenePrompt,
-    prompts.sceneLockPrompt,
-    prompts.sceneGroundingPrompt,
-    prompts.sceneLightMatchPrompt,
-    prompts.floorHintPrompt,
-    prompts.lightHintPrompt,
-    prompts.perspectivePromptFromScene,
-  ])
+  // ✅ nested payload 우선
+  const nestedActiveImage = s4SafeText(input.activeImage)
+  const nestedFrontImage = s4SafeText(input.frontImage)
+  const nestedBackImage = s4SafeText(input.backImage)
+  const nestedSceneImage = s4SafeText(input.sceneImage)
+  const nestedPoseReference = s4SafeText(input.poseReference)
+
+  const nestedFinalPrompt = s4SafeText(prompts.finalPrompt)
+  const nestedNegativePrompt = s4SafeText(prompts.negativePrompt)
+
+  // ✅ legacy flat payload fallback
+  const legacyModelImage = s4SafeText(body.model_image)
+  const legacySceneImage = s4SafeText(body.scene_image)
+  const legacyPoseReference = s4SafeText(body.pose_reference)
+  const legacyPrompt = s4SafeText(body.prompt)
+
+  const safeView =
+    selection.view === "back" || body.view === "back" ? "back" : "front"
+
+  const safeFormat = ["1:1", "3:4", "4:5", "16:9", "A4"].includes(
+    selection.format || body.format
+  )
+    ? selection.format || body.format
+    : "4:5"
+
+  const safeResolution =
+    (selection.resolution || body.resolution) === "4K" ? "4K" : "2K"
+
+  const safeGender =
+    (selection.gender || body.gender) === "male" ? "male" : "female"
+
+  const activeImage =
+    nestedActiveImage ||
+    (safeView === "back" ? nestedBackImage : nestedFrontImage) ||
+    legacyModelImage
+
+  const sceneImage = nestedSceneImage || legacySceneImage
+  const poseReference = nestedPoseReference || legacyPoseReference
+
+  const finalPrompt =
+    nestedFinalPrompt ||
+    legacyPrompt ||
+    s4JoinPrompt([
+      prompts.genderPrompt,
+      prompts.viewPrompt,
+      prompts.formatPrompt,
+      prompts.shotPrompt,
+      prompts.cropRule,
+      prompts.shotPerspectiveRule,
+      prompts.scenePrompt,
+      prompts.sceneLockPrompt,
+      prompts.sceneGroundingPrompt,
+      prompts.sceneLightMatchPrompt,
+      prompts.floorHintPrompt,
+      prompts.lightHintPrompt,
+      prompts.perspectivePromptFromScene,
+    ])
+
+  const negativePrompt =
+    nestedNegativePrompt ||
+    s4JoinPrompt([
+      body.negative_prompt,
+      "extra limbs",
+      "broken anatomy",
+      "twisted torso",
+      "garment distortion",
+      "cropped feet when full body is required",
+      "incorrect view direction",
+      "background redesign",
+      "mismatched lighting",
+      "floating body",
+      "fisheye distortion",
+      "blur",
+      "low detail",
+    ])
+
+  const aspectRatio =
+    s4SafeText(output.aspectRatio) ||
+    (safeFormat === "A4" ? "3:4" : safeFormat)
+
+  const width = Number(output.width || 0)
+  const height = Number(output.height || 0)
+
+  return {
+    input: {
+      activeImage,
+      frontImage: nestedFrontImage,
+      backImage: nestedBackImage,
+      sceneImage,
+      poseReference,
+    },
+    selection: {
+      shotKey: s4SafeText(selection.shotKey || body.shotKey),
+      sceneKey: s4SafeText(selection.sceneKey || body.sceneKey),
+      format: safeFormat,
+      resolution: safeResolution,
+      gender: safeGender,
+      view: safeView,
+    },
+    resolved: {
+      shotLabel: s4SafeText(resolved.shotLabel),
+      shotGroup: s4SafeText(resolved.shotGroup),
+      shotFraming: s4SafeText(resolved.shotFraming),
+      shotAngle: s4SafeText(resolved.shotAngle),
+      sceneLabel: s4SafeText(resolved.sceneLabel),
+      renderPresetId:
+        s4SafeText(resolved.renderPresetId) ||
+        `render_${safeFormat}_${safeResolution}_${safeView}`,
+      aspectRatio,
+      outputWidth: width,
+      outputHeight: height,
+      outputQuality: s4SafeText(resolved.outputQuality || safeResolution),
+    },
+    prompts: {
+      finalPrompt,
+      negativePrompt,
+      rawPrompts: prompts || {},
+    },
+    output: {
+      aspectRatio,
+      width: width > 0 ? width : safeResolution === "4K" ? 3072 : 1536,
+      height: height > 0 ? height : safeResolution === "4K" ? 4096 : 2048,
+      format: s4SafeText(output.format || "png"),
+    },
+    controls: controls || {},
+    reservationId: body.reservationId,
+    meta: body.meta || null,
+  }
 }
 
-function s4ValidatePayload(body) {
+function s4ValidateResolvedPayload(payload) {
   const issues = []
 
-  if (!body || typeof body !== "object") {
-    issues.push("Payload body is missing")
+  if (!payload || typeof payload !== "object") {
+    issues.push("payload is missing")
     return issues
   }
 
-  const input = body.input || {}
-  const selection = body.selection || {}
-  const prompts = body.prompts || {}
-  const output = body.output || {}
-
-  if (!s4IsNonEmptyString(selection.shotKey)) {
-    issues.push("selection.shotKey is missing")
+  if (!s4IsNonEmptyString(payload?.input?.activeImage)) {
+    issues.push("input.activeImage is required")
   }
 
-  if (!s4IsNonEmptyString(selection.sceneKey)) {
-    issues.push("selection.sceneKey is missing")
+  if (!s4IsNonEmptyString(payload?.input?.sceneImage)) {
+    issues.push("input.sceneImage is required")
   }
 
-  if (!s4IsNonEmptyString(selection.view)) {
-    issues.push("selection.view is missing")
+  if (!s4IsNonEmptyString(payload?.input?.poseReference)) {
+    issues.push("input.poseReference is required")
   }
 
-  if (!s4IsNonEmptyString(input.poseReference)) {
-    issues.push("input.poseReference is missing")
+  if (!s4IsNonEmptyString(payload?.prompts?.finalPrompt)) {
+    issues.push("prompts.finalPrompt is required")
   }
 
-  if (!s4IsNonEmptyString(input.sceneImage)) {
-    issues.push("input.sceneImage is missing")
+  if (!s4IsNonEmptyString(payload?.selection?.view)) {
+    issues.push("selection.view is required")
   }
 
-  if (selection.view === "front" && !s4IsNonEmptyString(input.frontImage)) {
-    issues.push("input.frontImage is missing for front view")
+  if (!s4IsNonEmptyString(payload?.output?.aspectRatio)) {
+    issues.push("output.aspectRatio is required")
   }
 
-  if (selection.view === "back" && !s4IsNonEmptyString(input.backImage)) {
-    issues.push("input.backImage is missing for back view")
-  }
-
-  if (!s4IsNonEmptyString(prompts.finalPrompt)) {
-    issues.push("prompts.finalPrompt is missing")
-  }
-
-  if (!s4IsNonEmptyString(output.aspectRatio)) {
-    issues.push("output.aspectRatio is missing")
-  }
-
-  if (!output.width || !output.height) {
-    issues.push("output width/height is missing")
+  if (!payload?.output?.width || !payload?.output?.height) {
+    issues.push("output.width / output.height is required")
   }
 
   return issues
 }
 
-// ✅ 실제 AI provider 호출부 자리
-// 지금은 구조만 만들고, 나중에 Replicate / Imagen / 기타 모델로 교체 가능
-async function s4RunLookbookEngine(payload) {
-  const input = payload?.input || {}
-  const prompts = payload?.prompts || {}
-  const output = payload?.output || {}
-  const selection = payload?.selection || {}
-  const resolved = payload?.resolved || {}
-
-  const activeImage =
-    s4SafeText(input.activeImage) ||
-    (selection.view === "back"
-      ? s4SafeText(input.backImage)
-      : s4SafeText(input.frontImage))
-
-  const finalPrompt =
-    s4SafeText(prompts.finalPrompt) || s4BuildEnginePrompt(payload)
-
-  const negativePrompt = s4SafeText(prompts.negativePrompt)
-
-  // =========================================
-  // 여기에 실제 생성 모델 호출 로직을 넣으면 됨
-  // =========================================
-  //
-  // 예시 개념:
-  // const aiResult = await someProviderGenerate({
-  //   modelImage: activeImage,
-  //   sceneImage: input.sceneImage,
-  //   poseReference: input.poseReference,
-  //   prompt: finalPrompt,
-  //   negative_prompt: negativePrompt,
-  //   aspect_ratio: output.aspectRatio,
-  //   width: output.width,
-  //   height: output.height,
-  // })
-  //
-  // return {
-  //   ok: true,
-  //   outputImage: aiResult.url,
-  //   provider: "some-provider",
-  //   raw: aiResult,
-  // }
-
-  // =========================================
-  // 임시 구조 테스트용 반환
-  // =========================================
-  return {
-    ok: true,
-    outputImage: activeImage, // 임시: 현재 선택 이미지 리턴
-    provider: "mock-s4-engine",
-    debug: {
-      activeImage,
-      poseReference: input.poseReference,
-      sceneImage: input.sceneImage,
-      finalPrompt,
-      negativePrompt,
-      aspectRatio: output.aspectRatio,
-      width: output.width,
-      height: output.height,
-      shotKey: selection.shotKey,
-      sceneKey: selection.sceneKey,
-      renderPresetId: resolved.renderPresetId || "",
-    },
-  }
-}
-
 app.post("/api/s4-lookbook", async (req, res) => {
+  const requestId = rid()
+  if (!mustHaveToken(res)) return
+
+  const body = req.body || {}
+  const resolvedPayload = s4ResolveLegacyOrNestedBody(body)
+  const { input, selection, resolved, prompts, output, reservationId, meta } =
+    resolvedPayload
+
+  const issues = s4ValidateResolvedPayload(resolvedPayload)
+  if (issues.length > 0) {
+    return res.status(400).json({
+      ok: false,
+      requestId,
+      error: "Invalid S4 payload",
+      issues,
+      debug: {
+        bodyKeys: Object.keys(body || {}),
+        selection,
+      },
+    })
+  }
+
   try {
-    const body = req.body || {}
-
-    console.log("[S4_LOOKBOOK_RAW_BODY_KEYS]", Object.keys(body || {}))
-
-    const issues = s4ValidatePayload(body)
-    if (issues.length > 0) {
-      return res.status(400).json({
-        ok: false,
-        error: "Invalid S4 payload",
-        issues,
-      })
+    const aspectRatioMap = {
+      "1:1": "1:1",
+      "3:4": "3:4",
+      "4:5": "4:5",
+      "16:9": "16:9",
+      A4: "3:4",
     }
 
-    const input = body.input || {}
-    const selection = body.selection || {}
-    const resolved = body.resolved || {}
-    const prompts = body.prompts || {}
-    const output = body.output || {}
-
     console.log("[S4_LOOKBOOK_REQUEST]", {
+      requestId,
       shotKey: selection.shotKey,
       sceneKey: selection.sceneKey,
       format: selection.format,
@@ -3281,41 +3330,133 @@ app.post("/api/s4-lookbook", async (req, res) => {
       gender: selection.gender,
       view: selection.view,
 
+      hasActiveImage: s4IsNonEmptyString(input.activeImage),
       hasFrontImage: s4IsNonEmptyString(input.frontImage),
       hasBackImage: s4IsNonEmptyString(input.backImage),
-      hasActiveImage: s4IsNonEmptyString(input.activeImage),
       hasSceneImage: s4IsNonEmptyString(input.sceneImage),
       hasPoseReference: s4IsNonEmptyString(input.poseReference),
 
-      renderPresetId: resolved.renderPresetId || "",
-      aspectRatio: output.aspectRatio || "",
-      size: `${output.width || 0}x${output.height || 0}`,
+      renderPresetId: resolved.renderPresetId,
+      aspectRatio: output.aspectRatio,
+      size: `${output.width}x${output.height}`,
 
       finalPromptPreview: s4SafeText(prompts.finalPrompt).slice(0, 240),
-      negativePromptPreview: s4SafeText(prompts.negativePrompt).slice(0, 200),
+      negativePromptPreview: s4SafeText(prompts.negativePrompt).slice(0, 180),
     })
 
-    const engineResult = await s4RunLookbookEngine(body)
+    // ============================================================
+    // 1) Final prompt
+    // ============================================================
+    const finalPrompt = s4JoinPrompt([
+      "high fashion commercial lookbook photography",
+      "premium editorial quality",
+      "realistic scene integration",
+      "preserve model identity exactly",
+      "preserve garment silhouette, seams, texture, and details exactly",
 
-    if (!engineResult?.ok) {
-      return res.status(500).json({
-        ok: false,
-        error: engineResult?.error || "S4 engine failed",
+      selection.gender === "male"
+        ? "male fashion model"
+        : "female fashion model",
+
+      selection.view === "back"
+        ? "rear-view priority, preserve back-facing readability"
+        : "front-view priority, preserve front-facing readability",
+
+      `use this scene reference as the exact environment: ${input.sceneImage}`,
+      `follow this pose and framing reference exactly: ${input.poseReference}`,
+
+      "do not invent a new pose",
+      "do not change the framing logic",
+      "do not alter camera structure or body direction",
+
+      prompts.finalPrompt,
+    ])
+
+    // ============================================================
+    // 2) Imagen run
+    // ============================================================
+    const outputRun = await replicate.run("google/imagen-4", {
+      input: {
+        prompt: finalPrompt,
+        image_size: selection.resolution === "4K" ? "4K" : "2K",
+        aspect_ratio: aspectRatioMap[selection.format] || "4:5",
+        output_format: output.format || "png",
+      },
+    })
+
+    const imageUrl = pickImageUrl(outputRun)
+
+    if (!imageUrl) {
+      throw new Error("No image generated from S4")
+    }
+
+    // ============================================================
+    // 3) Upload to Cloudflare
+    // ============================================================
+    let finalUrl = imageUrl
+    let cloudflare = s3EmptyAsset()
+
+    try {
+      cloudflare = await s3UploadRemoteResultToCloudflare(
+        imageUrl,
+        `s4-${Date.now()}.png`
+      )
+
+      if (cloudflare?.url) {
+        finalUrl = cloudflare.url
+      }
+    } catch (cfErr) {
+      console.warn("[S4_CF_UPLOAD_FAILED]", {
+        requestId,
+        error: cfErr?.message || String(cfErr),
       })
     }
 
+    // ============================================================
+    // 4) Confirm credits
+    // ============================================================
+    await confirmIfReserved(req, reservationId)
+
     return res.json({
       ok: true,
-      outputImage: engineResult.outputImage,
-      provider: engineResult.provider || "unknown",
-      debug: engineResult.debug || null,
+      requestId,
+      outputImage: finalUrl,
+      rawImage: imageUrl,
+
+      selection,
+      resolved: {
+        ...resolved,
+        aspectRatio: output.aspectRatio,
+        outputWidth: output.width,
+        outputHeight: output.height,
+      },
+      meta: meta || null,
+
+      debug: {
+        activeImage: input.activeImage,
+        sceneImage: input.sceneImage,
+        poseReference: input.poseReference,
+        finalPrompt,
+        negativePrompt: prompts.negativePrompt,
+      },
     })
-  } catch (err) {
-    console.error("[S4_LOOKBOOK_ERROR]", err)
+  } catch (e) {
+    await releaseIfReserved(req, reservationId)
+
+    console.error(`[${requestId}] /api/s4-lookbook ERROR`, {
+      message: e?.message || String(e),
+      stack: e?.stack,
+      shotKey: selection.shotKey,
+      sceneKey: selection.sceneKey,
+      format: selection.format,
+      resolution: selection.resolution,
+      view: selection.view,
+    })
 
     return res.status(500).json({
       ok: false,
-      error: err?.message || "S4 lookbook endpoint failed",
+      requestId,
+      error: e?.message || "S4 generation failed",
     })
   }
 })
